@@ -1,5 +1,6 @@
 use rmcp::{
     handler::server::wrapper::Parameters,
+    model::{ServerCapabilities, ServerInfo},
     schemars, tool, tool_router, tool_handler,
     ErrorData as McpError, ServerHandler, ServiceExt, transport::stdio,
 };
@@ -1328,7 +1329,18 @@ impl FileIoServer {
 }
 
 #[tool_handler]
-impl ServerHandler for FileIoServer {}
+impl ServerHandler for FileIoServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo {
+            protocol_version: rmcp::model::ProtocolVersion::V_2024_11_05,
+            capabilities: ServerCapabilities::builder()
+                .enable_tools()
+                .build(),
+            server_info: rmcp::model::Implementation::from_build_env(),
+            instructions: None,
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
