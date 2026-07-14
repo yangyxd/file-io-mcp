@@ -6,8 +6,13 @@ use rmcp::{
 };
 use serde::Deserialize;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use regex::Regex;
+use globset::{Glob, GlobMatcher};
+use sha2::{Sha256, Digest};
+
+const MAX_TEXT_READ_SIZE: usize = 256 * 1024; // read_text_file 默认最大读取 256KB
+const MAX_REGEX_FILE_SIZE: u64 = 64 * 1024 * 1024; // regex_replace 拒绝处理超过 64MB 的文件
 
 // ==================== 参数结构体 ====================
 
@@ -21,8 +26,6 @@ struct ReadTextFileParams {
     length: Option<usize>,
     /// 字符编码，默认utf-8。支持: gbk, gb2312, gb18030, big5, shift_jis, euc-jp, euc-kr等
     encoding: Option<String>,
-    /// 输出格式: markdown(默认，元信息+代码块)/json(纯文本格式)
-    output_format: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -47,8 +50,6 @@ struct ReadBinaryFileParams {
     offset: Option<u64>,
     /// 读取长度(字节)，默认到末尾
     length: Option<usize>,
-    /// 输出格式: markdown(默认，元信息+代码块)/json(纯文本格式)
-    output_format: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -66,7 +67,7 @@ struct WriteBinaryFileParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct GetFileInfoParams {
+struct FileInfoParams {
     /// 文件路径
     path: String,
 }
@@ -79,6 +80,8 @@ struct RegexReplaceParams {
     pattern: String,
     /// 替换内容，支持 $1, $2 捕获组引用
     replacement: String,
+    /// 字符串替换时使用的字符编码，默认utf-8。支持: gbk, gb2312, gb18030, big5, shift_jis, euc-jp, euc-kr等
+    encoding: Option<String>,
     /// 是否全局替换，默认true。false则仅替换首个匹配
     global: Option<bool>,
 }
@@ -97,16 +100,18 @@ struct TextSearchParams {
     extension: Option<String>,
     /// 是否递归子目录，默认true。仅path为目录时生效
     recursive: Option<bool>,
-    /// 输出格式: markdown(默认，元信息+代码块)/json(纯文本格式)
-    output_format: Option<String>,
+    /// 字符编码，默认utf-8。支持: gbk, gb2312, gb18030, big5, shift_jis, euc-jp, euc-kr等
+    encoding: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ListFilesParams {
     /// 目录路径
     path: String,
-    /// 文件名过滤(正则)，不指定则列出所有
+    /// 文件名过滤(正则)，不指定则列出所有。与 glob_pattern 二选一
     pattern: Option<String>,
+    /// Glob 通配符过滤(如 "**/*.rs" "*.txt")，比正则更直观。与 pattern 二选一
+    glob_pattern: Option<String>,
     /// 是否递归子目录，默认false
     recursive: Option<bool>,
     /// 是否包含目录项，默认true
@@ -117,8 +122,6 @@ struct ListFilesParams {
     show_size: Option<bool>,
     /// 是否显示修改时间，默认false
     show_modified: Option<bool>,
-    /// 输出格式: markdown(默认，表格)/json(纯文本格式)
-    output_format: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -159,8 +162,26 @@ struct EditFileLinesParams {
     content: Option<String>,
     /// 字符编码，默认utf-8。支持: gbk, gb2312, gb18030, big5, shift_jis, euc-jp, euc-kr等
     encoding: Option<String>,
-    /// 输出格式: text(默认)/json
-    output_format: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct CopyFilesParams {
+    /// 源文件路径列表
+    sources: Vec<String>,
+    /// 目标路径。如果是目录则将源文件复制到该目录下；单文件时可指定新文件名
+    target: String,
+    /// 是否覆盖已存在的目标文件，默认false
+    overwrite: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct MoveFilesParams {
+    /// 源文件路径列表
+    sources: Vec<String>,
+    /// 目标路径。如果是目录则将源文件移动到该目录下；单文件时可指定新文件名
+    target: String,
+    /// 是否覆盖已存在的目标文件，默认false
+    overwrite: Option<bool>,
 }
 
 // ==================== MCP 服务器 ====================
@@ -177,7 +198,8 @@ struct FileIoServer {
 fn normalize_path(p: &std::path::Path) -> std::path::PathBuf {
     use std::path::Component;
     let s = p.to_string_lossy();
-    let s = s.strip_prefix("\\\\?\\").unwrap_or(&s);
+    // 去除 Windows 路径前缀 \\?\ 和 \\.\
+    let s = s.strip_prefix("\\\\?\\").or_else(|| s.strip_prefix("\\\\.\\")).unwrap_or(&s);
     let p = std::path::PathBuf::from(s);
     let mut parts: Vec<Component> = Vec::new();
     for c in p.components() {
@@ -288,6 +310,53 @@ impl FileIoServer {
         }
     }
 
+    /// 自动检测文件编码：BOM → UTF-8 → 常见 CJK 编码
+    fn detect_encoding(bytes: &[u8]) -> &'static str {
+        // BOM 检测
+        if bytes.len() >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF {
+            return "utf-8";
+        }
+        if bytes.len() >= 4 && bytes[0] == 0xFF && bytes[1] == 0xFE && bytes[2] == 0x00 && bytes[3] == 0x00 {
+            return "utf-32le";
+        }
+        if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
+            return "utf-16le";
+        }
+        if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
+            return "utf-16be";
+        }
+        if bytes.len() >= 4 && bytes[0] == 0x00 && bytes[1] == 0x00 && bytes[2] == 0xFE && bytes[3] == 0xFF {
+            return "utf-32be";
+        }
+
+        // 尝试 UTF-8（无 BOM）
+        if std::str::from_utf8(bytes).is_ok() {
+            return "utf-8";
+        }
+
+        // 尝试常见 CJK 编码
+        let candidates = ["gbk", "big5", "shift_jis", "euc-jp", "euc-kr"];
+        for &enc in &candidates {
+            let encoding = encoding_rs::Encoding::for_label(enc.as_bytes()).unwrap();
+            let (_, _, had_errors) = encoding.decode(bytes);
+            if !had_errors {
+                return enc;
+            }
+        }
+
+        // 兜底用 GBK
+        "gbk"
+    }
+
+    /// 解析 encoding 参数："auto" 时自动检测，否则返回编码规范名（默认 utf-8）。校验编码有效性
+    fn resolve_encoding(param: Option<&str>, bytes: &[u8]) -> Result<&'static str, String> {
+        match param {
+            Some(name) if name.eq_ignore_ascii_case("auto") => Ok(Self::detect_encoding(bytes)),
+            Some(name) => Self::get_encoding(name).map(|e| e.name()),
+            None => Ok("utf-8"),
+        }
+    }
+
     /// 递归收集目录下符合后缀过滤的文件路径
     fn collect_files(
         dir: &std::path::Path,
@@ -374,30 +443,30 @@ impl FileIoServer {
             .map_err(|e| McpError::internal_error(format!("Seek 失败: {}", e), None))?;
 
         let remaining = (file_size - start) as usize;
-        let read_len = params.length.unwrap_or(remaining).min(remaining);
+        let max_len = params.length.unwrap_or(MAX_TEXT_READ_SIZE);
+        let read_len = max_len.min(remaining);
         let mut buffer = vec![0u8; read_len];
         file.read_exact(&mut buffer)
             .map_err(|e| McpError::internal_error(format!("读取失败: {}", e), None))?;
 
-        let encoding_name = params.encoding.as_deref().unwrap_or("utf-8");
+        let encoding_name = Self::resolve_encoding(params.encoding.as_deref(), &buffer)
+            .map_err(|e| McpError::invalid_params(e, None))?;
         let content = if encoding_name.eq_ignore_ascii_case("utf-8") {
-            String::from_utf8_lossy(&buffer).into_owned()
+            String::from_utf8(buffer).map_err(|_| {
+                McpError::internal_error(
+                    format!("文件不是有效的 UTF-8 编码（可能在偏移量 {} 处包含非法字节），请尝试指定正确的 encoding 参数", start),
+                    None,
+                )
+            })?
         } else {
             Self::decode_bytes(&buffer, encoding_name)
                 .map_err(|e| McpError::internal_error(e, None))?
         };
 
-        let output_format = params.output_format.as_deref().unwrap_or("markdown");
-        match output_format {
-            "json" => Ok(format!(
-                "文件: {}\n编码: {}\n大小: {} 字节\n读取范围: {} - {}\n内容:\n{}",
-                params.path, encoding_name, file_size, start, start + read_len as u64, content
-            )),
-            _ => Ok(format!(
-                "文件: {}\n编码: {}\n大小: {} 字节\n读取范围: {} - {}\n\n```\n{}\n```",
-                params.path, encoding_name, file_size, start, start + read_len as u64, content
-            )),
-        }
+        Ok(format!(
+            "{} | {} | {}B | [{},{})```\n{}\n```",
+            params.path, encoding_name, file_size, start, start + read_len as u64, content
+        ))
     }
 
     /// 写入文本文件
@@ -416,7 +485,8 @@ impl FileIoServer {
             p
         };
         let mode = params.mode.as_deref().unwrap_or("overwrite");
-        let encoding_name = params.encoding.as_deref().unwrap_or("utf-8");
+        let encoding_raw = params.encoding.as_deref().unwrap_or("utf-8");
+        let encoding_name = if encoding_raw.eq_ignore_ascii_case("auto") { "utf-8" } else { encoding_raw };
 
         // 按指定编码将内容转换为字节
         let bytes: Vec<u8> = if encoding_name.eq_ignore_ascii_case("utf-8") {
@@ -434,10 +504,7 @@ impl FileIoServer {
             "overwrite" => {
                 fs::write(&params.path, &bytes)
                     .map_err(|e| McpError::internal_error(format!("写入失败: {}", e), None))?;
-                Ok(format!(
-                    "已覆盖写入 {} (编码: {}, {} 字节)",
-                    params.path, encoding_name, bytes.len()
-                ))
+                Ok(format!("OK {} | {} | {}B", params.path, encoding_name, bytes.len()))
             }
             "append" => {
                 let mut file = OpenOptions::new()
@@ -449,13 +516,16 @@ impl FileIoServer {
                     })?;
                 file.write_all(&bytes)
                     .map_err(|e| McpError::internal_error(format!("追加失败: {}", e), None))?;
-                Ok(format!(
-                    "已追加到 {} (编码: {}, {} 字节)",
-                    params.path, encoding_name, bytes.len()
-                ))
+                Ok(format!("OK {} | {} | +{}B append", params.path, encoding_name, bytes.len()))
             }
             "insert" => {
                 let off = params.offset.unwrap_or(0) as usize;
+                if !std::path::Path::new(&params.path).exists() {
+                    return Err(McpError::invalid_params(
+                        format!("insert 模式需要文件已存在，但文件不存在: {}. 请使用 overwrite 模式创建新文件", params.path),
+                        None,
+                    ));
+                }
                 let original = fs::read(&params.path).map_err(|e| {
                     McpError::internal_error(format!("读取原文件失败: {}", e), None)
                 })?;
@@ -468,10 +538,7 @@ impl FileIoServer {
                 fs::write(&params.path, &new_data).map_err(|e| {
                     McpError::internal_error(format!("插入写入失败: {}", e), None)
                 })?;
-                Ok(format!(
-                    "已在偏移量 {} 处插入 {} 字节 (编码: {})，文件新大小: {} 字节",
-                    off, bytes.len(), encoding_name, new_data.len()
-                ))
+                Ok(format!("OK {} | {} | +{}B @{} | {}B", params.path, encoding_name, bytes.len(), off, new_data.len()))
             }
             _ => Ok(format!(
                 "不支持的模式: {}，可选: overwrite, append, insert",
@@ -547,17 +614,10 @@ impl FileIoServer {
             hex_dump.push_str("|\n");
         }
 
-        let output_format = params.output_format.as_deref().unwrap_or("markdown");
-        match output_format {
-            "json" => Ok(format!(
-                "文件: {}\n大小: {} 字节\n读取范围: {} - {} ({} 字节)\nHEX DUMP:\n{}",
-                params.path, file_size, start, start + read_len as u64, read_len, hex_dump
-            )),
-            _ => Ok(format!(
-                "文件: {}\n大小: {} 字节\n读取范围: {} - {} ({} 字节)\n\n```\n{}```",
-                params.path, file_size, start, start + read_len as u64, read_len, hex_dump
-            )),
-        }
+        Ok(format!(
+            "{} | {}B | [{},{})```\n{}```",
+            params.path, file_size, start, start + read_len as u64, hex_dump
+        ))
     }
 
     /// 写入十六进制数据到二进制文件
@@ -583,18 +643,25 @@ impl FileIoServer {
         } else {
             hex_str
         };
-        let clean_hex: String = hex_str
-            .chars()
-            .filter(|c| c.is_ascii_hexdigit())
-            .collect();
-
-        if clean_hex.len() % 2 != 0 {
-            return Ok("错误: 十六进制字符串长度必须为偶数".to_string());
+        // 校验：只允许十六进制字符
+        if !hex_str.chars().all(|c| c.is_ascii_hexdigit()) {
+            let invalid: String = hex_str.chars().filter(|c| !c.is_ascii_hexdigit()).collect();
+            return Err(McpError::invalid_params(
+                format!("十六进制数据包含非法字符: [{}]。只允许 0-9, A-F, a-f", invalid),
+                None,
+            ));
         }
 
-        let bytes: Result<Vec<u8>, _> = (0..clean_hex.len())
+        if hex_str.len() % 2 != 0 {
+            return Err(McpError::invalid_params(
+                "十六进制字符串长度必须为偶数".to_string(),
+                None,
+            ));
+        }
+
+        let bytes: Result<Vec<u8>, _> = (0..hex_str.len())
             .step_by(2)
-            .map(|i| u8::from_str_radix(&clean_hex[i..i + 2], 16))
+            .map(|i| u8::from_str_radix(&hex_str[i..i + 2], 16))
             .collect();
         let bytes = bytes.map_err(|e| {
             McpError::internal_error(format!("十六进制解析失败: {}", e), None)
@@ -608,11 +675,7 @@ impl FileIoServer {
             "overwrite" => {
                 fs::write(&params.path, &bytes)
                     .map_err(|e| McpError::internal_error(format!("写入失败: {}", e), None))?;
-                Ok(format!(
-                    "已覆盖写入 {} ({} 字节)",
-                    params.path,
-                    bytes.len()
-                ))
+                Ok(format!("OK {} | {}B", params.path, bytes.len()))
             }
             "append" => {
                 let mut file = OpenOptions::new()
@@ -624,11 +687,7 @@ impl FileIoServer {
                     })?;
                 file.write_all(&bytes)
                     .map_err(|e| McpError::internal_error(format!("追加失败: {}", e), None))?;
-                Ok(format!(
-                    "已追加到 {} ({} 字节)",
-                    params.path,
-                    bytes.len()
-                ))
+                Ok(format!("OK {} | +{}B append", params.path, bytes.len()))
             }
             "insert" => {
                 let off = params.offset.unwrap_or(0) as usize;
@@ -644,12 +703,7 @@ impl FileIoServer {
                 fs::write(&params.path, &new_data).map_err(|e| {
                     McpError::internal_error(format!("插入写入失败: {}", e), None)
                 })?;
-                Ok(format!(
-                    "已在偏移量 {} 处插入 {} 字节，文件新大小: {} 字节",
-                    off,
-                    bytes.len(),
-                    new_data.len()
-                ))
+                Ok(format!("OK {} | +{}B @{} | {}B", params.path, bytes.len(), off, new_data.len()))
             }
             "replace" => {
                 let off = params.offset.unwrap_or(0) as usize;
@@ -679,12 +733,12 @@ impl FileIoServer {
                 })?;
 
                 Ok(format!(
-                    "已在偏移量 {} 处替换 {} 字节为 {} 字节，文件新大小: {} 字节 (原大小: {} 字节)",
-                    off,
+                    "OK {} | {}B→{}B @{} | {}B",
+                    params.path,
                     actual_replaced,
                     bytes.len(),
-                    new_data.len(),
-                    original.len()
+                    off,
+                    new_data.len()
                 ))
             }
             _ => Ok(format!(
@@ -697,7 +751,7 @@ impl FileIoServer {
     /// 搜索文件/目录中的文本内容(正则)
     #[tool(
         name = "text_search",
-        description = "搜索文件或目录中的文本内容(正则)。path为目录时递归搜索，支持extension后缀过滤",
+        description = "搜索文件或目录中的文本内容(正则)。path为目录时递归搜索，支持extension后缀过滤，支持encoding指定编码",
         annotations(title = "文本搜索", read_only_hint = true)
     )]
     fn text_search(
@@ -712,6 +766,8 @@ impl FileIoServer {
         let case_sensitive = params.case_sensitive.unwrap_or(true);
         let max_results = params.max_results.unwrap_or(100);
         let recursive = params.recursive.unwrap_or(true);
+        let encoding_raw = params.encoding.as_deref();
+        let encoding_auto = encoding_raw.map_or(false, |e| e.eq_ignore_ascii_case("auto"));
 
         let pattern_str = if case_sensitive {
             params.pattern.clone()
@@ -731,10 +787,11 @@ impl FileIoServer {
         let path = std::path::Path::new(&params.path);
         let is_dir = path.is_dir();
 
-        // 收集需要搜索的文件列表
+        // 收集需要搜索的文件列表（使用更大的文件收集上限，避免限制搜索结果）
         let files: Vec<String> = if is_dir {
             let mut files = Vec::new();
-            Self::collect_files(path, &ext_filter, recursive, max_results, &mut files)
+            let max_files = max_results * 10; // 收集最多 10 倍于结果数量的文件
+            Self::collect_files(path, &ext_filter, recursive, max_files, &mut files)
                 .map_err(|e| McpError::internal_error(e, None))?;
             files
         } else {
@@ -751,32 +808,91 @@ impl FileIoServer {
                 break;
             }
 
-            let content = match fs::read_to_string(file_path) {
-                Ok(c) => c,
-                Err(_) => continue, // 跳过无法读取的文件（如二进制文件）
-            };
-
             searched_files += 1;
             let mut file_has_match = false;
 
-            for (line_idx, line) in content.lines().enumerate() {
-                for mat in re.find_iter(line) {
-                    if results.len() >= max_results {
-                        break;
+            if encoding_auto {
+                // auto 模式：读取字节 → 检测编码 → 解码 → 搜索
+                let bytes = match fs::read(file_path) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                let detected = Self::detect_encoding(&bytes);
+                let content = match Self::decode_bytes(&bytes, detected) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                for (line_idx, line) in content.lines().enumerate() {
+                    if results.len() >= max_results { break; }
+                    for mat in re.find_iter(line) {
+                        if results.len() >= max_results { break; }
+                        total_matches += 1;
+                        file_has_match = true;
+                        results.push(format!(
+                            "  {}:{}:{}  [{}] \"{}\"",
+                            file_path,
+                            line_idx + 1,
+                            mat.start() + 1,
+                            mat.as_str(),
+                            line.trim()
+                        ));
                     }
-                    total_matches += 1;
-                    file_has_match = true;
-                    results.push(format!(
-                        "  {}:{}:{}  [{}] \"{}\"",
-                        file_path,
-                        line_idx + 1,
-                        mat.start() + 1,
-                        mat.as_str(),
-                        line.trim()
-                    ));
                 }
-                if results.len() >= max_results {
-                    break;
+            } else {
+                let encoding_name = encoding_raw.unwrap_or("utf-8");
+                let is_utf8 = encoding_name.eq_ignore_ascii_case("utf-8");
+                if is_utf8 {
+                    // UTF-8 用 BufReader 逐行读取，避免加载整个文件到内存
+                    let file = match File::open(file_path) {
+                        Ok(f) => f,
+                        Err(_) => continue,
+                    };
+                    let reader = BufReader::new(file);
+                    for (line_idx, line_result) in reader.lines().enumerate() {
+                        if results.len() >= max_results { break; }
+                        let line = match line_result {
+                            Ok(l) => l,
+                            Err(_) => continue,
+                        };
+                        for mat in re.find_iter(&line) {
+                            if results.len() >= max_results { break; }
+                            total_matches += 1;
+                            file_has_match = true;
+                            results.push(format!(
+                                "  {}:{}:{}  [{}] \"{}\"",
+                                file_path,
+                                line_idx + 1,
+                                mat.start() + 1,
+                                mat.as_str(),
+                                line.trim()
+                            ));
+                        }
+                    }
+                } else {
+                    let bytes = match fs::read(file_path) {
+                        Ok(b) => b,
+                        Err(_) => continue,
+                    };
+                    let content = match Self::decode_bytes(&bytes, encoding_name) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    for (line_idx, line) in content.lines().enumerate() {
+                        if results.len() >= max_results { break; }
+                        for mat in re.find_iter(line) {
+                            if results.len() >= max_results { break; }
+                            total_matches += 1;
+                            file_has_match = true;
+                            results.push(format!(
+                                "  {}:{}:{}  [{}] \"{}\"",
+                                file_path,
+                                line_idx + 1,
+                                mat.start() + 1,
+                                mat.as_str(),
+                                line.trim()
+                            ));
+                        }
+                    }
                 }
             }
 
@@ -791,43 +907,28 @@ impl FileIoServer {
             String::new()
         };
 
-        let scope = if is_dir {
-            format!("目录: {} (递归: {})", params.path, if recursive { "是" } else { "否" })
-        } else {
-            format!("文件: {}", params.path)
-        };
-
         let ext_info = ext_filter.as_ref()
-            .map(|e| format!("\n后缀过滤: .{}", e))
+            .map(|e| format!(".{}", e))
             .unwrap_or_default();
 
-        let output_format = params.output_format.as_deref().unwrap_or("markdown");
-        match output_format {
-            "json" => Ok(format!(
-                "{}{}\n模式: {} (大小写: {})\n搜索文件: {} 个  匹配文件: {} 个  匹配数: {}\n结果:\n{}{}",
-                scope,
-                ext_info,
-                params.pattern,
-                if case_sensitive { "敏感" } else { "不敏感" },
-                searched_files,
-                matched_files,
-                total_matches,
-                results.join("\n"),
-                truncated
-            )),
-            _ => Ok(format!(
-                "{}{}\n模式: {} (大小写: {})\n搜索文件: {} 个  匹配文件: {} 个  匹配数: {}\n\n```\n{}{}```",
-                scope,
-                ext_info,
-                params.pattern,
-                if case_sensitive { "敏感" } else { "不敏感" },
-                searched_files,
-                matched_files,
-                total_matches,
-                results.join("\n"),
-                truncated
-            )),
-        }
+        let scope = if is_dir {
+            format!("{}", params.path)
+        } else {
+            format!("{}", params.path)
+        };
+
+        Ok(format!(
+            "{} | {} | {} | {}/{} files | {} matches{}```\n{}{}```",
+            scope,
+            params.pattern,
+            if case_sensitive { "cs" } else { "ci" },
+            matched_files,
+            searched_files,
+            total_matches,
+            if ext_info.is_empty() { String::new() } else { format!(" ext:{} ", ext_info) },
+            results.join("\n"),
+            truncated
+        ))
     }
 
     /// 正则替换文件文本
@@ -845,9 +946,40 @@ impl FileIoServer {
             p.path = self.resolve_path(&p.path)?;
             p
         };
-        let content = fs::read_to_string(&params.path).map_err(|e| {
+
+        // 检查文件大小，避免大文件导致 OOM
+        let file_size = fs::metadata(&params.path)
+            .map_err(|e| McpError::internal_error(format!("无法获取文件信息: {}", e), None))?
+            .len();
+        if file_size > MAX_REGEX_FILE_SIZE {
+            return Err(McpError::invalid_params(
+                format!(
+                    "文件过大 ({}B)，最大支持 {}B。如需处理大文件，请手动分割后操作",
+                    file_size, MAX_REGEX_FILE_SIZE
+                ),
+                None,
+            ));
+        }
+
+        let bytes = fs::read(&params.path).map_err(|e| {
             McpError::internal_error(format!("读取文件失败: {}", e), None)
         })?;
+
+        let encoding_name = Self::resolve_encoding(params.encoding.as_deref(), &bytes)
+            .map_err(|e| McpError::invalid_params(e, None))?;
+
+        // 按指定编码解码
+        let content = if encoding_name.eq_ignore_ascii_case("utf-8") {
+            String::from_utf8(bytes).map_err(|e| {
+                McpError::internal_error(
+                    format!("文件不是有效的 UTF-8 编码，请尝试指定正确的 encoding 参数: {}", e),
+                    None,
+                )
+            })?
+        } else {
+            Self::decode_bytes(&bytes, encoding_name)
+                .map_err(|e| McpError::internal_error(e, None))?
+        };
 
         let re = Regex::new(&params.pattern).map_err(|e| {
             McpError::invalid_params(format!("正则表达式错误: {}", e), None)
@@ -865,23 +997,28 @@ impl FileIoServer {
         };
 
         if count == 0 {
-            return Ok(format!(
-                "文件: {}\n模式: {}\n未找到匹配项，文件未修改",
-                params.path, params.pattern
-            ));
+            return Ok(format!("{} | {} | 0", params.path, params.pattern));
         }
 
-        fs::write(&params.path, &new_content).map_err(|e| {
+        // 按指定编码编码回字节
+        let new_bytes = if encoding_name.eq_ignore_ascii_case("utf-8") {
+            new_content.as_bytes().to_vec()
+        } else {
+            Self::encode_string(&new_content, encoding_name)
+                .map_err(|e| McpError::internal_error(e, None))?
+        };
+
+        fs::write(&params.path, &new_bytes).map_err(|e| {
             McpError::internal_error(format!("写入文件失败: {}", e), None)
         })?;
 
         Ok(format!(
-            "文件: {}\n模式: {}\n替换: {} 处\n文件大小: {} -> {} 字节",
+            "{} | {} | {} | {}B→{}B",
             params.path,
             params.pattern,
             count,
             content.len(),
-            new_content.len()
+            new_bytes.len()
         ))
     }
 
@@ -913,6 +1050,19 @@ impl FileIoServer {
             None => None,
         };
 
+        let glob_matcher = match &params.glob_pattern {
+            Some(g) => {
+                if params.pattern.is_some() {
+                    return Err(McpError::invalid_params("pattern 和 glob_pattern 不能同时使用", None));
+                }
+                let glob = Glob::new(g).map_err(|e| {
+                    McpError::invalid_params(format!("Glob 表达式错误: {}", e), None)
+                })?;
+                Some(glob.compile_matcher())
+            }
+            None => None,
+        };
+
         let mut entries = Vec::new();
         let mut file_count = 0usize;
         let mut dir_count = 0usize;
@@ -930,6 +1080,7 @@ impl FileIoServer {
         fn scan_dir(
             dir_path: &std::path::Path,
             re: &Option<Regex>,
+            glob_matcher: &Option<GlobMatcher>,
             recursive: bool,
             include_dirs: bool,
             max_results: usize,
@@ -955,17 +1106,20 @@ impl FileIoServer {
 
                 if is_dir && recursive {
                     scan_dir(
-                        &entry.path(), re, recursive, include_dirs, max_results,
+                        &entry.path(), re, glob_matcher, recursive, include_dirs, max_results,
                         show_size, show_modified, entries, file_count, dir_count,
                         scanned_dirs, total_size,
                     )?;
                     if entries.len() >= max_results { return Ok(()); }
                 }
 
-                // 决定是否匹配当前条目
-                let matched = match &re {
+                // 匹配：正则 / glob / 全部列出
+                let matched = match re {
                     Some(re) => re.is_match(&name),
-                    None => true,
+                    None => match glob_matcher {
+                        Some(gm) => gm.is_match(&name),
+                        None => true,
+                    },
                 };
                 if !matched { continue; }
 
@@ -990,6 +1144,7 @@ impl FileIoServer {
         scan_dir(
             std::path::Path::new(&params.path),
             &re,
+            &glob_matcher,
             recursive,
             include_dirs,
             max_results,
@@ -1009,82 +1164,39 @@ impl FileIoServer {
             String::new()
         };
 
-        let size_info = if show_size {
-            format!("  总大小: {} 字节", total_size)
-        } else {
-            String::new()
-        };
-
-        let output_format = params.output_format.as_deref().unwrap_or("markdown");
-        match output_format {
-            "json" => {
-                let lines: Vec<String> = entries.iter().map(|(path, is_dir, size, modified)| {
-                    let type_str = if *is_dir { "[目录]" } else { "[文件]" };
-                    let mut info = format!("  {} {}", path, type_str);
-                    if show_size && !is_dir {
-                        info.push_str(&format!("  ({} 字节)", size));
-                    }
-                    if show_modified && !modified.is_empty() {
-                        info.push_str(&format!("  [修改: {}]", modified));
-                    }
-                    info
-                }).collect();
-                Ok(format!(
-                    "目录: {}\n文件: {} 个  目录: {} 个  扫描目录: {} 个{}\n结果:\n{}{}",
-                    params.path, file_count, dir_count, scanned_dirs, size_info,
-                    lines.join("\n"), truncated
-                ))
+        // 紧凑输出
+        let has_modified = show_modified && entries.iter().any(|(_, _, _, m)| !m.is_empty());
+        let mut lines = Vec::new();
+        for (path, is_dir, size, modified) in &entries {
+            let mut parts = vec![
+                if *is_dir { "d".to_string() } else { "f".to_string() },
+                path.clone(),
+            ];
+            if show_size && !is_dir {
+                parts.push(format!("{}B", size));
             }
-            _ => {
-                // markdown 表格输出
-                let has_modified = show_modified && entries.iter().any(|(_, _, _, m)| !m.is_empty());
-                let mut table = String::from("| 名称 | 类型 |");
-                if show_size { table.push_str(" 大小 |"); }
-                if has_modified { table.push_str(" 修改时间 |"); }
-                table.push('\n');
-                table.push_str("|------|------|");
-                if show_size { table.push_str("------|"); }
-                if has_modified { table.push_str("----------|"); }
-                table.push('\n');
-
-                for (path, is_dir, size, modified) in &entries {
-                    let type_str = if *is_dir { "目录" } else { "文件" };
-                    table.push_str(&format!("| {} | {} |", path, type_str));
-                    if show_size {
-                        if *is_dir {
-                            table.push_str(" - |");
-                        } else {
-                            table.push_str(&format!(" {} 字节 |", size));
-                        }
-                    }
-                    if has_modified {
-                        if modified.is_empty() {
-                            table.push_str(" - |");
-                        } else {
-                            table.push_str(&format!(" {} |", modified));
-                        }
-                    }
-                    table.push('\n');
-                }
-
-                Ok(format!(
-                    "目录: {}\n文件: {} 个  目录: {} 个  扫描目录: {} 个{}\n\n{}{}",
-                    params.path, file_count, dir_count, scanned_dirs, size_info,
-                    table, truncated
-                ))
+            if has_modified && !modified.is_empty() {
+                parts.push(modified.clone());
             }
+            lines.push(parts.join(" "));
         }
+
+        let total = if show_size { format!(" | {}B", total_size) } else { String::new() };
+        Ok(format!(
+            "{} | {}f {}d{} | {} dirs scanned{}",
+            params.path, file_count, dir_count, total, scanned_dirs, truncated
+        ) + if lines.is_empty() { String::new() } else { format!("\n{}", lines.join("\n")) }.as_str())
     }
 
-    /// 获取文件元信息
+    /// 获取文件元信息（大小、类型、修改时间、SHA256）
     #[tool(
-        name = "get_file_info",
-        description = "获取文件/目录元信息(大小、类型、修改时间)",
+        name = "file_info",
+        description = "获取文件/目录元信息(大小、类型、修改时间、SHA256)",
         annotations(title = "获取文件信息", read_only_hint = true)
     )]
-    fn get_file_info(
+    fn file_info(
         &self,
-        Parameters(params): Parameters<GetFileInfoParams>,
+        Parameters(params): Parameters<FileInfoParams>,
     ) -> Result<String, McpError> {
         let params = {
             let mut p = params;
@@ -1100,10 +1212,10 @@ impl FileIoServer {
             .ok()
             .map(|t| {
                 t.duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| format!("{} 秒 (UNIX时间戳)", d.as_secs()))
-                    .unwrap_or_else(|_| "未知".to_string())
+                    .map(|d| format!("{}s", d.as_secs()))
+                    .unwrap_or_else(|_| "-".to_string())
             })
-            .unwrap_or_else(|| "未知".to_string());
+            .unwrap_or_else(|| "-".to_string());
 
         let file_type = if metadata.is_file() {
             "文件"
@@ -1113,12 +1225,24 @@ impl FileIoServer {
             "其他"
         };
 
+        // 计算 SHA256（仅文件，目录输出 "-"）
+        let hash = if metadata.is_file() {
+            match fs::read(&params.path) {
+                Ok(bytes) => {
+                    let mut hasher = Sha256::new();
+                    hasher.update(&bytes);
+                    let result = hasher.finalize();
+                    result.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+                }
+                Err(_) => "-".to_string(),
+            }
+        } else {
+            "-".to_string()
+        };
+
         Ok(format!(
-            "路径: {}\n类型: {}\n大小: {} 字节\n修改时间: {}",
-            params.path,
-            file_type,
-            metadata.len(),
-            modified_str
+            "{} | {} | {}B | {} | sha256:{}",
+            params.path, file_type, metadata.len(), modified_str, hash
         ))
     }
 
@@ -1155,10 +1279,7 @@ impl FileIoServer {
             McpError::internal_error(format!("删除文件失败: {}", e), None)
         })?;
 
-        Ok(format!(
-            "已删除文件: {} (原大小: {} 字节)",
-            params.path, size
-        ))
+        Ok(format!("OK {} | {}B deleted", params.path, size))
     }
 
     /// 发送HTTP请求
@@ -1216,14 +1337,14 @@ impl FileIoServer {
         let mut resp_headers = Vec::new();
         for (key, value) in response.headers().iter() {
             if let Ok(v) = value.to_str() {
-                resp_headers.push(format!("  {}: {}", key, v));
+                resp_headers.push(format!("{}: {}", key, v));
             }
         }
-        let status_line = format!("状态: {} {}", status, status_text);
+        let status_line = format!("{} {}", status, status_text);
         let headers_block = if resp_headers.is_empty() {
-            String::new()
+            "\n".to_string()
         } else {
-            format!("\n响应头:\n{}", resp_headers.join("\n"))
+            format!("\n{}\n---\n", resp_headers.join("\n"))
         };
 
         match response_type {
@@ -1236,7 +1357,7 @@ impl FileIoServer {
                     .unwrap_or(body);
 
                 Ok(format!(
-                    "{}{}\n\n```\n{}\n```",
+                    "{}{}```\n{}\n```",
                     status_line, headers_block, formatted
                 ))
             }
@@ -1250,14 +1371,14 @@ impl FileIoServer {
                     .map(|b| format!("{:02X} ", b))
                     .collect();
                 let truncated = if bytes.len() > 256 {
-                    format!("\n... 已截断，仅显示前 256 字节（共 {} 字节）", bytes.len())
+                    format!("\n... {}B total", bytes.len())
                 } else {
                     String::new()
                 };
 
                 Ok(format!(
-                    "{}{}\n大小: {} 字节\n\n```\n{}{}```",
-                    status_line, headers_block, bytes.len(), hex_preview, truncated
+                    "{}{}```\n{}{}```",
+                    status_line, headers_block, hex_preview, truncated
                 ))
             }
             _ => {
@@ -1268,7 +1389,7 @@ impl FileIoServer {
 
                 let preview = if body.len() > 100_000 {
                     format!(
-                        "{}\n... 已截断，仅显示前 100KB（共 {} 字节）",
+                        "{}\n... {}B total",
                         &body[..100_000],
                         body.len()
                     )
@@ -1277,11 +1398,186 @@ impl FileIoServer {
                 };
 
                 Ok(format!(
-                    "{}{}\n\n```\n{}\n```",
+                    "{}{}```\n{}\n```",
                     status_line, headers_block, preview
                 ))
             }
         }
+    }
+
+    /// 复制文件
+    #[tool(
+        name = "copy_files",
+        description = "批量复制文件到目标目录，或单文件复制为新文件名。支持自动创建父目录",
+        annotations(title = "复制文件", destructive_hint = true)
+    )]
+    fn copy_files(
+        &self,
+        Parameters(params): Parameters<CopyFilesParams>,
+    ) -> Result<String, McpError> {
+        let overwrite = params.overwrite.unwrap_or(false);
+        let target = self.resolve_path(&params.target)?;
+        let target_path = std::path::Path::new(&target);
+        let target_is_dir = target_path.is_dir() || !target_path.exists();
+
+        // 解析所有源文件路径
+        let sources: Vec<String> = params.sources.iter()
+            .map(|s| self.resolve_path(s))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // 校验所有源文件存在
+        for s in &sources {
+            if !std::path::Path::new(s).is_file() {
+                return Err(McpError::invalid_params(
+                    format!("源文件不存在或不是普通文件: {}", s), None,
+                ));
+            }
+        }
+
+        // 如果是多文件，目标必须是目录
+        if sources.len() > 1 && target_path.exists() && !target_is_dir {
+            return Err(McpError::invalid_params(
+                format!("多文件复制时目标必须是目录: {}", target), None,
+            ));
+        }
+
+        // 确保目标目录存在
+        if target_is_dir {
+            fs::create_dir_all(target_path)
+                .map_err(|e| McpError::internal_error(format!("创建目标目录失败: {}", e), None))?;
+        } else {
+            // 单文件且目标不是目录，确保父目录存在
+            if let Some(parent) = target_path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| McpError::internal_error(format!("创建父目录失败: {}", e), None))?;
+            }
+        }
+
+        let mut copied = 0u64;
+        let mut results = Vec::new();
+
+        for src in &sources {
+            let src_path = std::path::Path::new(src);
+            let file_name = src_path.file_name().ok_or_else(|| {
+                McpError::invalid_params(format!("无法获取文件名: {}", src), None)
+            })?;
+
+            let dest = if target_is_dir {
+                target_path.join(file_name)
+            } else {
+                target_path.to_path_buf()
+            };
+
+            if dest.exists() && !overwrite {
+                results.push(format!("跳过 {} (已存在)", dest.display()));
+                continue;
+            }
+
+            let size = fs::metadata(src)
+                .map_err(|e| McpError::internal_error(format!("无法读取源文件信息: {}", e), None))?
+                .len();
+
+            fs::copy(src, &dest)
+                .map_err(|e| McpError::internal_error(format!("复制失败 {} -> {}: {}", src, dest.display(), e), None))?;
+
+            copied += size;
+            results.push(format!("OK {} -> {} | {}B", src, dest.display(), size));
+        }
+
+        Ok(format!(
+            "{} | {} files | {}B copied\n{}",
+            if target_is_dir { target.to_string() } else { target_path.to_string_lossy().to_string() },
+            results.len(),
+            copied,
+            results.join("\n"),
+        ))
+    }
+
+    /// 移动/重命名文件
+    #[tool(
+        name = "move_files",
+        description = "批量移动文件到目标目录，或单文件重命名。支持自动创建父目录",
+        annotations(title = "移动文件", destructive_hint = true)
+    )]
+    fn move_files(
+        &self,
+        Parameters(params): Parameters<MoveFilesParams>,
+    ) -> Result<String, McpError> {
+        let overwrite = params.overwrite.unwrap_or(false);
+        let target = self.resolve_path(&params.target)?;
+        let target_path = std::path::Path::new(&target);
+        let target_is_dir = target_path.is_dir() || !target_path.exists();
+
+        // 解析所有源文件路径
+        let sources: Vec<String> = params.sources.iter()
+            .map(|s| self.resolve_path(s))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // 校验所有源文件存在
+        for s in &sources {
+            if !std::path::Path::new(s).is_file() {
+                return Err(McpError::invalid_params(
+                    format!("源文件不存在或不是普通文件: {}", s), None,
+                ));
+            }
+        }
+
+        // 如果是多文件，目标必须是目录
+        if sources.len() > 1 && target_path.exists() && !target_is_dir {
+            return Err(McpError::invalid_params(
+                format!("多文件移动时目标必须是目录: {}", target), None,
+            ));
+        }
+
+        // 确保目标目录存在
+        if target_is_dir {
+            fs::create_dir_all(target_path)
+                .map_err(|e| McpError::internal_error(format!("创建目标目录失败: {}", e), None))?;
+        } else {
+            if let Some(parent) = target_path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| McpError::internal_error(format!("创建父目录失败: {}", e), None))?;
+            }
+        }
+
+        let mut moved = 0u64;
+        let mut results = Vec::new();
+
+        for src in &sources {
+            let src_path = std::path::Path::new(src);
+            let file_name = src_path.file_name().ok_or_else(|| {
+                McpError::invalid_params(format!("无法获取文件名: {}", src), None)
+            })?;
+
+            let dest = if target_is_dir {
+                target_path.join(file_name)
+            } else {
+                target_path.to_path_buf()
+            };
+
+            if dest.exists() && !overwrite {
+                results.push(format!("跳过 {} (已存在)", dest.display()));
+                continue;
+            }
+
+            let size = fs::metadata(src)
+                .map_err(|e| McpError::internal_error(format!("无法读取源文件信息: {}", e), None))?
+                .len();
+
+            fs::rename(src, &dest)
+                .map_err(|e| McpError::internal_error(format!("移动失败 {} -> {}: {}", src, dest.display(), e), None))?;
+
+            moved += size;
+            results.push(format!("OK {} -> {} | {}B", src, dest.display(), size));
+        }
+
+        Ok(format!(
+            "{} | {} files | {}B moved\n{}",
+            if target_is_dir { target.to_string() } else { target_path.to_string_lossy().to_string() },
+            results.len(),
+            moved,
+            results.join("\n"),
+        ))
     }
 
     /// 按行编辑文件：删除/插入/替换/追加行
@@ -1299,8 +1595,6 @@ impl FileIoServer {
         })?;
         let target = self.resolve_path(&target)?;
 
-        let encoding_name = params.encoding.as_deref().unwrap_or("utf-8");
-
         // 读取文件字节
         let bytes = fs::read(&target).map_err(|e| {
             match e.kind() {
@@ -1313,6 +1607,9 @@ impl FileIoServer {
                 _ => McpError::internal_error(format!("读取文件失败: {}", e), None),
             }
         })?;
+
+        let encoding_name = Self::resolve_encoding(params.encoding.as_deref(), &bytes)
+            .map_err(|e| McpError::invalid_params(e, None))?;
 
         // 按编码解码为字符串
         let file_content = if encoding_name.eq_ignore_ascii_case("utf-8") {
@@ -1342,7 +1639,7 @@ impl FileIoServer {
                     ));
                 }
                 modified.drain(start - 1..end);
-                format!("成功删除第 {} 到第 {} 行", start, end)
+                format!("del {}~{}", start, end)
             }
 
             "insert_lines" => {
@@ -1369,7 +1666,7 @@ impl FileIoServer {
                 new.extend(insert_lines);
                 new.extend(modified);
                 modified = new;
-                format!("成功在第 {} 行插入内容", start)
+                format!("ins @{}", start)
             }
 
             "replace_lines" => {
@@ -1393,7 +1690,7 @@ impl FileIoServer {
                     .map(|s| s.trim_end_matches('\r').to_string())
                     .collect();
                 modified.splice(start - 1..end, replace_lines);
-                format!("成功替换第 {} 到第 {} 行", start, end)
+                format!("repl {}~{}", start, end)
             }
 
             "append_lines" => {
@@ -1405,7 +1702,7 @@ impl FileIoServer {
                     .map(|s| s.trim_end_matches('\r').to_string())
                     .collect();
                 modified.extend(append_lines);
-                format!("成功在文件末尾追加内容")
+                format!("append")
             }
 
             _ => {
@@ -1439,21 +1736,7 @@ impl FileIoServer {
             }
         })?;
 
-        let fmt = params.output_format.as_deref().unwrap_or("text");
-        if fmt == "json" {
-            let json = serde_json::json!({
-                "action": params.operation,
-                "path": target,
-                "total_lines_before": total_lines,
-                "total_lines_after": modified.len()
-            });
-            Ok(serde_json::to_string_pretty(&json).unwrap_or_default())
-        } else {
-            Ok(format!(
-                "{}\n文件: {}\n总行数: {} → {}",
-                result, target, total_lines, modified.len()
-            ))
-        }
+        Ok(format!("{} | {} | {}→{}", result, target, total_lines, modified.len()))
     }
 }
 
