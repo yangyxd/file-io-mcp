@@ -1,6 +1,6 @@
 # file-io-mcp
 
-基于 Rust 实现的 MCP (Model Context Protocol) 文件 I/O 工具服务器，通过 stdio 传输协议为 AI 客户端提供文件操作和 HTTP 请求能力。
+基于 Rust 实现的 MCP (Model Context Protocol) 文件 I/O 工具服务器，支持 **stdio**（默认）和 **Streamable HTTP** 两种传输模式，为 AI 客户端提供文件操作和 HTTP 请求能力。
 
 ## 功能概览
 
@@ -24,7 +24,8 @@
 
 ## 技术栈
 
-- **rmcp 0.16** — Rust MCP SDK，server + macros + transport-io
+- **rmcp 0.16** — Rust MCP SDK，server + macros + transport-io + transport-streamable-http-server
+- **axum 0.8** — HTTP 框架（HTTP 模式）
 - **tokio** — 异步运行时
 - **serde / serde_json** — 序列化
 - **schemars** — JSON Schema 生成（工具参数描述）
@@ -51,7 +52,7 @@ $env:LIB = "D:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSV
 
 ## 使用方式
 
-### 作为 MCP 服务器运行
+### stdio 模式（默认）
 
 编译后直接通过 stdio 运行：
 
@@ -63,7 +64,7 @@ cargo run
 ./target/release/file-io-mcp
 ```
 
-### 配置 MCP 客户端
+#### 配置 MCP 客户端
 
 在 MCP 客户端（如 Claude Desktop、Cursor 等）的配置文件中添加：
 
@@ -79,6 +80,51 @@ cargo run
 ```
 
 将 `command` 路径替换为实际的可执行文件路径即可。
+
+### HTTP 模式（Streamable HTTP）
+
+支持 [MCP Streamable HTTP 传输协议](https://spec.modelcontextprotocol.io/specification/2025-03-26/basic/transports/streamable-http/)，可通过 HTTP 端点提供 MCP 服务，适用于远程访问场景。
+
+#### 启动服务
+
+```bash
+# 默认监听 0.0.0.0:3000
+cargo run -- --http
+
+# 自定义监听地址
+cargo run -- --http --addr 127.0.0.1:8080
+
+# 发布模式
+./target/release/file-io-mcp --http --addr 0.0.0.0:3000
+```
+
+#### 配置 MCP 客户端
+
+在支持 Streamable HTTP 的 MCP 客户端中配置 `url` 方式连接：
+
+```json
+{
+  "mcpServers": {
+    "file-io": {
+      "url": "http://127.0.0.1:3000/mcp"
+    }
+  }
+}
+```
+
+#### 命令行参数
+
+| 参数 | 说明 |
+|------|------|
+| `--http` | 以 HTTP 模式启动（默认 stdio） |
+| `--addr <ADDR>` | 监听地址，格式 `IP:PORT`，默认 `0.0.0.0:3000` |
+
+#### 协议特性
+
+- **有状态会话**：通过 `mcp-session-id` 头部维持会话，支持 SSE 重连
+- **SSE 流式响应**：客户端发送 `Accept: text/event-stream` 时，服务端以 SSE 流式返回结果
+- **JSON 单次响应**：客户端发送 `Accept: application/json` 时，返回普通 JSON 响应
+- **Keep-Alive**：每 15 秒发送 ping 保持连接存活
 
 ## 工具详细说明
 

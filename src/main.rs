@@ -4,6 +4,10 @@ use rmcp::{
     schemars, tool, tool_router, tool_handler,
     ErrorData as McpError, ServerHandler, ServiceExt, transport::stdio,
 };
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpService, StreamableHttpServerConfig,
+    session::local::LocalSessionManager,
+};
 use serde::Deserialize;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -1783,7 +1787,44 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let service = FileIoServer::new(root).serve(stdio()).await?;
-    service.waiting().await?;
+    // 命令行参数解析：默认 stdio，--http 启动为 HTTP 模式
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--http") {
+        run_http(root).await?;
+    } else {
+        let service = FileIoServer::new(root).serve(stdio()).await?;
+        service.waiting().await?;
+    }
+    Ok(())
+}
+
+/// 启动 Streamable HTTP 模式（单端点 /mcp）
+async fn run_http(root: Option<std::path::PathBuf>) -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let addr: std::net::SocketAddr = args
+        .iter()
+        .position(|a| a == "--addr" || a == "-a")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| ([0, 0, 0, 0], 3000).into());
+
+    let server_root = root.clone();
+    let service: StreamableHttpService<FileIoServer, LocalSessionManager> = StreamableHttpService::new(
+        move || {
+            Ok(FileIoServer::new(server_root.clone()))
+        },
+        Default::default(),
+        StreamableHttpServerConfig {
+            stateful_mode: true,
+            sse_keep_alive: Some(std::time::Duration::from_secs(15)),
+            ..Default::default()
+        },
+    );
+
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    eprintln!("[file-io-mcp] HTTP 模式已启动，监听: http://{}/mcp", addr);
+    eprintln!("[file-io-mcp] 客户端连接示例: MCP 配置中设置 url = http://{}/mcp", addr);
+    axum::serve(listener, router).await?;
     Ok(())
 }
