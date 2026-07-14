@@ -4,14 +4,6 @@ cd /d "%~dp0"
 
 set ADDR=0.0.0.0:3790
 
-echo [file-io-mcp] 正在构建 release 版本...
-call cargo build --release
-if %ERRORLEVEL% neq 0 (
-    echo [file-io-mcp] 构建失败，请检查错误信息
-    pause
-    exit /b 1
-)
-
 REM 寻找可执行文件：优先 target\release\，其次当前目录
 set EXE_PATH=.\target\release\file-io-mcp.exe
 if not exist "%EXE_PATH%" (
