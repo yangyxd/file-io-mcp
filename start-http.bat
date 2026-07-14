@@ -3,6 +3,7 @@ chcp 65001 >nul
 cd /d "%~dp0"
 
 set ADDR=0.0.0.0:3790
+set CLIENT_ADDR=127.0.0.1:3790
 
 REM 寻找可执行文件：优先 target\release\，其次当前目录
 set EXE_PATH=.\target\release\file-io-mcp.exe
@@ -24,7 +25,7 @@ echo.
 echo   {
 echo     "mcpServers": {
 echo       "file-io": {
-echo         "url": "http://%ADDR%/mcp"
+echo         "url": "http://%CLIENT_ADDR%/mcp"
 echo       }
 echo     }
 echo   }
