@@ -168,12 +168,84 @@ struct EditFileLinesParams {
 #[derive(Clone)]
 struct FileIoServer {
     tool_router: rmcp::handler::server::router::tool::ToolRouter<Self>,
+    /// 允许访问的根目录（沙箱）。为 None 时不限制路径。
+    root: Option<std::path::PathBuf>,
+}
+
+/// 逻辑规范化路径：解析 `.` 和 `..`，并去除 Windows `\\?\` 前缀，
+/// 便于做组件级前缀比较（不访问文件系统）。
+fn normalize_path(p: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let s = p.to_string_lossy();
+    let s = s.strip_prefix("\\\\?\\").unwrap_or(&s);
+    let p = std::path::PathBuf::from(s);
+    let mut parts: Vec<Component> = Vec::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if let Some(Component::Normal(_)) = parts.last() {
+                    parts.pop();
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.into_iter().collect()
 }
 
 impl FileIoServer {
-    fn new() -> Self {
+    fn new(root: Option<std::path::PathBuf>) -> Self {
         Self {
             tool_router: Self::tool_router(),
+            root,
+        }
+    }
+
+    /// 校验并解析路径，确保不超出 root 沙箱（若配置了 root）。
+    /// 返回可用于实际文件系统操作的标准化路径字符串。
+    fn resolve_path(&self, path: &str) -> Result<String, McpError> {
+        let p = std::path::Path::new(path);
+        let abs = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|e| McpError::internal_error(format!("无法获取当前目录: {}", e), None))?
+                .join(p)
+        };
+
+        let root = match &self.root {
+            None => return Ok(abs.to_string_lossy().into_owned()),
+            Some(r) => r,
+        };
+
+        let root_norm = normalize_path(root);
+        let abs_norm = normalize_path(&abs);
+        if !abs_norm.starts_with(&root_norm) {
+            return Err(McpError::invalid_params(
+                format!(
+                    "路径超出允许的根目录: {} (根目录: {})",
+                    path,
+                    root.display()
+                ),
+                None,
+            ));
+        }
+
+        if abs.exists() {
+            let canon = abs.canonicalize().map_err(|e| {
+                McpError::internal_error(format!("无法解析路径: {}", e), None)
+            })?;
+            let canon_norm = normalize_path(&canon);
+            if !canon_norm.starts_with(&root_norm) {
+                return Err(McpError::invalid_params(
+                    format!("路径(解析符号链接后)超出允许的根目录: {}", path),
+                    None,
+                ));
+            }
+            Ok(canon.to_string_lossy().into_owned())
+        } else {
+            Ok(abs.to_string_lossy().into_owned())
         }
     }
 
@@ -274,12 +346,18 @@ impl FileIoServer {
     /// 读取文本文件
     #[tool(
         name = "read_text_file",
-        description = "读取文本文件。支持offset(字节偏移)和length(字节长度)截取，encoding指定编码(默认utf-8)"
+        description = "读取文本文件。支持offset(字节偏移)和length(字节长度)截取，encoding指定编码(默认utf-8)",
+        annotations(title = "读取文本文件", read_only_hint = true)
     )]
     fn read_text_file(
         &self,
         Parameters(params): Parameters<ReadTextFileParams>,
     ) -> Result<String, McpError> {
+        let params = {
+            let mut p = params;
+            p.path = self.resolve_path(&p.path)?;
+            p
+        };
         let mut file = File::open(&params.path)
             .map_err(|e| McpError::internal_error(format!("无法打开文件: {}", e), None))?;
         let file_size = file
@@ -325,12 +403,18 @@ impl FileIoServer {
     /// 写入文本文件
     #[tool(
         name = "write_text_file",
-        description = "写入文本文件。目录不存在自动创建。mode: overwrite(默认)/append/insert，支持encoding指定编码"
+        description = "写入文本文件。目录不存在自动创建。mode: overwrite(默认)/append/insert，支持encoding指定编码",
+        annotations(title = "写入文本文件", destructive_hint = true)
     )]
     fn write_text_file(
         &self,
         Parameters(params): Parameters<WriteTextFileParams>,
     ) -> Result<String, McpError> {
+        let params = {
+            let mut p = params;
+            p.path = self.resolve_path(&p.path)?;
+            p
+        };
         let mode = params.mode.as_deref().unwrap_or("overwrite");
         let encoding_name = params.encoding.as_deref().unwrap_or("utf-8");
 
@@ -399,12 +483,18 @@ impl FileIoServer {
     /// 读取二进制文件，返回HEX dump
     #[tool(
         name = "read_binary_file",
-        description = "读取二进制文件，返回HEX dump。支持offset和length截取"
+        description = "读取二进制文件，返回HEX dump。支持offset和length截取",
+        annotations(title = "读取二进制文件", read_only_hint = true)
     )]
     fn read_binary_file(
         &self,
         Parameters(params): Parameters<ReadBinaryFileParams>,
     ) -> Result<String, McpError> {
+        let params = {
+            let mut p = params;
+            p.path = self.resolve_path(&p.path)?;
+            p
+        };
         let mut file = File::open(&params.path)
             .map_err(|e| McpError::internal_error(format!("无法打开文件: {}", e), None))?;
         let file_size = file
@@ -473,12 +563,18 @@ impl FileIoServer {
     /// 写入十六进制数据到二进制文件
     #[tool(
         name = "write_binary_file",
-        description = "写入十六进制数据到二进制文件。目录不存在自动创建。mode: overwrite/append/insert/replace"
+        description = "写入十六进制数据到二进制文件。目录不存在自动创建。mode: overwrite/append/insert/replace",
+        annotations(title = "写入二进制文件", destructive_hint = true)
     )]
     fn write_binary_file(
         &self,
         Parameters(params): Parameters<WriteBinaryFileParams>,
     ) -> Result<String, McpError> {
+        let params = {
+            let mut p = params;
+            p.path = self.resolve_path(&p.path)?;
+            p
+        };
         let mode = params.mode.as_deref().unwrap_or("overwrite");
         // 兼容处理：去掉 0x 前缀
         let hex_str = params.hex_data.trim();
@@ -601,12 +697,18 @@ impl FileIoServer {
     /// 搜索文件/目录中的文本内容(正则)
     #[tool(
         name = "text_search",
-        description = "搜索文件或目录中的文本内容(正则)。path为目录时递归搜索，支持extension后缀过滤"
+        description = "搜索文件或目录中的文本内容(正则)。path为目录时递归搜索，支持extension后缀过滤",
+        annotations(title = "文本搜索", read_only_hint = true)
     )]
     fn text_search(
         &self,
         Parameters(params): Parameters<TextSearchParams>,
     ) -> Result<String, McpError> {
+        let params = {
+            let mut p = params;
+            p.path = self.resolve_path(&p.path)?;
+            p
+        };
         let case_sensitive = params.case_sensitive.unwrap_or(true);
         let max_results = params.max_results.unwrap_or(100);
         let recursive = params.recursive.unwrap_or(true);
@@ -731,12 +833,18 @@ impl FileIoServer {
     /// 正则替换文件文本
     #[tool(
         name = "regex_replace",
-        description = "正则替换文件文本。支持$1/$2捕获组引用。global默认true全局替换"
+        description = "正则替换文件文本。支持$1/$2捕获组引用。global默认true全局替换",
+        annotations(title = "正则替换", destructive_hint = true)
     )]
     fn regex_replace(
         &self,
         Parameters(params): Parameters<RegexReplaceParams>,
     ) -> Result<String, McpError> {
+        let params = {
+            let mut p = params;
+            p.path = self.resolve_path(&p.path)?;
+            p
+        };
         let content = fs::read_to_string(&params.path).map_err(|e| {
             McpError::internal_error(format!("读取文件失败: {}", e), None)
         })?;
@@ -780,12 +888,18 @@ impl FileIoServer {
     /// 列出或搜索目录内容
     #[tool(
         name = "list_files",
-        description = "列出目录内容或按文件名正则搜索文件。支持递归子目录、过滤、显示大小和修改时间"
+        description = "列出目录内容或按文件名正则搜索文件。支持递归子目录、过滤、显示大小和修改时间",
+        annotations(title = "列出目录", read_only_hint = true)
     )]
     fn list_files(
         &self,
         Parameters(params): Parameters<ListFilesParams>,
     ) -> Result<String, McpError> {
+        let params = {
+            let mut p = params;
+            p.path = self.resolve_path(&p.path)?;
+            p
+        };
         let recursive = params.recursive.unwrap_or(false);
         let include_dirs = params.include_dirs.unwrap_or(true);
         let max_results = params.max_results.unwrap_or(500);
@@ -965,12 +1079,18 @@ impl FileIoServer {
     /// 获取文件元信息
     #[tool(
         name = "get_file_info",
-        description = "获取文件/目录元信息(大小、类型、修改时间)"
+        description = "获取文件/目录元信息(大小、类型、修改时间)",
+        annotations(title = "获取文件信息", read_only_hint = true)
     )]
     fn get_file_info(
         &self,
         Parameters(params): Parameters<GetFileInfoParams>,
     ) -> Result<String, McpError> {
+        let params = {
+            let mut p = params;
+            p.path = self.resolve_path(&p.path)?;
+            p
+        };
         let metadata = fs::metadata(&params.path).map_err(|e| {
             McpError::internal_error(format!("无法获取文件信息: {}", e), None)
         })?;
@@ -1005,12 +1125,18 @@ impl FileIoServer {
     /// 删除文件(需用户确认)
     #[tool(
         name = "delete_file",
-        description = "删除文件(不可目录)。不可逆，需用户确认"
+        description = "删除文件(不可目录)。不可逆，需用户确认",
+        annotations(title = "删除文件", destructive_hint = true)
     )]
     fn delete_file(
         &self,
         Parameters(params): Parameters<DeleteFileParams>,
     ) -> Result<String, McpError> {
+        let params = {
+            let mut p = params;
+            p.path = self.resolve_path(&p.path)?;
+            p
+        };
         let path = std::path::Path::new(&params.path);
 
         if !path.exists() {
@@ -1038,7 +1164,8 @@ impl FileIoServer {
     /// 发送HTTP请求
     #[tool(
         name = "fetch",
-        description = "发送HTTP请求。支持GET/POST/PUT/DELETE/PATCH/HEAD、自定义headers、body、响应格式(text/json/binary)"
+        description = "发送HTTP请求。支持GET/POST/PUT/DELETE/PATCH/HEAD、自定义headers、body、响应格式(text/json/binary)",
+        annotations(title = "HTTP 请求", open_world_hint = true)
     )]
     async fn fetch(
         &self,
@@ -1160,7 +1287,8 @@ impl FileIoServer {
     /// 按行编辑文件：删除/插入/替换/追加行
     #[tool(
         name = "edit_file_lines",
-        description = "按行编辑文件内容。支持 delete_lines(删除行)、insert_lines(插入行)、replace_lines(替换行)、append_lines(追加行)。行号从1开始计数。支持多种编码"
+        description = "按行编辑文件内容。支持 delete_lines(删除行)、insert_lines(插入行)、replace_lines(替换行)、append_lines(追加行)。行号从1开始计数。支持多种编码",
+        annotations(title = "按行编辑文件", destructive_hint = true)
     )]
     fn edit_file_lines(
         &self,
@@ -1169,6 +1297,7 @@ impl FileIoServer {
         let target = params.path.or(params.file_path).ok_or_else(|| {
             McpError::invalid_params("缺少 path 或 file_path 参数", None)
         })?;
+        let target = self.resolve_path(&target)?;
 
         let encoding_name = params.encoding.as_deref().unwrap_or("utf-8");
 
@@ -1337,14 +1466,41 @@ impl ServerHandler for FileIoServer {
                 .enable_tools()
                 .build(),
             server_info: rmcp::model::Implementation::from_build_env(),
-            instructions: None,
+            instructions: Some(
+                "文件 I/O 工具服务器。若启动时设置了 FILE_IO_ROOT 环境变量，则所有文件操作都被限制在该根目录内（沙箱）。\
+                 delete_file、write_*、edit_file_lines、regex_replace 会修改或删除文件，属于破坏性操作，请谨慎使用。\
+                 fetch 会与外部网络交互。".into(),
+            ),
         }
     }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let service = FileIoServer::new().serve(stdio()).await?;
+    // 可选的安全沙箱：通过环境变量 FILE_IO_ROOT 限制可访问的根目录。
+    // 未设置时不限制路径（向后兼容），但生产环境建议配置以防越权访问。
+    let root = match std::env::var("FILE_IO_ROOT") {
+        Ok(r) if !r.trim().is_empty() => {
+            let p = std::path::PathBuf::from(r.trim());
+            let p = if p.is_absolute() {
+                p
+            } else {
+                std::env::current_dir()?.join(p)
+            };
+            if !p.exists() {
+                std::fs::create_dir_all(&p)?;
+            }
+            let canon = p.canonicalize()?;
+            eprintln!("[file-io-mcp] 已启用路径沙箱，根目录: {}", canon.display());
+            Some(canon)
+        }
+        _ => {
+            eprintln!("[file-io-mcp] 警告: 未设置 FILE_IO_ROOT，文件访问不限制路径。生产环境建议配置以限制可访问范围。");
+            None
+        }
+    };
+
+    let service = FileIoServer::new(root).serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
 }
