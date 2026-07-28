@@ -4,22 +4,23 @@
 
 ## 功能概览
 
-共提供 **13 个工具**，覆盖文本/二进制文件读写、行编辑、搜索、正则处理、文件批量操作、目录管理和网络请求。
+共提供 **14 个工具**，覆盖文本/二进制文件读写、行编辑、搜索、正则处理、文件批量操作、目录管理和网络请求。
 
 | 工具 | 说明 |
 |------|------|
-| `read_text_file` | 读取文本文件，支持 offset/length 截取、多编码和自动编码检测 |
-| `write_text_file` | 写入文本文件，支持覆盖/追加/插入模式，自动创建目录 |
-| `read_binary_file` | 读取二进制文件，返回 HEX dump 格式 |
-| `write_binary_file` | 写入十六进制数据到二进制文件，支持覆盖/追加/插入/替换模式 |
-| `edit_file_lines` | 按行编辑文件：删除行、插入行、替换行、追加行 |
-| `text_search` | 搜索文件/目录中的文本内容（正则），支持后缀过滤、递归和 BufReader 流式读取 |
-| `regex_replace` | 正则替换文件文本，支持捕获组引用和全局/单次替换（64MB 文件上限） |
-| `list_files` | 列出/搜索目录内容，支持正则过滤、glob 通配符、递归子目录、显示大小和修改时间 |
-| `copy_files` | 批量复制文件到目标目录，或单文件复制为新文件名 |
-| `move_files` | 批量移动文件到目标目录，或单文件重命名 |
-| `file_info` | 获取文件/目录元信息（大小、类型、修改时间、SHA256） |
-| `delete_file` | 删除指定文件（不可逆，需用户确认） |
+| `read_text_file` | 字节级读取文本，支持 offset/length 截取、多编码自动检测 |
+| `read_text_lines` | 行号级读取文本，自带行号前缀，专为 `edit_file_lines` 配套 |
+| `write_text_file` | 写入文本，支持覆盖/追加/插入模式，自动创建目录 |
+| `read_binary_file` | 读取二进制文件，返回 HEX dump（地址+十六进制+ASCII 预览） |
+| `write_binary_file` | 写入十六进制数据，支持覆盖/追加/插入/替换模式 |
+| `edit_file_lines` | 按行编辑：删/插/替/追，行号 1-based，`expected_old` 防行号算错 |
+| `text_search` | 文件/目录内容正则搜索，支持后缀过滤、递归、流式读取 |
+| `regex_replace` | 正则替换文件文本，支持捕获组、全局/单次（64MB 上限） |
+| `list_files` | 列目录/搜文件名，支持正则+glob 过滤、递归、大小和修改时间 |
+| `copy_files` | 批量复制文件到目录，或单文件改名复制 |
+| `move_files` | 批量移动文件到目录，或单文件重命名 |
+| `file_info` | 获取元信息：大小、类型、修改时间、SHA256 |
+| `delete_file` | 删除文件（不可逆，需用户确认） |
 | `fetch` | 发送 HTTP 请求，支持 GET/POST/PUT/DELETE/PATCH/HEAD |
 
 ## 技术栈
@@ -130,25 +131,48 @@ cargo run -- --http --addr 127.0.0.1:8080
 
 ### read_text_file
 
-读取文本文件内容。
+字节级读取文本文件内容。适用于读配置、解析内容、已知字节位置的读取。如需配合 `edit_file_lines` 编辑代码，请优先使用 `read_text_lines`。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `path` | string | 是 | 文件路径 |
 | `offset` | u64 | 否 | 起始偏移量(字节)，默认 0 |
-| `length` | usize | 否 | 读取长度(字节)，默认 256KB（未指定时自动限制，防止大文件 OOM） |
-| `encoding` | string | 否 | 字符编码，默认 utf-8。设为 `"auto"` 自动检测（BOM → UTF-8 → GBK/Big5/Shift_JIS…） |
+| `length` | usize | 否 | 读取长度(字节)，默认 256KB（上限，防止大文件 OOM） |
+| `encoding` | string | 否 | 字符编码，默认 utf-8。`"auto"` 自动检测（BOM → UTF-8 → GBK/Big5/Shift_JIS…） |
+| `show_line_numbers` | bool | 否 | 每行前显示行号，默认 false |
 
 **支持的编码**：utf-8, gbk, gb2312, gb18030, big5, shift_jis, euc-jp, euc-kr, utf-16le, utf-16be, iso-8859-1 等。
-
-**输出格式：**
-```
-路径 | 编码 | 大小B | [起始,结束)```内容
-```
 
 ```json
 { "path": "data/config.txt", "encoding": "auto" }
 { "path": "data/config.txt", "encoding": "gbk", "length": 1024 }
+```
+
+### read_text_lines
+
+行号级读取文本文件内容。每行前带行号前缀（1-based），与 `edit_file_lines` 配套使用可避免行号算错。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `path` | string | 是 | 文件路径 |
+| `start_line` | usize | 否 | 起始行号（1-based），默认 1 |
+| `end_line` | usize | 否 | 结束行号（含），默认到文件末尾 |
+| `encoding` | string | 否 | 字符编码，默认 utf-8。`"auto"` 自动检测 |
+
+**输出示例：**
+```
+src/main.rs | utf-8 | 4096B | 120 lines total | [10-15]```
+ 10| fn foo() {
+ 11|     let x = 1;
+ 12|     println!("{}", x);
+ 13| }
+ 14| 
+ 15| fn bar() {
+```
+
+```json
+{ "path": "src/main.rs", "start_line": 10, "end_line": 50 }
+{ "path": "data/cn.txt", "encoding": "auto" }
 ```
 
 ### write_text_file
@@ -202,7 +226,7 @@ cargo run -- --http --addr 127.0.0.1:8080
 
 ### edit_file_lines
 
-按行编辑文件内容，支持删除、插入、替换、追加四种行操作。行号从 **1 开始计数**。
+按行编辑文件内容。行号从 **1 开始计数**，建议配合 `read_text_lines` 使用。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
@@ -212,7 +236,8 @@ cargo run -- --http --addr 127.0.0.1:8080
 | `start_line` | usize | 视操作 | 起始行号（1-based），delete/insert/replace 使用 |
 | `end_line` | usize | 视操作 | 结束行号（1-based），delete/replace 使用 |
 | `content` | string | 视操作 | 要插入/替换/追加的内容，多行用 `\n` 分隔 |
-| `encoding` | string | 否 | 字符编码，默认 utf-8。设为 `"auto"` 自动检测 |
+| `encoding` | string | 否 | 字符编码，默认 utf-8。`"auto"` 自动检测 |
+| `expected_old` | string | 否 | 期望的旧行内容。delete/replace 使用：若实际内容不匹配则拒绝操作，防止行号算错 |
 
 **操作说明：**
 
@@ -223,11 +248,19 @@ cargo run -- --http --addr 127.0.0.1:8080
 | `replace_lines` | `start_line`, `end_line`, `content` | 将 `start_line` 到 `end_line` 替换为 `content` |
 | `append_lines` | `content` | 在文件末尾追加 `content` 内容 |
 
+> 💡 **最佳实践**：`delete_lines` / `replace_lines` 时务必传 `expected_old`，把从 `read_text_lines` 读到的目标行原样传入。行号算错时工具会拒绝操作并返回实际内容，不会破坏文件。
+
 **示例：**
 
-删除第 3-5 行：
+删除第 3-5 行（带校验）：
 ```json
-{ "operation": "delete_lines", "path": "data/file.txt", "start_line": 3, "end_line": 5 }
+{
+  "operation": "delete_lines",
+  "path": "data/file.txt",
+  "start_line": 3,
+  "end_line": 5,
+  "expected_old": "old line 3\nold line 4\nold line 5"
+}
 ```
 
 在第 10 行前插入两行：
@@ -235,9 +268,16 @@ cargo run -- --http --addr 127.0.0.1:8080
 { "operation": "insert_lines", "path": "data/file.txt", "start_line": 10, "content": "line1\nline2" }
 ```
 
-替换第 2-4 行：
+替换第 2-4 行（带校验）：
 ```json
-{ "operation": "replace_lines", "path": "data/file.txt", "start_line": 2, "end_line": 4, "content": "new line" }
+{
+  "operation": "replace_lines",
+  "path": "data/file.txt",
+  "start_line": 2,
+  "end_line": 4,
+  "content": "new line 2\nnew line 3",
+  "expected_old": "old line 2\nold line 3\nold line 4"
+}
 ```
 
 追加内容到末尾：

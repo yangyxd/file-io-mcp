@@ -30,6 +30,20 @@ struct ReadTextFileParams {
     length: Option<usize>,
     /// 字符编码，默认utf-8。支持: gbk, gb2312, gb18030, big5, shift_jis, euc-jp, euc-kr等
     encoding: Option<String>,
+    /// 是否在每行前显示行号，默认false。如需按行编辑配合 edit_file_lines，请使用 read_text_lines 工具
+    show_line_numbers: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ReadTextLinesParams {
+    /// 文件路径
+    path: String,
+    /// 起始行号(1-based)，默认1
+    start_line: Option<usize>,
+    /// 结束行号(1-based，包含)，默认到末尾
+    end_line: Option<usize>,
+    /// 字符编码，默认utf-8。支持: gbk, gb2312, gb18030, big5, shift_jis, euc-jp, euc-kr等
+    encoding: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -166,6 +180,8 @@ struct EditFileLinesParams {
     content: Option<String>,
     /// 字符编码，默认utf-8。支持: gbk, gb2312, gb18030, big5, shift_jis, euc-jp, euc-kr等
     encoding: Option<String>,
+    /// 期望的旧内容(delete/replace操作使用)。若提供，会与实际文件的目标行进行比对，不匹配则拒绝操作。用于防止行号算错导致误改。
+    expected_old: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -419,7 +435,7 @@ impl FileIoServer {
     /// 读取文本文件
     #[tool(
         name = "read_text_file",
-        description = "读取文本文件。支持offset(字节偏移)和length(字节长度)截取，encoding指定编码(默认utf-8)",
+        description = "字节级读取文本。支持offset/length截取（字节），encoding指定编码，show_line_numbers可开启行号显示（默认false）。需配合edit_file_lines请用read_text_lines",
         annotations(title = "读取文本文件", read_only_hint = true)
     )]
     fn read_text_file(
@@ -431,6 +447,7 @@ impl FileIoServer {
             p.path = self.resolve_path(&p.path)?;
             p
         };
+        let show_ln = params.show_line_numbers.unwrap_or(false);
         let mut file = File::open(&params.path)
             .map_err(|e| McpError::internal_error(format!("无法打开文件: {}", e), None))?;
         let file_size = file
@@ -439,6 +456,20 @@ impl FileIoServer {
             .len();
 
         let start = params.offset.unwrap_or(0);
+
+        // 若需要显示行号且有偏移，需先读取前面的内容数行数
+        let prefix_line_count = if show_ln && start > 0 {
+            file.seek(SeekFrom::Start(0))
+                .map_err(|e| McpError::internal_error(format!("Seek 失败: {}", e), None))?;
+            let mut prefix_buf = vec![0u8; start as usize];
+            file.read_exact(&mut prefix_buf)
+                .map_err(|e| McpError::internal_error(format!("读取前缀失败: {}", e), None))?;
+            // 数前缀中的换行数（即偏移位置处已经过了多少行，行号从1开始，所以行数+1是起始行号）
+            prefix_buf.iter().filter(|&&b| b == b'\n').count()
+        } else {
+            0
+        };
+
         if start >= file_size {
             return Ok(format!("偏移量 {} 超出文件大小 {}", start, file_size));
         }
@@ -467,16 +498,36 @@ impl FileIoServer {
                 .map_err(|e| McpError::internal_error(e, None))?
         };
 
+        let display_content = if show_ln {
+            // 起始行号：前缀的换行数 + 1（1-based）
+            let start_line = prefix_line_count + 1;
+            let width = (start_line + content.lines().count()).to_string().len().max(3);
+            content
+                .lines()
+                .enumerate()
+                .map(|(i, line)| format!("{:>width$}| {}", start_line + i, line, width = width))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            content.clone()
+        };
+
         Ok(format!(
-            "{} | {} | {}B | [{},{})```\n{}\n```",
-            params.path, encoding_name, file_size, start, start + read_len as u64, content
+            "{} | {} | {}B | [{},{}){}```\n{}\n```",
+            params.path,
+            encoding_name,
+            file_size,
+            start,
+            start + read_len as u64,
+            if show_ln { " | lines" } else { "" },
+            display_content
         ))
     }
 
     /// 写入文本文件
     #[tool(
         name = "write_text_file",
-        description = "写入文本文件。目录不存在自动创建。mode: overwrite(默认)/append/insert，支持encoding指定编码",
+        description = "写入文本。目录不存在自动创建。mode: overwrite(默认)/append(字节尾追加)/insert(指定字节offset插入)，支持encoding指定编码",
         annotations(title = "写入文本文件", destructive_hint = true)
     )]
     fn write_text_file(
@@ -551,10 +602,90 @@ impl FileIoServer {
         }
     }
 
+    /// 按行号读取文本文件（与 edit_file_lines 配合使用，避免行号算错）
+    #[tool(
+        name = "read_text_lines",
+        description = "行号级读取文本。行号1-based，输出自带行号前缀，与edit_file_lines配套使用避免行号算错。支持encoding多编码。",
+        annotations(title = "按行读取文本", read_only_hint = true)
+    )]
+    fn read_text_lines(
+        &self,
+        Parameters(params): Parameters<ReadTextLinesParams>,
+    ) -> Result<String, McpError> {
+        let params = {
+            let mut p = params;
+            p.path = self.resolve_path(&p.path)?;
+            p
+        };
+        let bytes = fs::read(&params.path).map_err(|e| {
+            match e.kind() {
+                std::io::ErrorKind::NotFound => {
+                    McpError::internal_error(format!("文件不存在: {}", params.path), None)
+                }
+                std::io::ErrorKind::PermissionDenied => {
+                    McpError::internal_error(format!("没有权限读取文件: {}", params.path), None)
+                }
+                _ => McpError::internal_error(format!("读取文件失败: {}", e), None),
+            }
+        })?;
+
+        let file_size = bytes.len();
+        let encoding_name = Self::resolve_encoding(params.encoding.as_deref(), &bytes)
+            .map_err(|e| McpError::invalid_params(e, None))?;
+
+        let file_content = if encoding_name.eq_ignore_ascii_case("utf-8") {
+            String::from_utf8_lossy(&bytes).into_owned()
+        } else {
+            Self::decode_bytes(&bytes, encoding_name)
+                .map_err(|e| McpError::internal_error(e, None))?
+        };
+
+        // 拆分行，保留换行符风格的信息
+        let lines: Vec<&str> = file_content.split('\n').collect();
+        let total_lines = lines.len();
+
+        let start = params.start_line.unwrap_or(1).max(1);
+        let end = params.end_line.unwrap_or(total_lines).min(total_lines);
+
+        if start > end {
+            return Err(McpError::invalid_params(
+                format!("行号范围无效: start_line({}) > end_line({})，文件总行数: {}", start, end, total_lines),
+                None,
+            ));
+        }
+        if start > total_lines {
+            return Err(McpError::invalid_params(
+                format!("start_line({}) 超出文件总行数({})", start, total_lines),
+                None,
+            ));
+        }
+
+        // 行号显示宽度
+        let width = total_lines.to_string().len().max(3);
+        let selected: Vec<String> = lines
+            .iter()
+            .enumerate()
+            .skip(start - 1)
+            .take(end - start + 1)
+            .map(|(i, s)| format!("{:>width$}| {}", i + 1, s.trim_end_matches('\r'), width = width))
+            .collect();
+
+        Ok(format!(
+            "{} | {} | {}B | {} lines total | [{}-{}]```\n{}\n```",
+            params.path,
+            encoding_name,
+            file_size,
+            total_lines,
+            start,
+            end,
+            selected.join("\n")
+        ))
+    }
+
     /// 读取二进制文件，返回HEX dump
     #[tool(
         name = "read_binary_file",
-        description = "读取二进制文件，返回HEX dump。支持offset和length截取",
+        description = "读取二进制文件，返回HEX dump（地址+十六进制+ASCII预览）。支持offset/length截取（字节）",
         annotations(title = "读取二进制文件", read_only_hint = true)
     )]
     fn read_binary_file(
@@ -627,7 +758,7 @@ impl FileIoServer {
     /// 写入十六进制数据到二进制文件
     #[tool(
         name = "write_binary_file",
-        description = "写入十六进制数据到二进制文件。目录不存在自动创建。mode: overwrite/append/insert/replace",
+        description = "写入十六进制数据到二进制文件。目录不存在自动创建。mode: overwrite(默认)/append/insert(offset插入)/replace(offset+replace_length)",
         annotations(title = "写入二进制文件", destructive_hint = true)
     )]
     fn write_binary_file(
@@ -755,7 +886,7 @@ impl FileIoServer {
     /// 搜索文件/目录中的文本内容(正则)
     #[tool(
         name = "text_search",
-        description = "搜索文件或目录中的文本内容(正则)。path为目录时递归搜索，支持extension后缀过滤，支持encoding指定编码",
+        description = "搜索文件或目录中的文本（正则）。path为目录时递归，支持extension后缀过滤、max_results、case_sensitive，BufReader流式读取大文件",
         annotations(title = "文本搜索", read_only_hint = true)
     )]
     fn text_search(
@@ -938,7 +1069,7 @@ impl FileIoServer {
     /// 正则替换文件文本
     #[tool(
         name = "regex_replace",
-        description = "正则替换文件文本。支持$1/$2捕获组引用。global默认true全局替换",
+        description = "正则替换文件文本。支持$1/$2捕获组引用。global默认true全局替换。文件上限64MB（防止OOM）",
         annotations(title = "正则替换", destructive_hint = true)
     )]
     fn regex_replace(
@@ -1029,7 +1160,7 @@ impl FileIoServer {
     /// 列出或搜索目录内容
     #[tool(
         name = "list_files",
-        description = "列出目录内容或按文件名正则搜索文件。支持递归子目录、过滤、显示大小和修改时间",
+        description = "列目录内容或按文件名搜索。支持正则pattern或glob_pattern过滤、recursive递归、show_size/show_modified元信息、include_dirs、max_results",
         annotations(title = "列出目录", read_only_hint = true)
     )]
     fn list_files(
@@ -1195,7 +1326,7 @@ impl FileIoServer {
     /// 获取文件元信息（大小、类型、修改时间、SHA256）
     #[tool(
         name = "file_info",
-        description = "获取文件/目录元信息(大小、类型、修改时间、SHA256)",
+        description = "获取文件/目录元信息：路径、类型、大小、修改时间(UNIX时间戳)、SHA256哈希",
         annotations(title = "获取文件信息", read_only_hint = true)
     )]
     fn file_info(
@@ -1253,7 +1384,7 @@ impl FileIoServer {
     /// 删除文件(需用户确认)
     #[tool(
         name = "delete_file",
-        description = "删除文件(不可目录)。不可逆，需用户确认",
+        description = "删除单个文件（不可删除目录）。不可逆，需用户确认授权",
         annotations(title = "删除文件", destructive_hint = true)
     )]
     fn delete_file(
@@ -1289,7 +1420,7 @@ impl FileIoServer {
     /// 发送HTTP请求
     #[tool(
         name = "fetch",
-        description = "发送HTTP请求。支持GET/POST/PUT/DELETE/PATCH/HEAD、自定义headers、body、响应格式(text/json/binary)",
+        description = "发送HTTP请求，与fetch API一致。支持GET/POST/PUT/DELETE/PATCH/HEAD、自定义headers、body、response_type(text/json/binary)、timeout",
         annotations(title = "HTTP 请求", open_world_hint = true)
     )]
     async fn fetch(
@@ -1412,7 +1543,7 @@ impl FileIoServer {
     /// 复制文件
     #[tool(
         name = "copy_files",
-        description = "批量复制文件到目标目录，或单文件复制为新文件名。支持自动创建父目录",
+        description = "批量复制文件到目标目录，或单文件改名复制。支持自动创建父目录、overwrite覆盖开关",
         annotations(title = "复制文件", destructive_hint = true)
     )]
     fn copy_files(
@@ -1500,7 +1631,7 @@ impl FileIoServer {
     /// 移动/重命名文件
     #[tool(
         name = "move_files",
-        description = "批量移动文件到目标目录，或单文件重命名。支持自动创建父目录",
+        description = "批量移动文件到目标目录，或单文件重命名。支持自动创建父目录、overwrite覆盖开关",
         annotations(title = "移动文件", destructive_hint = true)
     )]
     fn move_files(
@@ -1587,7 +1718,7 @@ impl FileIoServer {
     /// 按行编辑文件：删除/插入/替换/追加行
     #[tool(
         name = "edit_file_lines",
-        description = "按行编辑文件内容。支持 delete_lines(删除行)、insert_lines(插入行)、replace_lines(替换行)、append_lines(追加行)。行号从1开始计数。支持多种编码",
+        description = "按行编辑：delete_lines/insert_lines/replace_lines/append_lines。行号1-based。delete/replace强烈建议传expected_old做内容校验，不匹配则拒绝操作防止行号算错毁文件",
         annotations(title = "按行编辑文件", destructive_hint = true)
     )]
     fn edit_file_lines(
@@ -1628,6 +1759,51 @@ impl FileIoServer {
         let total_lines = lines.len();
         let mut modified: Vec<String> = lines.iter().map(|&s| s.to_string()).collect();
 
+        // 辅助：对期望旧内容进行比对（用于防止行号算错）
+        let check_expected_old = |range: std::ops::Range<usize>, expected: &str| -> Result<(), McpError> {
+            let actual_lines: Vec<String> = lines[range.clone()]
+                .iter()
+                .map(|s| s.trim_end_matches('\r').to_string())
+                .collect();
+            // 逐行比较，兼容 \r\n
+            let expected_lines: Vec<&str> = expected.split('\n').collect();
+            let matches = expected_lines.len() == actual_lines.len()
+                && expected_lines.iter().zip(actual_lines.iter()).all(|(e, a)| e.trim_end_matches('\r') == a.as_str());
+            if !matches {
+                // 输出实际内容 (附近 ±2 行上下文)
+                let ctx_start = (range.start.saturating_sub(2)).max(0);
+                let ctx_end = (range.end + 2).min(total_lines);
+                let width = total_lines.to_string().len().max(3);
+                let mut ctx = String::new();
+                for i in ctx_start..ctx_end {
+                    let mark = if i >= range.start && i < range.end { ">>>" } else { "   " };
+                    ctx.push_str(&format!(
+                        "{} {:>width$}| {}\n",
+                        mark,
+                        i + 1,
+                        lines[i].trim_end_matches('\r'),
+                        width = width
+                    ));
+                }
+                return Err(McpError::invalid_params(
+                    format!(
+                        "expected_old 不匹配！行号可能算错了。期望 {}~{} 行的实际内容与提供的 expected_old 不一致。\n\
+                         文件总行数: {}\n\
+                         === 期望内容({}行):\n{}\n\
+                         === 实际内容(上下文 >>> 标记目标行):\n{}",
+                        range.start + 1,
+                        range.end,
+                        total_lines,
+                        expected_lines.len(),
+                        expected,
+                        ctx
+                    ),
+                    None,
+                ));
+            }
+            Ok(())
+        };
+
         let result = match params.operation.as_str() {
             "delete_lines" => {
                 let start = params.start_line.ok_or_else(|| {
@@ -1641,6 +1817,9 @@ impl FileIoServer {
                         format!("行号范围无效: {}-{}，文件总行数: {}", start, end, total_lines),
                         None,
                     ));
+                }
+                if let Some(ref exp) = params.expected_old.as_deref() {
+                    check_expected_old((start - 1)..end, exp)?;
                 }
                 modified.drain(start - 1..end);
                 format!("del {}~{}", start, end)
@@ -1688,6 +1867,9 @@ impl FileIoServer {
                         format!("行号范围无效: {}-{}，文件总行数: {}", start, end, total_lines),
                         None,
                     ));
+                }
+                if let Some(ref exp) = params.expected_old.as_deref() {
+                    check_expected_old((start - 1)..end, exp)?;
                 }
                 let replace_lines: Vec<String> = replace_content
                     .split('\n')
