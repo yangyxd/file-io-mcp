@@ -137,8 +137,8 @@ cargo run -- --http --addr 127.0.0.1:8080
 |------|------|------|------|
 | `path` | string | 是 | 文件路径 |
 | `offset` | u64 | 否 | 起始偏移量(字节)，默认 0 |
-| `length` | usize | 否 | 读取长度(字节)，默认 256KB（上限，防止大文件 OOM） |
-| `encoding` | string | 否 | 字符编码，默认 utf-8。`"auto"` 自动检测（BOM → UTF-8 → GBK/Big5/Shift_JIS…） |
+| `length` | usize | 否 | 读取长度(字节)，默认 10MB 上限。超过会截断并在返回头标注 ⚠️ 已截断 |
+| `encoding` | string | 否 | 字符编码，默认自动检测并返回文件实际编码（BOM → UTF-8 → GBK/Big5/Shift_JIS…），也可显式指定 |
 | `show_line_numbers` | bool | 否 | 每行前显示行号，默认 false |
 
 **支持的编码**：utf-8, gbk, gb2312, gb18030, big5, shift_jis, euc-jp, euc-kr, utf-16le, utf-16be, iso-8859-1 等。
@@ -157,7 +157,7 @@ cargo run -- --http --addr 127.0.0.1:8080
 | `path` | string | 是 | 文件路径 |
 | `start_line` | usize | 否 | 起始行号（1-based），默认 1 |
 | `end_line` | usize | 否 | 结束行号（含），默认到文件末尾 |
-| `encoding` | string | 否 | 字符编码，默认 utf-8。`"auto"` 自动检测 |
+| `encoding` | string | 否 | 字符编码，默认自动检测并返回文件实际编码。`"auto"` 显式自动检测 |
 
 **输出示例：**
 ```
@@ -185,7 +185,8 @@ src/main.rs | utf-8 | 4096B | 120 lines total | [10-15]```
 | `content` | string | 是 | 写入内容 |
 | `mode` | string | 否 | `overwrite`(默认) / `append` / `insert` |
 | `offset` | u64 | 否 | insert 模式下的插入位置(字节) |
-| `encoding` | string | 否 | 字符编码，默认 utf-8。`"auto"` 时自动使用 UTF-8 |
+| `encoding` | string | 否 | 字符编码。默认自动保持原文件编码（新文件用 UTF-8）；显式指定与实际不一致会拒绝写入并返回真实编码 |
+| `expected_old` | string | 否 | 写前校验，按 mode 匹配"当前想改范围"的内容：overwrite=整个文件、append=文件末尾、insert=offset 附近。与实际不一致则拒绝写入并返回该范围实际内容 |
 
 ```json
 { "path": "logs/app.log", "content": "新日志行\n", "mode": "append" }
@@ -236,8 +237,8 @@ src/main.rs | utf-8 | 4096B | 120 lines total | [10-15]```
 | `start_line` | usize | 视操作 | 起始行号（1-based），delete/insert/replace 使用 |
 | `end_line` | usize | 视操作 | 结束行号（1-based），delete/replace 使用 |
 | `content` | string | 视操作 | 要插入/替换/追加的内容，多行用 `\n` 分隔 |
-| `encoding` | string | 否 | 字符编码，默认 utf-8。`"auto"` 自动检测 |
-| `expected_old` | string | 否 | 期望的旧行内容。delete/replace 使用：若实际内容不匹配则拒绝操作，防止行号算错 |
+| `encoding` | string | 否 | 字符编码。默认自动保持原文件编码；显式指定与实际不一致会拒绝写入并返回真实编码 |
+| `expected_old` | string | delete/replace 必填 | 期望的旧行内容（read_text_lines 读到的原行原样传入）。若实际内容不匹配则拒绝操作，防止行号算错 |
 
 **操作说明：**
 
@@ -248,7 +249,7 @@ src/main.rs | utf-8 | 4096B | 120 lines total | [10-15]```
 | `replace_lines` | `start_line`, `end_line`, `content` | 将 `start_line` 到 `end_line` 替换为 `content` |
 | `append_lines` | `content` | 在文件末尾追加 `content` 内容 |
 
-> 💡 **最佳实践**：`delete_lines` / `replace_lines` 时务必传 `expected_old`，把从 `read_text_lines` 读到的目标行原样传入。行号算错时工具会拒绝操作并返回实际内容，不会破坏文件。
+> 💡 **最佳实践**：`delete_lines` / `replace_lines` **必须**传 `expected_old`，把从 `read_text_lines` 读到的目标行原样传入。行号算错时工具会拒绝操作并返回实际内容，不会破坏文件。编辑会自动保持原文件的 CRLF/LF 换行风格与编码。
 
 **示例：**
 
@@ -314,6 +315,8 @@ src/main.rs | utf-8 | 4096B | 120 lines total | [10-15]```
 | `pattern` | string | 是 | 正则表达式 |
 | `replacement` | string | 是 | 替换内容，支持 `$1`, `$2` 捕获组引用 |
 | `global` | bool | 否 | 全局替换，默认 true |
+| `dry_run` | bool | 否 | 仅预览不写入：返回匹配数量、前 20 处替换预览及新文件大小，默认 false |
+| `max_matches` | usize | 否 | 匹配数量上限，超过则拒绝执行（防止正则过宽/匹配空串误伤），默认 10000 |
 | `encoding` | string | 否 | 字符编码，默认 utf-8。设为 `"auto"` 自动检测 |
 
 > ⚠️ 文件大小限制：超过 64MB 的文件会返回错误提示，防止 OOM。

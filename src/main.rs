@@ -15,7 +15,7 @@ use regex::Regex;
 use globset::{Glob, GlobMatcher};
 use sha2::{Sha256, Digest};
 
-const MAX_TEXT_READ_SIZE: usize = 256 * 1024; // read_text_file 默认最大读取 256KB
+const MAX_TEXT_READ_SIZE: usize = 10 * 1024 * 1024; // read_text_file 默认最大读取 10MB，超过则在返回头显著标注已截断
 const MAX_REGEX_FILE_SIZE: u64 = 64 * 1024 * 1024; // regex_replace 拒绝处理超过 64MB 的文件
 
 // ==================== 参数结构体 ====================
@@ -26,7 +26,7 @@ struct ReadTextFileParams {
     path: String,
     /// 起始偏移量(字节)，默认0
     offset: Option<u64>,
-    /// 读取长度(字节)，默认到末尾
+    /// 读取长度(字节)，默认 10MB 上限。文件更大时会截断并在返回头显著标注，可用 offset 分页读取剩余部分
     length: Option<usize>,
     /// 字符编码，默认utf-8。支持: gbk, gb2312, gb18030, big5, shift_jis, euc-jp, euc-kr等
     encoding: Option<String>,
@@ -58,6 +58,8 @@ struct WriteTextFileParams {
     offset: Option<u64>,
     /// 字符编码，默认utf-8。支持: gbk, gb2312, gb18030, big5, shift_jis, euc-jp, euc-kr等
     encoding: Option<String>,
+    /// 期望的旧内容（overwrite 模式写前校验）。若提供且与文件当前内容不一致，则拒绝写入并返回文件完整内容，防止未完整读取就整文件覆盖
+    expected_old: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -102,6 +104,10 @@ struct RegexReplaceParams {
     encoding: Option<String>,
     /// 是否全局替换，默认true。false则仅替换首个匹配
     global: Option<bool>,
+    /// 是否仅预览不写入（dry-run）。true 时返回匹配数量、前20处替换预览及新文件大小，不修改文件。默认 false
+    dry_run: Option<bool>,
+    /// 匹配数量上限，超过则拒绝执行（防止正则过宽或匹配空串导致误替换）。默认 10000
+    max_matches: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -180,7 +186,7 @@ struct EditFileLinesParams {
     content: Option<String>,
     /// 字符编码，默认utf-8。支持: gbk, gb2312, gb18030, big5, shift_jis, euc-jp, euc-kr等
     encoding: Option<String>,
-    /// 期望的旧内容(delete/replace操作使用)。若提供，会与实际文件的目标行进行比对，不匹配则拒绝操作。用于防止行号算错导致误改。
+    /// 期望的旧内容(delete/replace操作必传)。与实际文件的目标行进行比对，不匹配则拒绝操作。用于防止行号算错导致误改。
     expected_old: Option<String>,
 }
 
@@ -377,6 +383,140 @@ impl FileIoServer {
         }
     }
 
+    /// 计算字节的 SHA256 十六进制
+    fn sha256_hex(data: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let result = hasher.finalize();
+        result.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+    }
+
+    /// 写入类操作的写前校验：防止 AI 在未确认当前内容的情况下误写。
+    /// expected_old 按 mode 匹配"当前想改范围"的内容：
+    /// - overwrite: 整个文件
+    /// - append: 文件末尾（追加点）
+    /// - insert: 插入点 offset 附近
+    /// 不匹配则拒绝写入，并返回该范围的当前内容。
+    fn check_write_guard(
+        path: &str,
+        encoding_name: &str,
+        mode: &str,
+        offset: Option<u64>,
+        expected_old: Option<&str>,
+    ) -> Result<(), McpError> {
+        let Some(exp) = expected_old else {
+            return Ok(());
+        };
+        if !std::path::Path::new(path).exists() {
+            return Err(McpError::invalid_params(
+                format!(
+                    "文件不存在: {}。已提供 expected_old 说明期望文件存在，请核对路径",
+                    path
+                ),
+                None,
+            ));
+        }
+        let bytes = fs::read(path)
+            .map_err(|e| McpError::internal_error(format!("读取文件失败: {}", e), None))?;
+
+        let actual_content = if encoding_name.eq_ignore_ascii_case("utf-8") {
+            String::from_utf8_lossy(&bytes).into_owned()
+        } else {
+            Self::decode_bytes(&bytes, encoding_name)
+                .map_err(|e| McpError::internal_error(e, None))?
+        };
+
+        // 按模式确定"当前想改范围"并比对
+        let (matched, scope, shown): (bool, String, String) = match mode {
+            "append" => {
+                // 匹配文件末尾内容（追加点）
+                let tail: String = actual_content
+                    .chars()
+                    .rev()
+                    .take(exp.chars().count())
+                    .collect::<Vec<char>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                let shown: String = actual_content
+                    .chars()
+                    .rev()
+                    .take(1000)
+                    .collect::<Vec<char>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                (tail == exp, "文件末尾(追加点)".to_string(), shown)
+            }
+            "insert" => {
+                // 匹配插入点 offset 附近内容
+                let off = offset.unwrap_or(0) as usize;
+                let char_off = actual_content.floor_char_boundary(off.min(actual_content.len()));
+                let window: String = actual_content[char_off..]
+                    .chars()
+                    .take(exp.chars().count())
+                    .collect();
+                let s = actual_content.floor_char_boundary(char_off.saturating_sub(400));
+                let shown: String = actual_content[s..].chars().take(800).collect();
+                (window == exp, format!("插入点 offset={}", off), shown)
+            }
+            _ => {
+                (actual_content == exp, "整个文件".to_string(), actual_content.clone())
+            }
+        };
+
+        if matched {
+            return Ok(());
+        }
+        Err(McpError::invalid_params(
+            format!(
+                "expected_old 不匹配，拒绝写入！文件可能已被修改或你未完整读取。\n=== 当前想改范围[{}]的实际内容:\n{}",
+                scope, shown
+            ),
+            None,
+        ))
+    }
+
+    /// 写入类操作的编码决策：
+    /// - 文件已存在：检测实际编码；未指定或 auto 时保持原编码写回；
+    ///   显式指定编码与实际不一致时直接报错，并返回文件真实编码（防止编码被悄悄改坏）。
+    /// - 文件不存在（新建）：按指定编码（默认 utf-8）。
+    fn resolve_write_encoding(
+        path: &str,
+        requested: Option<&str>,
+        existing_bytes: Option<&[u8]>,
+    ) -> Result<&'static str, McpError> {
+        let actual = existing_bytes.map(Self::detect_encoding);
+        let req = match requested {
+            Some(name) if name.eq_ignore_ascii_case("auto") => None,
+            Some(name) => Some(name),
+            None => None,
+        };
+        match (req, actual) {
+            (None, Some(act)) => Ok(act),
+            (None, None) => Ok("utf-8"),
+            (Some(r), None) => {
+                let enc = Self::get_encoding(r).map_err(|e| McpError::invalid_params(e, None))?;
+                Ok(enc.name())
+            }
+            (Some(r), Some(act)) => {
+                let enc = Self::get_encoding(r).map_err(|e| McpError::invalid_params(e, None))?;
+                let rn = enc.name();
+                if rn.eq_ignore_ascii_case(act) {
+                    return Ok(rn);
+                }
+                Err(McpError::invalid_params(
+                    format!(
+                        "编码不一致，拒绝写入！文件 {} 的实际编码是 [{}]，但你指定的编码是 [{}]。直接写入会导致编码混乱。\n\
+                         请改用 encoding='{}' 保持原编码后重新调用",
+                        path, act, rn, act
+                    ),
+                    None,
+                ))
+            }
+        }
+    }
+
     /// 递归收集目录下符合后缀过滤的文件路径
     fn collect_files(
         dir: &std::path::Path,
@@ -435,7 +575,7 @@ impl FileIoServer {
     /// 读取文本文件
     #[tool(
         name = "read_text_file",
-        description = "字节级读取文本。支持offset/length截取（字节），encoding指定编码，show_line_numbers可开启行号显示（默认false）。需配合edit_file_lines请用read_text_lines",
+        description = "字节级读取文本。支持offset/length截取（字节），encoding默认自动检测并返回文件实际编码，show_line_numbers可开启行号显示（默认false）。需配合edit_file_lines请用read_text_lines",
         annotations(title = "读取文本文件", read_only_hint = true)
     )]
     fn read_text_file(
@@ -480,11 +620,12 @@ impl FileIoServer {
         let remaining = (file_size - start) as usize;
         let max_len = params.length.unwrap_or(MAX_TEXT_READ_SIZE);
         let read_len = max_len.min(remaining);
+        let truncated = read_len < remaining;
         let mut buffer = vec![0u8; read_len];
         file.read_exact(&mut buffer)
             .map_err(|e| McpError::internal_error(format!("读取失败: {}", e), None))?;
 
-        let encoding_name = Self::resolve_encoding(params.encoding.as_deref(), &buffer)
+        let encoding_name = Self::resolve_encoding(params.encoding.as_deref().or(Some("auto")), &buffer)
             .map_err(|e| McpError::invalid_params(e, None))?;
         let content = if encoding_name.eq_ignore_ascii_case("utf-8") {
             String::from_utf8(buffer).map_err(|_| {
@@ -512,9 +653,19 @@ impl FileIoServer {
             content.clone()
         };
 
+        let trunc_warn = if truncated {
+            format!(
+                " ⚠️已截断: 文件共 {}B，仅返回 [{},{})。若要完整编辑请改用 read_text_lines，或用 offset 分页读取剩余部分",
+                file_size, start, start + read_len as u64
+            )
+        } else {
+            String::new()
+        };
+
         Ok(format!(
-            "{} | {} | {}B | [{},{}){}```\n{}\n```",
+            "{}{} | {} | {}B | [{},{}){}```\n{}\n```",
             params.path,
+            trunc_warn,
             encoding_name,
             file_size,
             start,
@@ -527,7 +678,7 @@ impl FileIoServer {
     /// 写入文本文件
     #[tool(
         name = "write_text_file",
-        description = "写入文本。目录不存在自动创建。mode: overwrite(默认)/append(字节尾追加)/insert(指定字节offset插入)，支持encoding指定编码",
+        description = "写入文本。目录不存在自动创建。mode: overwrite(默认)/append(追加)/insert(指定字节offset插入)。建议传expected_old做写前校验：与\"当前想改范围\"（overwrite=整个文件/append=文件末尾/insert=offset附近）不一致会拒绝写入并返回该范围实际内容，防止未读全文件就误写。encoding未指定/auto时自动保持原文件编码；显式指定编码与实际文件编码不一致会拒绝并返回真实编码",
         annotations(title = "写入文本文件", destructive_hint = true)
     )]
     fn write_text_file(
@@ -540,8 +691,22 @@ impl FileIoServer {
             p
         };
         let mode = params.mode.as_deref().unwrap_or("overwrite");
-        let encoding_raw = params.encoding.as_deref().unwrap_or("utf-8");
-        let encoding_name = if encoding_raw.eq_ignore_ascii_case("auto") { "utf-8" } else { encoding_raw };
+
+        // 若文件已存在，读取原字节用于编码检测（写前保持原编码）
+        let existing_bytes: Option<Vec<u8>> = if std::path::Path::new(&params.path).exists() {
+            Some(fs::read(&params.path).map_err(|e| {
+                McpError::internal_error(format!("读取原文件失败: {}", e), None)
+            })?)
+        } else {
+            None
+        };
+
+        // 决定写入编码：未指定/auto 时保持原文件编码；指定编码与实际不一致时直接报错返回真实编码
+        let encoding_name = Self::resolve_write_encoding(
+            &params.path,
+            params.encoding.as_deref(),
+            existing_bytes.as_deref(),
+        )?;
 
         // 按指定编码将内容转换为字节
         let bytes: Vec<u8> = if encoding_name.eq_ignore_ascii_case("utf-8") {
@@ -554,6 +719,15 @@ impl FileIoServer {
         // 自动创建父目录
         Self::ensure_parent_dir(&params.path)
             .map_err(|e| McpError::internal_error(e, None))?;
+
+        // 写前校验（按 mode 校验"当前想改范围"的内容）：防止未确认当前内容就误写
+        Self::check_write_guard(
+            &params.path,
+            encoding_name,
+            mode,
+            params.offset,
+            params.expected_old.as_deref(),
+        )?;
 
         match mode {
             "overwrite" => {
@@ -605,7 +779,7 @@ impl FileIoServer {
     /// 按行号读取文本文件（与 edit_file_lines 配合使用，避免行号算错）
     #[tool(
         name = "read_text_lines",
-        description = "行号级读取文本。行号1-based，输出自带行号前缀，与edit_file_lines配套使用避免行号算错。支持encoding多编码。",
+        description = "行号级读取文本。行号1-based，输出自带行号前缀，与edit_file_lines配套使用避免行号算错。encoding默认自动检测并返回文件实际编码，支持多编码。",
         annotations(title = "按行读取文本", read_only_hint = true)
     )]
     fn read_text_lines(
@@ -630,7 +804,7 @@ impl FileIoServer {
         })?;
 
         let file_size = bytes.len();
-        let encoding_name = Self::resolve_encoding(params.encoding.as_deref(), &bytes)
+        let encoding_name = Self::resolve_encoding(params.encoding.as_deref().or(Some("auto")), &bytes)
             .map_err(|e| McpError::invalid_params(e, None))?;
 
         let file_content = if encoding_name.eq_ignore_ascii_case("utf-8") {
@@ -1069,7 +1243,7 @@ impl FileIoServer {
     /// 正则替换文件文本
     #[tool(
         name = "regex_replace",
-        description = "正则替换文件文本。支持$1/$2捕获组引用。global默认true全局替换。文件上限64MB（防止OOM）",
+        description = "正则替换文件文本。支持$1/$2捕获组引用。global默认true全局替换。支持 dry_run 预览（只返回匹配数与替换预览，不写入文件）。匹配数超过 max_matches(默认10000) 会拒绝执行，防止正则过宽或匹配空串误伤。文件上限64MB（防止OOM）",
         annotations(title = "正则替换", destructive_hint = true)
     )]
     fn regex_replace(
@@ -1121,18 +1295,65 @@ impl FileIoServer {
         })?;
 
         let global = params.global.unwrap_or(true);
-        let (new_content, count) = if global {
-            let count = re.find_iter(&content).count();
-            let result = re.replace_all(&content, params.replacement.as_str());
-            (result.into_owned(), count)
+        let max_matches = params.max_matches.unwrap_or(10000);
+
+        // 计算匹配数（带上限，防止匹配空串/过宽正则时计数爆炸）
+        let count = if global {
+            re.find_iter(&content).take(max_matches + 1).count()
         } else {
-            let count = if re.is_match(&content) { 1 } else { 0 };
-            let result = re.replacen(&content, 1, params.replacement.as_str());
-            (result.into_owned(), count)
+            if re.is_match(&content) { 1 } else { 0 }
         };
 
         if count == 0 {
             return Ok(format!("{} | {} | 0", params.path, params.pattern));
+        }
+        if count > max_matches {
+            return Err(McpError::invalid_params(
+                format!(
+                    "匹配数量 {} 超过上限 {}，拒绝执行！请检查正则是否过宽或匹配了空串。确认无误可设置 max_matches 调高上限",
+                    count, max_matches
+                ),
+                None,
+            ));
+        }
+
+        let new_content = if global {
+            re.replace_all(&content, params.replacement.as_str()).into_owned()
+        } else {
+            re.replacen(&content, 1, params.replacement.as_str()).into_owned()
+        };
+
+        // dry-run：只预览不写入
+        if params.dry_run.unwrap_or(false) {
+            let mut preview = String::new();
+            for (i, mat) in re.find_iter(&content).take(20).enumerate() {
+                let replaced = re
+                    .captures_at(&content, mat.start())
+                    .map(|caps| {
+                        let mut out = String::new();
+                        caps.expand(params.replacement.as_str(), &mut out);
+                        out
+                    })
+                    .unwrap_or_else(|| params.replacement.clone());
+                preview.push_str(&format!(
+                    "  #{}: \"{}\" => \"{}\"\n",
+                    i + 1,
+                    mat.as_str(),
+                    replaced
+                ));
+            }
+            if count > 20 {
+                preview.push_str(&format!("  ... 共 {} 处匹配，仅预览前 20 处\n", count));
+            }
+            return Ok(format!(
+                "{} | DRY-RUN | {} | {} matches | 未写入文件\n{}新文件大小: {}B → {}B\n确认无误后去掉 dry_run 重新调用以实际写入",
+                params.path,
+                params.pattern,
+                count,
+                preview,
+                content.len(),
+                new_content.len()
+            ));
         }
 
         // 按指定编码编码回字节
@@ -1363,12 +1584,7 @@ impl FileIoServer {
         // 计算 SHA256（仅文件，目录输出 "-"）
         let hash = if metadata.is_file() {
             match fs::read(&params.path) {
-                Ok(bytes) => {
-                    let mut hasher = Sha256::new();
-                    hasher.update(&bytes);
-                    let result = hasher.finalize();
-                    result.iter().map(|b| format!("{:02x}", b)).collect::<String>()
-                }
+                Ok(bytes) => Self::sha256_hex(&bytes),
                 Err(_) => "-".to_string(),
             }
         } else {
@@ -1718,7 +1934,7 @@ impl FileIoServer {
     /// 按行编辑文件：删除/插入/替换/追加行
     #[tool(
         name = "edit_file_lines",
-        description = "按行编辑：delete_lines/insert_lines/replace_lines/append_lines。行号1-based。delete/replace强烈建议传expected_old做内容校验，不匹配则拒绝操作防止行号算错毁文件",
+        description = "按行编辑：delete_lines/insert_lines/replace_lines/append_lines。行号1-based。delete_lines/replace_lines 必须传 expected_old（read_text_lines 读到的原行原样传入）做内容校验，不匹配则拒绝操作防止行号算错毁文件。自动保持原文件 CRLF/LF 换行风格与编码（显式指定编码与实际不一致会拒绝并返回真实编码）",
         annotations(title = "按行编辑文件", destructive_hint = true)
     )]
     fn edit_file_lines(
@@ -1743,8 +1959,8 @@ impl FileIoServer {
             }
         })?;
 
-        let encoding_name = Self::resolve_encoding(params.encoding.as_deref(), &bytes)
-            .map_err(|e| McpError::invalid_params(e, None))?;
+        // 决定编辑编码：默认保持原文件编码；指定编码与实际不一致时直接报错返回真实编码
+        let encoding_name = Self::resolve_write_encoding(&target, params.encoding.as_deref(), Some(&bytes))?;
 
         // 按编码解码为字符串
         let file_content = if encoding_name.eq_ignore_ascii_case("utf-8") {
@@ -1754,10 +1970,17 @@ impl FileIoServer {
                 .map_err(|e| McpError::internal_error(e, None))?
         };
 
-        // 拆分行（保留尾部 \r 以兼容 \r\n 换行符）
-        let lines: Vec<&str> = file_content.split('\n').collect();
+        // 检测原文件主换行风格（CRLF/LF），写回时统一恢复，避免局部编辑产生混合换行
+        let crlf_count = file_content.matches("\r\n").count();
+        let total_lf = file_content.matches('\n').count();
+        let line_ending = if crlf_count * 2 > total_lf { "\r\n" } else { "\n" };
+        // 拆分为"裸行"（去掉行尾 \r），后续操作在裸行上进行，写回时统一补行尾符
+        let lines: Vec<String> = file_content
+            .split('\n')
+            .map(|s| s.trim_end_matches('\r').to_string())
+            .collect();
         let total_lines = lines.len();
-        let mut modified: Vec<String> = lines.iter().map(|&s| s.to_string()).collect();
+        let mut modified: Vec<String> = lines.clone();
 
         // 辅助：对期望旧内容进行比对（用于防止行号算错）
         let check_expected_old = |range: std::ops::Range<usize>, expected: &str| -> Result<(), McpError> {
@@ -1818,9 +2041,13 @@ impl FileIoServer {
                         None,
                     ));
                 }
-                if let Some(ref exp) = params.expected_old.as_deref() {
-                    check_expected_old((start - 1)..end, exp)?;
-                }
+                let exp = params.expected_old.as_deref().ok_or_else(|| {
+                    McpError::invalid_params(
+                        "delete_lines 必须提供 expected_old（将 read_text_lines 读到的目标行原样传入），用于防止行号算错",
+                        None,
+                    )
+                })?;
+                check_expected_old((start - 1)..end, exp)?;
                 modified.drain(start - 1..end);
                 format!("del {}~{}", start, end)
             }
@@ -1868,9 +2095,13 @@ impl FileIoServer {
                         None,
                     ));
                 }
-                if let Some(ref exp) = params.expected_old.as_deref() {
-                    check_expected_old((start - 1)..end, exp)?;
-                }
+                let exp = params.expected_old.as_deref().ok_or_else(|| {
+                    McpError::invalid_params(
+                        "replace_lines 必须提供 expected_old（将 read_text_lines 读到的目标行原样传入），用于防止行号算错",
+                        None,
+                    )
+                })?;
+                check_expected_old((start - 1)..end, exp)?;
                 let replace_lines: Vec<String> = replace_content
                     .split('\n')
                     .map(|s| s.trim_end_matches('\r').to_string())
@@ -1902,7 +2133,7 @@ impl FileIoServer {
             }
         };
 
-        let new_content = modified.join("\n");
+        let new_content = modified.join(line_ending);
         let new_bytes = if encoding_name.eq_ignore_ascii_case("utf-8") {
             new_content.as_bytes().to_vec()
         } else {
