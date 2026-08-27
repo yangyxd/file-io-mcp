@@ -426,6 +426,9 @@ impl FileIoServer {
                 .map_err(|e| McpError::internal_error(e, None))?
         };
 
+        // CRLF 归一化：read_text_lines 读取时已去除行尾 \r，比较前统一归一避免误拒
+        let norm = |s: &str| s.replace("\r\n", "\n");
+
         // 按模式确定"当前想改范围"并比对
         let (matched, scope, shown): (bool, String, String) = match mode {
             "append" => {
@@ -446,7 +449,7 @@ impl FileIoServer {
                     .into_iter()
                     .rev()
                     .collect();
-                (tail == exp, "文件末尾(追加点)".to_string(), shown)
+                (norm(&tail) == norm(exp), "文件末尾(追加点)".to_string(), shown)
             }
             "insert" => {
                 // 匹配插入点 offset 附近内容
@@ -458,10 +461,10 @@ impl FileIoServer {
                     .collect();
                 let s = actual_content.floor_char_boundary(char_off.saturating_sub(400));
                 let shown: String = actual_content[s..].chars().take(800).collect();
-                (window == exp, format!("插入点 offset={}", off), shown)
+                (norm(&window) == norm(exp), format!("插入点 offset={}", off), shown)
             }
             _ => {
-                (actual_content == exp, "整个文件".to_string(), actual_content.clone())
+                (norm(&actual_content) == norm(exp), "整个文件".to_string(), actual_content.clone())
             }
         };
 
@@ -575,7 +578,7 @@ impl FileIoServer {
     /// 读取文本文件
     #[tool(
         name = "read_text_file",
-        description = "字节级读取文本。支持offset/length截取（字节），encoding默认自动检测并返回文件实际编码，show_line_numbers可开启行号显示（默认false）。需配合edit_file_lines请用read_text_lines",
+        description = "按字节读文本。encoding 默认自动检测并返回实际编码；offset/length 截取，超 10MB 截断时返回头标红。编辑请用 read_text_lines",
         annotations(title = "读取文本文件", read_only_hint = true)
     )]
     fn read_text_file(
@@ -678,7 +681,7 @@ impl FileIoServer {
     /// 写入文本文件
     #[tool(
         name = "write_text_file",
-        description = "写入文本。目录不存在自动创建。mode: overwrite(默认)/append(追加)/insert(指定字节offset插入)。建议传expected_old做写前校验：与\"当前想改范围\"（overwrite=整个文件/append=文件末尾/insert=offset附近）不一致会拒绝写入并返回该范围实际内容，防止未读全文件就误写。encoding未指定/auto时自动保持原文件编码；显式指定编码与实际文件编码不一致会拒绝并返回真实编码",
+        description = "写文本(自动建目录)。mode: overwrite/append/insert。建议传 expected_old 校验：与当前想改范围(overwrite=全文/append=末尾/insert=offset附近)不一致则拒绝并返回实际内容。encoding 默认保持原编码，不一致则拒绝",
         annotations(title = "写入文本文件", destructive_hint = true)
     )]
     fn write_text_file(
@@ -779,7 +782,7 @@ impl FileIoServer {
     /// 按行号读取文本文件（与 edit_file_lines 配合使用，避免行号算错）
     #[tool(
         name = "read_text_lines",
-        description = "行号级读取文本。行号1-based，输出自带行号前缀，与edit_file_lines配套使用避免行号算错。encoding默认自动检测并返回文件实际编码，支持多编码。",
+        description = "按行读文本(1-based，带行号)，与 edit_file_lines 配套。encoding 默认自动检测并返回实际编码",
         annotations(title = "按行读取文本", read_only_hint = true)
     )]
     fn read_text_lines(
@@ -859,7 +862,7 @@ impl FileIoServer {
     /// 读取二进制文件，返回HEX dump
     #[tool(
         name = "read_binary_file",
-        description = "读取二进制文件，返回HEX dump（地址+十六进制+ASCII预览）。支持offset/length截取（字节）",
+        description = "读二进制返回 HEX dump(地址+十六进制+ASCII)。offset/length 截取",
         annotations(title = "读取二进制文件", read_only_hint = true)
     )]
     fn read_binary_file(
@@ -932,7 +935,7 @@ impl FileIoServer {
     /// 写入十六进制数据到二进制文件
     #[tool(
         name = "write_binary_file",
-        description = "写入十六进制数据到二进制文件。目录不存在自动创建。mode: overwrite(默认)/append/insert(offset插入)/replace(offset+replace_length)",
+        description = "写十六进制。mode: overwrite/append/insert(offset)/replace(offset+replace_length)",
         annotations(title = "写入二进制文件", destructive_hint = true)
     )]
     fn write_binary_file(
@@ -1060,7 +1063,7 @@ impl FileIoServer {
     /// 搜索文件/目录中的文本内容(正则)
     #[tool(
         name = "text_search",
-        description = "搜索文件或目录中的文本（正则）。path为目录时递归，支持extension后缀过滤、max_results、case_sensitive，BufReader流式读取大文件",
+        description = "正则搜索文件/目录文本。目录时递归，支持 extension 过滤、case_sensitive、max_results",
         annotations(title = "文本搜索", read_only_hint = true)
     )]
     fn text_search(
@@ -1243,7 +1246,7 @@ impl FileIoServer {
     /// 正则替换文件文本
     #[tool(
         name = "regex_replace",
-        description = "正则替换文件文本。支持$1/$2捕获组引用。global默认true全局替换。支持 dry_run 预览（只返回匹配数与替换预览，不写入文件）。匹配数超过 max_matches(默认10000) 会拒绝执行，防止正则过宽或匹配空串误伤。文件上限64MB（防止OOM）",
+        description = "正则替换文件文本，支持 $1/$2 捕获组。global 默认 true；dry_run=true 只预览不写入；匹配数超 max_matches(默认10000) 拒绝防误伤",
         annotations(title = "正则替换", destructive_hint = true)
     )]
     fn regex_replace(
@@ -1381,7 +1384,7 @@ impl FileIoServer {
     /// 列出或搜索目录内容
     #[tool(
         name = "list_files",
-        description = "列目录内容或按文件名搜索。支持正则pattern或glob_pattern过滤、recursive递归、show_size/show_modified元信息、include_dirs、max_results",
+        description = "列目录/搜文件名。pattern(正则)或 glob_pattern 过滤、recursive、show_size/show_modified、include_dirs、max_results",
         annotations(title = "列出目录", read_only_hint = true)
     )]
     fn list_files(
@@ -1636,7 +1639,7 @@ impl FileIoServer {
     /// 发送HTTP请求
     #[tool(
         name = "fetch",
-        description = "发送HTTP请求，与fetch API一致。支持GET/POST/PUT/DELETE/PATCH/HEAD、自定义headers、body、response_type(text/json/binary)、timeout",
+        description = "发送 HTTP 请求。GET/POST/PUT/DELETE/PATCH/HEAD，headers/body/response_type(text|json|binary)/timeout",
         annotations(title = "HTTP 请求", open_world_hint = true)
     )]
     async fn fetch(
@@ -1759,7 +1762,7 @@ impl FileIoServer {
     /// 复制文件
     #[tool(
         name = "copy_files",
-        description = "批量复制文件到目标目录，或单文件改名复制。支持自动创建父目录、overwrite覆盖开关",
+        description = "批量复制到目录，或单文件改名。自动建目录，overwrite 开关",
         annotations(title = "复制文件", destructive_hint = true)
     )]
     fn copy_files(
@@ -1847,7 +1850,7 @@ impl FileIoServer {
     /// 移动/重命名文件
     #[tool(
         name = "move_files",
-        description = "批量移动文件到目标目录，或单文件重命名。支持自动创建父目录、overwrite覆盖开关",
+        description = "批量移动到目录，或单文件改名。自动建目录，overwrite 开关",
         annotations(title = "移动文件", destructive_hint = true)
     )]
     fn move_files(
@@ -1934,7 +1937,7 @@ impl FileIoServer {
     /// 按行编辑文件：删除/插入/替换/追加行
     #[tool(
         name = "edit_file_lines",
-        description = "按行编辑：delete_lines/insert_lines/replace_lines/append_lines。行号1-based。delete_lines/replace_lines 必须传 expected_old（read_text_lines 读到的原行原样传入）做内容校验，不匹配则拒绝操作防止行号算错毁文件。自动保持原文件 CRLF/LF 换行风格与编码（显式指定编码与实际不一致会拒绝并返回真实编码）",
+        description = "按行编辑(1-based)：delete/insert/replace/append_lines。delete/replace 必须传 expected_old(读到的原行)校验，不匹配拒绝。自动保持原换行风格与编码",
         annotations(title = "按行编辑文件", destructive_hint = true)
     )]
     fn edit_file_lines(
