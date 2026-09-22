@@ -305,6 +305,7 @@ src/main.rs | utf-8 | 4096B | 120 lines total | sha256:8f3a1c02d94b7e15 | [10-15
 | `edits[].expected_old` | string | 是 | 待替换的原始片段，须与文件内容**逐字符一致**（缩进/空行/标点都要对）；默认要求全文唯一命中 |
 | `edits[].content` | string | 是 | 替换成的新内容；空串 = 删除该片段 |
 | `edits[].occurrence` | usize | 否 | `expected_old` 命中多处时选第几处（1-based） |
+| `edits[].start_line` | usize | 否 | 期望该片段**从原文第几行开始**(1-based)：可为多处相同的片段消歧（此时不再要求全文唯一）；声明的行号与实际位置不符时会直接告知实际行号 |
 | `all_or_nothing` | bool | 否 | 默认 true；false = 只写命中的那些，其余在结果里列出 |
 | `encoding` | string | 否 | 默认保持原文件编码（不一致则拒绝） |
 | `expected_sha256` | string | 否 | 上次读到的指纹，防并发覆盖 |
@@ -313,6 +314,9 @@ src/main.rs | utf-8 | 4096B | 120 lines total | sha256:8f3a1c02d94b7e15 | [10-15
 - 所有片段都在**同一次快照**上定位，所以可以放心地“按原文”写多处改动；两条片段命中范围重叠会直接报错。
 - `expected_old` 里的换行写 `\n` 或 `\r\n` 都可以（两侧归一后匹配），写回时按文件主换行风格还原；BOM/编码/备份/`expected_sha256` 与其他写工具一致。
 - 成功时返回头**第二行**会回报每处改动的落点（**改动前**的行号，按文件顺序排列，下标对应你传入的 `edits`），例如：`改动位置(改动前行号): edits[1] 第 2 行、edits[0] 第 4~5 行`——不必再读一次文件就能核对“改的是不是我说的那几处”。
+
+- **行号 + 文本双约束**：片段在文件里出现多次时，除了写更长的上下文，也可以给 `start_line`（如 `{ "expected_old": "dup = 1", "content": "DUP", "start_line": 3 }`）；行号写错时会直接告诉你它实际在第几行。
+- `all_or_nothing=false` 时被跳过的条目会列在结果里；`dry_run=true` 时**同样会列出**，方便“先预览再决定”。
 
 - 失败时：未命中给 `E_GUARD_MISMATCH`，命中多处给 `E_NOT_UNIQUE`（会列出各处行号），并明确告知“本次一处未改”。
 
