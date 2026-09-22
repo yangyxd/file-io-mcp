@@ -4474,9 +4474,6 @@ expected_old 须逐字符一致、默认全文唯一；多处时可用 occurrenc
         &self,
         Parameters(params): Parameters<FileInfoParams>,
     ) -> Result<String, McpError> {
-        if std::env::var("FILE_IO_TEST_PANIC").is_ok() {
-            panic!("临时验证用 panic：模拟数组越界");
-        }
         let params = {
             let mut p = params;
             p.path = self.resolve_path(&p.path)?;
@@ -5548,6 +5545,30 @@ expected_old 须逐字符一致、默认全文唯一；多处时可用 occurrenc
     }
 }
 
+/// 最近一次 panic 的文本：由启动时装的 hook 写入、catch_unwind 分支取走。
+/// 只有“两个工具同时 panic”这种极罕见并发下才可能串味，不影响兜底本身。
+static LAST_PANIC_MSG: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+    std::sync::OnceLock::new();
+
+/// 装 panic hook：① 截获 panic 文本供兜底分支回显；② 保留默认 stderr 输出——
+/// 默认输出里的 `文件:行号` 是定位依据（release 虽 strip 掉符号表，这行仍在），不能吃掉。
+fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info
+            .payload_as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| "未知 panic（payload 非字符串）".to_string());
+        if let Ok(mut slot) = LAST_PANIC_MSG
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+        {
+            *slot = Some(msg);
+        }
+        default(info);
+    }));
+}
+
 /// 包住 ToolRouter：把工具实现里的 panic 兜住，降级成一条普通错误返回。
 ///
 /// 背景：edit_file_sections 曾在“中文 + start_line”的分支上数组越界 panic，
@@ -5602,20 +5623,25 @@ impl<'a> PanicSafeRouter<'a> {
         self.inner.get(name)
     }
 
+    /// 取走最近一次 panic 的文本（由启动时装的 hook 写入），取完即清空
+    fn take_last_panic_msg() -> Option<String> {
+        LAST_PANIC_MSG.get()?.lock().ok().and_then(|mut g| g.take())
+    }
+
     fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-        eprintln!(
-            "DEBUG typeid str={} String={} any={:?}",
-            payload.type_id() == std::any::TypeId::of::<&str>(),
-            payload.type_id() == std::any::TypeId::of::<String>(),
-            payload.type_id()
-        );
-        if let Some(s) = payload.downcast_ref::<&str>() {
-            (*s).to_string()
-        } else if let Some(s) = payload.downcast_ref::<String>() {
-            s.clone()
-        } else {
-            "未知 panic（无可读信息）".to_string()
+        // rustc 1.98 起 panic!("...") 的 payload 是 std 的内部类型，实测 downcast 到
+        // &str / String 都是 None；但 PanicHookInfo::payload_as_str() 能取到文本，
+        // 故优先用 hook 截获的内容，downcast 仅作兜底。
+        if let Some(msg) = Self::take_last_panic_msg() {
+            return msg;
         }
+        if let Some(s) = payload.downcast_ref::<&str>() {
+            return (*s).to_string();
+        }
+        if let Some(s) = payload.downcast_ref::<String>() {
+            return s.clone();
+        }
+        "未知 panic（无可读信息；服务端 stderr 里仍有 panic 的 文件:行号）".to_string()
     }
 }
 
@@ -5645,7 +5671,7 @@ impl ServerHandler for FileIoServer {
                     若文件已被他人改动会返回 E_EXTERNAL_CHANGED，此时请重新读取后再改，不要盲目覆盖；\
                  ④ 改文件前先 read_text_lines 取内容与 sha256；不确定改法时先传 dry_run=true 看 diff 再实写。\
                  错误码：E_NOT_FOUND/E_NOT_UNIQUE/E_GUARD_MISMATCH/E_EXTERNAL_CHANGED/E_ENCODING/\
-                 E_NO_PERMISSION/E_READ/E_WRITE/E_TOO_LARGE/E_TOO_MANY_MATCHES/E_INVALID_PARAM。\
+                 E_NO_PERMISSION/E_READ/E_WRITE/E_TOO_LARGE/E_TOO_MANY_MATCHES/E_INVALID_PARAM/E_PANIC。\
                  fetch 会访问外部网络。".into(),
             ),
         }
@@ -5654,6 +5680,9 @@ impl ServerHandler for FileIoServer {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // 先装 panic hook：派发处会兜住工具内的 panic，这里负责把它的文本截获下来
+    install_panic_hook();
+
     // 可选的安全沙箱：通过环境变量 FILE_IO_ROOT 限制可访问的根目录。
     // 未设置时不限制路径（向后兼容），但生产环境建议配置以防越权访问。
     let root = match std::env::var("FILE_IO_ROOT") {
