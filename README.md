@@ -1,38 +1,88 @@
 # file-io-mcp
 
-基于 Rust 实现的 MCP (Model Context Protocol) 文件 I/O 工具服务器，支持 **stdio**（默认）和 **Streamable HTTP** 两种传输模式，为 AI 客户端提供文件操作和 HTTP 请求能力。
+基于 Rust 实现的 MCP (Model Context Protocol) 文件 I/O 工具服务器，支持 **stdio**（默认）和 **Streamable HTTP** 两种传输模式，为 AI 客户端提供文件读写、编辑、搜索、备份回滚和 HTTP 请求能力。
+
+设计目标：**编码不乱、改动可校验、写入可回滚、并发不互相覆盖**。
 
 ## 功能概览
 
-共提供 **14 个工具**，覆盖文本/二进制文件读写、行编辑、搜索、正则处理、文件批量操作、目录管理和网络请求。
+共 **15 个工具**：
 
 | 工具 | 说明 |
 |------|------|
-| `read_text_file` | 字节级读取文本，支持 offset/length 截取、多编码自动检测 |
-| `read_text_lines` | 行号级读取文本，自带行号前缀，专为 `edit_file_lines` 配套 |
-| `write_text_file` | 写入文本，支持覆盖/追加/插入模式，自动创建目录 |
-| `read_binary_file` | 读取二进制文件，返回 HEX dump（地址+十六进制+ASCII 预览） |
-| `write_binary_file` | 写入十六进制数据，支持覆盖/追加/插入/替换模式 |
-| `edit_file_lines` | 按行编辑：删/插/替/追，行号 1-based，`expected_old` 防行号算错 |
-| `text_search` | 文件/目录内容正则搜索，支持后缀过滤、递归、流式读取 |
-| `regex_replace` | 正则替换文件文本，支持捕获组、全局/单次（64MB 上限） |
-| `list_files` | 列目录/搜文件名，支持正则+glob 过滤、递归、大小和修改时间 |
-| `copy_files` | 批量复制文件到目录，或单文件改名复制 |
-| `move_files` | 批量移动文件到目录，或单文件重命名 |
-| `file_info` | 获取元信息：大小、类型、修改时间、SHA256 |
-| `delete_file` | 删除文件（不可逆，需用户确认） |
-| `fetch` | 发送 HTTP 请求，支持 GET/POST/PUT/DELETE/PATCH/HEAD |
+| `read_text_file` | 按字节读文本片段，返回编码与文件指纹 |
+| `read_text_lines` | 按行读文本（带行号），编辑前取内容与指纹 |
+| `write_text_file` | 整段写文本，支持覆盖/追加/插入，可 dry-run 预览 diff |
+| `edit_file_lines` | 按行编辑：删/插/替/追，支持锚点定位与 `expected_old` 校验 |
+| `regex_replace` | 正则替换，`max_matches` 必填防误伤，可 dry-run |
+| `read_binary_file` | 读二进制 HEX dump |
+| `write_binary_file` | 按十六进制写二进制（覆盖/追加/插入/替换） |
+| `text_search` | 文件/目录内容正则搜索 |
+| `list_files` | 列目录 / 按文件名搜索（支持 glob） |
+| `file_info` | 文件/目录元信息（大小、mtime、指纹） |
+| `manage_backups` | 备份管理：列出 / 回滚 / 清理 |
+| `delete_file` | 删除文件（自动备份，可回滚） |
+| `copy_files` | 复制文件 |
+| `move_files` | 移动 / 重命名文件 |
+| `fetch` | HTTP 请求 |
+
+## 核心机制
+
+### 1. 编码识别与保持
+
+- **写入时默认保持原编码**，原文件有 BOM 则原样补回；显式指定的编码与实际不一致时**拒绝写入**并回报真实编码。
+- **自动识别顺序**：BOM → 无 BOM 的 UTF-16 探测 → 纯 ASCII → UTF-8 合法性 → UTF-8/GBK 打分对比 → Big5/Shift_JIS/EUC-KR/EUC-JP 候选。
+- **GBK 与 UTF-8 可靠区分**：大量 GBK 汉字的字节序列恰好也是合法 UTF-8（如 `隆` = `C2 A1`），仅凭"是否合法 UTF-8"会把 GBK 文件误判成 UTF-8 并写出乱码。因此工具会对两种候选分别解码并做"像不像中文文本"打分，取分数高者；两者接近时判定为**低置信度**并在返回头提示（建议显式指定 `encoding`）。
+- **换行风格**：写入按文件的主换行风格（CRLF/LF 多数派）统一，避免出现混合换行。
+- **非法字节保护**：解码时出现 `U+FFFD` 替换（内容已损坏）时**拒绝写回**，避免原字节被永久破坏。
+- **支持的编码**：`utf-8`、`gbk`/`gb18030`、`big5`、`shift_jis`、`euc-jp`、`euc-kr`、`utf-16le`、`utf-16be`、`iso-8859-1` 等（UTF-32 仅能识别，不支持编解码）。
+
+### 2. 文件指纹（`sha256`）与并发写入
+
+读取类工具在返回头给出 `sha256:<16位>`，它是**文件指纹**（≤1MB 用整份内容；>1MB 用"大小 + 头尾各 64KB"采样，避免为算指纹而重复读大文件）。同一算法贯穿读取、写入与 `file_info`，可直接互相使用。
+
+多个 AI/进程同时改同一文件时：
+
+- 写入工具传 `expected_sha256`（上次读到的值），写入前会重新校验；若文件已被他人改动，返回 **`E_EXTERNAL_CHANGED`** 而不是覆盖别人的修改 —— 此时应重新读取最新内容后再改。
+- **同路径锁**：同一文件的"读-改-写"串行化。HTTP 模式用进程内锁；stdio 模式下每个 AI 是独立进程，额外使用**跨进程锁文件**（`<文件>.file-io-mcp.lock`，30 秒陈旧锁自动抢占、最长等待 10 秒后降级放行）。
+- **原子写入**：先写同目录临时文件并 `sync_all`，再 `rename` 原子替换；读取方永远不会读到写了一半的文件。若 `rename` 因文件被 IDE/杀软占用而失败，回退为就地覆盖写（并先把备份转为独立副本），保证"原来能写的场景现在依然能写"。
+
+### 3. 备份与回滚
+
+- **位置**：MCP 工具**自身所在目录**下的 `.file-io-mcp-backups/<文件名>-<绝对路径hash16>/`，**不会污染被编辑的项目**。可用环境变量 `FILE_IO_BACKUP_DIR` 覆盖（例如 exe 目录不可写时）。
+- **硬链接优先**：工具与被编辑文件同盘时用硬链接做零拷贝快照（因为原子写是"写临时文件 + rename 替换"，旧内容仍被硬链接引用）；跨盘自动退化为复制。
+- **自动清理**：每个文件最多保留 **10 份**，超出自动删除最旧的（连同元数据）；单文件超过 **20MB** 不做备份；备份目录清空后自动删除。
+- **不备份的情况**：`append` 模式（就地追加会让硬链接备份一起变化，语义上也难以回滚）。
+- **回滚**：`manage_backups` 的 `undo` 会回滚最近一次写入或删除；若文件在备份之后又被改动过，默认拒绝（`force=true` 强制）。回滚前会先把当前内容存一份快照，所以"回滚"这个动作本身也能被撤销。
+
+### 4. 错误码
+
+所有错误消息以 `E_XXX` 开头，便于 AI 分流处理：
+
+| 错误码 | 含义 | 建议动作 |
+|--------|------|----------|
+| `E_NOT_FOUND` | 目标不存在 / 锚点未匹配 / 无备份可回滚 | 确认路径，或先读取 |
+| `E_NOT_UNIQUE` | 锚点命中多处 | 补全 `anchor_text` 或用 `anchor_occurrence` |
+| `E_GUARD_MISMATCH` | `expected_old` 与实际不符 | 重新读取目标行后再改 |
+| `E_EXTERNAL_CHANGED` | 文件已被他人改动 | 重新读取（拿新 sha256）后重试 |
+| `E_ENCODING` | 编码识别/解码/不一致 | 显式指定 `encoding` |
+| `E_NO_PERMISSION` | 权限不足 | 检查文件占用/权限 |
+| `E_READ` / `E_WRITE` | 读 / 写失败 | 查看具体原因 |
+| `E_TOO_LARGE` | 文件过大（正则替换 >64MB） | 分段处理 |
+| `E_TOO_MANY_MATCHES` | 匹配数超过 `max_matches` | 收窄正则或调整上限 |
+| `E_INVALID_PARAM` | 参数错误 | 按提示修正参数 |
 
 ## 技术栈
 
-- **rmcp 0.16** — Rust MCP SDK，server + macros + transport-io + transport-streamable-http-server
+- **rmcp 0.16** — Rust MCP SDK（server / macros / transport-io / transport-streamable-http-server）
 - **axum 0.8** — HTTP 框架（HTTP 模式）
 - **tokio** — 异步运行时
 - **serde / serde_json** — 序列化
 - **schemars** — JSON Schema 生成（工具参数描述）
 - **regex** — 正则表达式
 - **globset** — Glob 通配符匹配（支持 `**`、`*`、`?`）
-- **encoding_rs** — 高性能字符编码转换与自动检测
+- **encoding_rs** — 字符编码转换（UTF-16 由工具自身实现，保证编码/解码严格对称）
+- **sha2** — 文件指纹
 - **reqwest** — HTTP 客户端
 
 ## 编译
@@ -45,29 +95,24 @@ cargo build
 cargo build --release
 ```
 
-**Windows MSVC 环境**：如编译时遇到 `LNK1104: 无法打开文件 msvcrt.lib`，需设置 LIB 环境变量：
+**Windows MSVC 环境**：如编译时遇到 `LNK1104` 找不到 `msvcrt.lib`，需先引入 VS 环境或手动设置 `LIB`：
+
 ```powershell
-$env:LIB = "D:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.43.34808\lib\onecore\x64"
+$env:LIB = "D:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.43.34808\lib\x64;" +
+           "C:\Program Files (x86)\Windows Kits\10\Lib\10.0.22621.0\um\x64;" +
+           "C:\Program Files (x86)\Windows Kits\10\Lib\10.0.22621.0\ucrt\x64"
 ```
-路径请根据实际 Visual Studio 安装位置调整。
 
 ## 使用方式
 
 ### stdio 模式（默认）
 
-编译后直接通过 stdio 运行：
-
 ```bash
-# 开发模式
-cargo run
-
-# 发布模式
-./target/release/file-io-mcp
+cargo run                          # 开发
+./target/release/file-io-mcp       # 发布
 ```
 
-#### 配置 MCP 客户端
-
-在 MCP 客户端（如 Claude Desktop、Cursor 等）的配置文件中添加：
+在 MCP 客户端（Claude Desktop、Cursor 等）配置：
 
 ```json
 {
@@ -80,35 +125,27 @@ cargo run
 }
 ```
 
-将 `command` 路径替换为实际的可执行文件路径即可。
+#### 环境变量
+
+| 变量 | 说明 |
+|------|------|
+| `FILE_IO_ROOT` | 可选。设置后所有文件操作被限制在该目录内（沙箱），未设置则不限制路径 |
+| `FILE_IO_BACKUP_DIR` | 可选。备份根目录，默认 `<exe 所在目录>/.file-io-mcp-backups` |
 
 ### HTTP 模式（Streamable HTTP）
 
-支持 [MCP Streamable HTTP 传输协议](https://spec.modelcontextprotocol.io/specification/2025-03-26/basic/transports/streamable-http/)，可通过 HTTP 端点提供 MCP 服务，适用于远程访问场景。
-
-#### 启动服务
-
 ```bash
-# 默认监听 0.0.0.0:3000
-cargo run -- --http
-
-# 自定义监听地址
-cargo run -- --http --addr 127.0.0.1:8080
-
-# 发布模式
+cargo run -- --http                                  # 默认 0.0.0.0:3000
+cargo run -- --http --addr 127.0.0.1:8080            # 自定义地址
 ./target/release/file-io-mcp --http --addr 0.0.0.0:3000
 ```
 
-#### 配置 MCP 客户端
-
-在支持 Streamable HTTP 的 MCP 客户端中配置 `url` 方式连接：
+客户端配置：
 
 ```json
 {
   "mcpServers": {
-    "file-io": {
-      "url": "http://127.0.0.1:3000/mcp"
-    }
+    "file-io": { "url": "http://127.0.0.1:3000/mcp" }
   }
 }
 ```
@@ -122,138 +159,118 @@ cargo run -- --http --addr 127.0.0.1:8080
 
 #### 协议特性
 
-- **有状态会话**：通过 `mcp-session-id` 头部维持会话，支持 SSE 重连
-- **SSE 流式响应**：客户端发送 `Accept: text/event-stream` 时，服务端以 SSE 流式返回结果
-- **JSON 单次响应**：客户端发送 `Accept: application/json` 时，返回普通 JSON 响应
-- **Keep-Alive**：每 15 秒发送 ping 保持连接存活
+- **有状态会话**：`mcp-session-id` 头部维持会话，支持 SSE 重连
+- **SSE 流式响应**：`Accept: text/event-stream` 时以 SSE 返回
+- **JSON 单次响应**：`Accept: application/json` 时返回普通 JSON
+- **Keep-Alive**：每 15 秒 ping
 
 ## 工具详细说明
 
+> 通用约定见上文"核心机制"：编码保持、`sha256` 指纹、`expected_sha256`、原子写入与备份，各工具不再重复说明。
+
 ### read_text_file
 
-字节级读取文本文件内容。适用于读配置、解析内容、已知字节位置的读取。如需配合 `edit_file_lines` 编辑代码，请优先使用 `read_text_lines`。
+按字节读取文本片段，适合读配置、按偏移查看内容。要按行编辑请用 `read_text_lines`。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `path` | string | 是 | 文件路径 |
-| `offset` | u64 | 否 | 起始偏移量(字节)，默认 0 |
-| `length` | usize | 否 | 读取长度(字节)，默认 10MB 上限。超过会截断并在返回头标注 ⚠️ 已截断 |
-| `encoding` | string | 否 | 字符编码，默认自动检测并返回文件实际编码（BOM → UTF-8 → GBK/Big5/Shift_JIS…），也可显式指定 |
+| `offset` | u64 | 否 | 起始字节偏移，默认 0 |
+| `length` | usize | 否 | 读取字节数，默认上限 10MB（超出会截断并在返回头标注 ⚠️） |
+| `encoding` | string | 否 | 编码，默认自动识别 |
 | `show_line_numbers` | bool | 否 | 每行前显示行号，默认 false |
 
-**支持的编码**：utf-8, gbk, gb2312, gb18030, big5, shift_jis, euc-jp, euc-kr, utf-16le, utf-16be, iso-8859-1 等。
-
-```json
-{ "path": "data/config.txt", "encoding": "auto" }
-{ "path": "data/config.txt", "encoding": "gbk", "length": 1024 }
-```
+**返回头**：`路径 | 编码(BOM标注) | 大小 | sha256 | [起,止)`；编码识别不确定时会追加 ⚠️ 提示。
 
 ### read_text_lines
 
-行号级读取文本文件内容。每行前带行号前缀（1-based），与 `edit_file_lines` 配套使用可避免行号算错。
+按行读取（1-based，带行号），与 `edit_file_lines` 配套。返回头包含总行数与 `sha256` —— 编辑同一文件时把它传给 `expected_sha256` 即可防止并发覆盖。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `path` | string | 是 | 文件路径 |
-| `start_line` | usize | 否 | 起始行号（1-based），默认 1 |
-| `end_line` | usize | 否 | 结束行号（含），默认到文件末尾 |
-| `encoding` | string | 否 | 字符编码，默认自动检测并返回文件实际编码。`"auto"` 显式自动检测 |
+| `start_line` | usize | 否 | 起始行号，默认 1 |
+| `end_line` | usize | 否 | 结束行号（含），默认到末尾 |
+| `encoding` | string | 否 | 编码，默认自动识别 |
 
 **输出示例：**
+
 ```
-src/main.rs | utf-8 | 4096B | 120 lines total | [10-15]```
+src/main.rs | utf-8 | 4096B | 120 lines total | sha256:8f3a1c02d94b7e15 | [10-15]```
  10| fn foo() {
  11|     let x = 1;
- 12|     println!("{}", x);
- 13| }
- 14| 
- 15| fn bar() {
+ 12| }
 ```
 
-```json
-{ "path": "src/main.rs", "start_line": 10, "end_line": 50 }
-{ "path": "data/cn.txt", "encoding": "auto" }
-```
+> 空文件按 `0 lines` 处理。
 
 ### write_text_file
 
-写入文本到文件。目录不存在时自动创建。
+整段写入文本，目录不存在时自动创建。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `path` | string | 是 | 文件路径 |
 | `content` | string | 是 | 写入内容 |
 | `mode` | string | 否 | `overwrite`(默认) / `append` / `insert` |
-| `offset` | u64 | 否 | insert 模式下的插入位置(字节) |
-| `encoding` | string | 否 | 字符编码。默认自动保持原文件编码（新文件用 UTF-8）；显式指定与实际不一致会拒绝写入并返回真实编码 |
-| `expected_old` | string | 否 | 写前校验，按 mode 匹配"当前想改范围"的内容：overwrite=整个文件、append=文件末尾、insert=offset 附近。与实际不一致则拒绝写入并返回该范围实际内容 |
+| `offset` | u64 | 否 | insert 的插入字节偏移（必须落在字符边界，否则拒绝，防止把汉字劈开） |
+| `encoding` | string | 否 | 默认保持原文件编码（新建文件默认 UTF-8；`utf-16le/be` 新建会自动带 BOM） |
+| `expected_old` | string | 否 | 写前校验：overwrite=全文 / append=末尾 / insert=offset 附近，不符则拒绝并回显实际内容 |
+| `expected_sha256` | string | 否 | 上次读到的指纹，文件被改动则拒绝写入 |
+| `dry_run` | bool | 否 | true=只返回 diff 与预计指纹，不写文件 |
 
 ```json
 { "path": "logs/app.log", "content": "新日志行\n", "mode": "append" }
-{ "path": "data/file.txt", "content": "你好", "encoding": "auto" }
-```
-
-### read_binary_file
-
-读取二进制文件，返回 HEX dump 格式（含地址、十六进制和 ASCII 预览）。
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `path` | string | 是 | 文件路径 |
-| `offset` | u64 | 否 | 起始偏移量(字节) |
-| `length` | usize | 否 | 读取长度(字节) |
-
-```json
-{ "path": "data/header.bin", "offset": 0, "length": 64 }
-```
-
-### write_binary_file
-
-将十六进制数据写入二进制文件。目录不存在时自动创建。
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `path` | string | 是 | 文件路径 |
-| `hex_data` | string | 是 | 十六进制数据，支持 `"48656C6C6F"` 或 `"0x48656C6C6F"` 格式 |
-| `mode` | string | 否 | `overwrite`(默认) / `append` / `insert` / `replace` |
-| `offset` | u64 | 否 | insert 为插入位置，replace 为替换起始位置 |
-| `replace_length` | usize | 否 | replace 模式下被替换的字节数 |
-
-**replace 模式**：从 `offset` 起移除 `replace_length` 个字节，然后写入新数据（新旧长度可以不同）。
-
-```json
-{ "path": "data/file.bin", "hex_data": "0xFF01", "mode": "replace", "offset": 3, "replace_length": 4 }
+{ "path": "data/a.txt", "content": "新内容", "expected_old": "旧内容", "dry_run": true }
 ```
 
 ### edit_file_lines
 
-按行编辑文件内容。行号从 **1 开始计数**，建议配合 `read_text_lines` 使用。
+按行编辑，行号 **1-based**。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `operation` | string | 是 | 操作类型：`delete_lines` / `insert_lines` / `replace_lines` / `append_lines` |
+| `operation` | string | 是 | `delete_lines` / `insert_lines` / `replace_lines` / `append_lines` |
 | `path` | string | 是（二选一） | 文件路径 |
 | `file_path` | string | 是（二选一） | 文件路径（兼容别名） |
-| `start_line` | usize | 视操作 | 起始行号（1-based），delete/insert/replace 使用 |
-| `end_line` | usize | 视操作 | 结束行号（1-based），delete/replace 使用 |
-| `content` | string | 视操作 | 要插入/替换/追加的内容，多行用 `\n` 分隔 |
-| `encoding` | string | 否 | 字符编码。默认自动保持原文件编码；显式指定与实际不一致会拒绝写入并返回真实编码 |
-| `expected_old` | string | delete/replace 必填 | 期望的旧行内容（read_text_lines 读到的原行原样传入）。若实际内容不匹配则拒绝操作，防止行号算错 |
+| `start_line` | usize | 视操作 | 起始行号；与锚点参数二选一 |
+| `end_line` | usize | 视操作 | 结束行号（含）；用锚点定位时可省（默认单行） |
+| `content` | string | 视操作 | 插入/替换/追加的内容，多行用 `\n` 分隔 |
+| `expected_old` | string | delete/replace 必填 | 目标行原文，用于二次校验 |
+| `anchor_text` | string | 否 | **锚点定位**：目标行的完整文本，须全文唯一命中 |
+| `anchor_regex` | string | 否 | 锚点定位：正则匹配目标行，须唯一命中 |
+| `anchor_occurrence` | usize | 否 | 锚点命中多处时选第几处（1-based），默认要求唯一 |
+| `expected_sha256` | string | 否 | 上次读到的指纹 |
+| `encoding` | string | 否 | 默认保持原文件编码 |
+| `dry_run` | bool | 否 | true=只返回 diff 预览 |
 
 **操作说明：**
 
 | 操作 | 必需参数 | 行为 |
 |------|----------|------|
-| `delete_lines` | `start_line`, `end_line` | 删除 `start_line` 到 `end_line` 之间的所有行 |
-| `insert_lines` | `start_line`, `content` | 在 `start_line` **之前**插入 `content` 内容 |
-| `replace_lines` | `start_line`, `end_line`, `content` | 将 `start_line` 到 `end_line` 替换为 `content` |
-| `append_lines` | `content` | 在文件末尾追加 `content` 内容 |
+| `delete_lines` | `start_line`+`end_line`（或锚点） | 删除该范围 |
+| `insert_lines` | `start_line`（或锚点 `anchor_occurrence`）+ `content` | 在该行**之前**插入 |
+| `replace_lines` | `start_line`+`end_line`（或锚点）+ `content` | 用 `content` 替换该范围 |
+| `append_lines` | `content` | 追加到文件末尾 |
 
-> 💡 **最佳实践**：`delete_lines` / `replace_lines` **必须**传 `expected_old`，把从 `read_text_lines` 读到的目标行原样传入。行号算错时工具会拒绝操作并返回实际内容，不会破坏文件。编辑会自动保持原文件的 CRLF/LF 换行风格与编码。
+**锚点定位**（免去行号计算，AI 更不容易改错位置）：
 
-**示例：**
+```json
+{
+  "operation": "replace_lines",
+  "path": "src/unit1.pas",
+  "anchor_text": "  FCount := 0;",
+  "content": "  FCount := 1;",
+  "expected_old": "  FCount := 0;"
+}
+```
 
-删除第 3-5 行（带校验）：
+- 未命中 → `E_NOT_FOUND`，并列出"包含该文本的行"作提示；
+- 多处命中 → `E_NOT_UNIQUE` 并列出全部行号，可用 `anchor_occurrence` 指定第几处；
+- `anchor_text` 必须与整行完全一致（含缩进）。
+
+**示例**：删除第 3-5 行并校验
+
 ```json
 {
   "operation": "delete_lines",
@@ -264,184 +281,203 @@ src/main.rs | utf-8 | 4096B | 120 lines total | [10-15]```
 }
 ```
 
-在第 10 行前插入两行：
+### regex_replace
+
+正则替换，支持 `$1`/`$2` 捕获组。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `path` | string | 是 | 文件路径 |
+| `pattern` | string | 是 | 正则表达式 |
+| `replacement` | string | 是 | 替换内容，支持 `$1`、`$2` |
+| `max_matches` | usize | **是** | 预期最多替换几处；实际匹配数超过该值即拒绝（防止正则过宽或匹配空串造成大范围误替换） |
+| `global` | bool | 否 | 全局替换，默认 true；false 时只替换首个 |
+| `dry_run` | bool | 否 | true=返回 diff 预览不写入 |
+| `encoding` | string | 否 | 默认自动识别并保持原编码 |
+| `expected_sha256` | string | 否 | 上次读到的指纹 |
+
+> 文件超过 64MB 会被拒绝（防 OOM）。
+
 ```json
-{ "operation": "insert_lines", "path": "data/file.txt", "start_line": 10, "content": "line1\nline2" }
+{ "path": "config.ini", "pattern": "host=\\S+", "replacement": "host=192.168.1.10", "max_matches": 1 }
+{ "path": "data.txt", "pattern": "你好", "replacement": "Hello", "max_matches": 3, "dry_run": true }
 ```
 
-替换第 2-4 行（带校验）：
-```json
-{
-  "operation": "replace_lines",
-  "path": "data/file.txt",
-  "start_line": 2,
-  "end_line": 4,
-  "content": "new line 2\nnew line 3",
-  "expected_old": "old line 2\nold line 3\nold line 4"
-}
-```
+### read_binary_file
 
-追加内容到末尾：
+读取二进制文件，返回 HEX dump（偏移 + 十六进制 + ASCII）。返回头含 `sha256`。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `path` | string | 是 | 文件路径 |
+| `offset` | u64 | 否 | 起始字节偏移，默认 0 |
+| `length` | usize | 否 | 读取字节数，默认到末尾 |
+
+### write_binary_file
+
+按十六进制写二进制。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `path` | string | 是 | 文件路径 |
+| `hex_data` | string | 是 | 十六进制数据，如 `"48656C6C6F"` 或 `"0x48656C6C6F"` |
+| `mode` | string | 否 | `overwrite`(默认) / `append` / `insert` / `replace` |
+| `offset` | u64 | 否 | insert 为插入位置，replace 为替换起始位置 |
+| `replace_length` | usize | 否 | replace 模式下被替换的字节数 |
+| `expected_sha256` | string | 否 | 上次读到的指纹 |
+
 ```json
-{ "operation": "append_lines", "path": "data/file.txt", "content": "末尾新增行" }
+{ "path": "data/file.bin", "hex_data": "0xFF01", "mode": "replace", "offset": 3, "replace_length": 4 }
 ```
 
 ### text_search
 
-搜索文件或目录中的文本内容（正则表达式）。UTF-8 文件使用 BufReader 逐行流式读取，大文件不占用过多内存。
+在文件或目录中正则搜索，返回 `文件:行号:列:内容` 与命中统计。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `path` | string | 是 | 文件或目录路径 |
+| `path` | string | 是 | 文件或目录（目录则搜索其下文件） |
 | `pattern` | string | 是 | 正则表达式 |
 | `case_sensitive` | bool | 否 | 区分大小写，默认 true |
-| `max_results` | usize | 否 | 最大返回数，默认 100 |
-| `extension` | string | 否 | 文件后缀过滤（如 `"java"`），仅目录时生效 |
-| `recursive` | bool | 否 | 递归子目录，默认 true |
-| `encoding` | string | 否 | 字符编码，默认 utf-8。`"auto"` 时每文件独立自动检测 |
+| `max_results` | usize | 否 | 最多返回条数，默认 100 |
+| `extension` | string | 否 | 后缀过滤（如 `"pas"`），仅目录模式 |
+| `recursive` | bool | 否 | 递归子目录，默认 true（仅目录模式） |
+| `encoding` | string | 否 | 默认 utf-8（此时逐行流式读取）；`"auto"` 时按文件自动检测后整体解码 |
 
-```json
-{ "path": "src/", "pattern": "TODO.*fix", "extension": "java", "recursive": true }
-{ "path": "src/", "pattern": "fn", "encoding": "auto" }
-```
-
-### regex_replace
-
-使用正则表达式替换文件中的文本。
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `path` | string | 是 | 文件路径 |
-| `pattern` | string | 是 | 正则表达式 |
-| `replacement` | string | 是 | 替换内容，支持 `$1`, `$2` 捕获组引用 |
-| `global` | bool | 否 | 全局替换，默认 true |
-| `dry_run` | bool | 否 | 仅预览不写入：返回匹配数量、前 20 处替换预览及新文件大小，默认 false |
-| `max_matches` | usize | 否 | 匹配数量上限，超过则拒绝执行（防止正则过宽/匹配空串误伤），默认 10000 |
-| `encoding` | string | 否 | 字符编码，默认 utf-8。设为 `"auto"` 自动检测 |
-
-> ⚠️ 文件大小限制：超过 64MB 的文件会返回错误提示，防止 OOM。
-
-```json
-{ "path": "config.yml", "pattern": "host:\\s*localhost", "replacement": "host: 192.168.1.100" }
-{ "path": "data.txt", "pattern": "你好", "replacement": "Hello", "encoding": "auto" }
-```
+> 工具的备份目录与临时文件会自动从搜索结果中排除。
 
 ### list_files
 
-列出目录内容或按文件名正则搜索文件。
+列目录 / 按文件名搜索。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `path` | string | 是 | 目录路径 |
-| `pattern` | string | 否 | 文件名正则过滤，不指定则列出所有（与 `glob_pattern` 二选一） |
-| `glob_pattern` | string | 否 | Glob 通配符过滤，如 `"**/*.rs"`、`"*.txt"`，比正则更直观（与 `pattern` 二选一） |
+| `pattern` | string | 否 | 文件名正则过滤（与 `glob_pattern` 二选一） |
+| `glob_pattern` | string | 否 | Glob 过滤，如 `"*.pas"`、`"**/*.rs"` |
 | `recursive` | bool | 否 | 递归子目录，默认 false |
 | `include_dirs` | bool | 否 | 包含目录项，默认 true |
-| `max_results` | usize | 否 | 最大返回数，默认 500 |
-| `show_size` | bool | 否 | 显示文件大小，默认 true |
-| `show_modified` | bool | 否 | 显示修改时间戳，默认 false |
-
-```json
-{ "path": "src/", "pattern": ".*\\.rs$", "recursive": true }
-{ "path": "src/", "glob_pattern": "**/*.rs", "recursive": true }
-{ "path": ".", "glob_pattern": "*.txt" }
-```
+| `max_results` | usize | 否 | 最多返回条数，默认 500 |
+| `show_size` | bool | 否 | 显示大小，默认 true |
+| `show_modified` | bool | 否 | 显示修改时间，默认 false |
 
 ### file_info
 
-获取文件或目录的元信息，包括大小、类型、修改时间戳和 SHA256 哈希值。
+文件/目录元信息：`路径 | 类型 | 大小 | mtime(秒) | sha256`。
+
+这里返回的 `sha256` 与读取工具同源，可直接作为写入时的 `expected_sha256`。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `path` | string | 是 | 文件/目录路径 |
+| `path` | string | 是 | 文件或目录路径 |
 
-返回：路径、类型（文件/目录）、大小(字节)、修改时间(UNIX 时间戳)、SHA256 哈希值。
+### manage_backups
+
+备份管理。备份位于工具自身目录（见"核心机制 3"），项目目录不会被污染。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `path` | string | 是 | 目标文件路径（备份按文件区分） |
+| `action` | string | 是 | `list` / `undo` / `clean` |
+| `keep` | usize | 否 | `clean` 保留份数，默认 10；`0` 表示清空 |
+| `force` | bool | 否 | `undo` 时若文件在备份后又被改动，默认拒绝；true 强制回滚 |
 
 ```json
-{ "path": "data/report.csv" }
+{ "path": "src/unit1.pas", "action": "list" }
+{ "path": "src/unit1.pas", "action": "undo" }
+{ "path": "src/unit1.pas", "action": "clean", "keep": 3 }
 ```
 
 ### delete_file
 
-删除指定文件。**此操作不可逆，需要用户确认权限。**
+删除单个文件（不可删目录）。删除前会自动备份，可用 `manage_backups` 的 `undo` 恢复。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `path` | string | 是 | 文件路径 |
 
-- 文件不存在时返回提示（不报错）
-- 路径为目录时拒绝删除
-
-```json
-{ "path": "temp/old_data.txt" }
-```
-
 ### copy_files
-
-批量复制文件到目标目录，或单文件复制为新文件名。支持自动创建父目录。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `sources` | string[] | 是 | 源文件路径列表 |
-| `target` | string | 是 | 目标路径。目录时多文件复制到该目录下；单文件时可指定新文件名 |
-| `overwrite` | bool | 否 | 是否覆盖已存在的目标文件，默认 false |
-
-- 多文件时目标必须是目录
-- 单文件时目标可以是文件路径（重命名）
+| `target` | string | 是 | 目标：多文件时为目录；单文件时可指定新路径/文件名 |
+| `overwrite` | bool | 否 | 覆盖已存在的目标，默认 false（存在则跳过） |
 
 ```json
 { "sources": ["/a.txt", "/b.txt"], "target": "/dest/", "overwrite": true }
-{ "sources": ["/a.txt"], "target": "/b.txt" }
+{ "sources": ["/a.txt"], "target": "/renamed.txt" }
 ```
 
 ### move_files
 
-批量移动文件到目标目录，或单文件重命名。支持自动创建父目录。
-
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `sources` | string[] | 是 | 源文件路径列表 |
-| `target` | string | 是 | 目标路径。目录时多文件移动到该目录下；单文件时可指定新文件名 |
-| `overwrite` | bool | 否 | 是否覆盖已存在的目标文件，默认 false |
-
-- 多文件时目标必须是目录
-- 单文件时目标可以是文件路径（重命名）
-- 自动创建目标目录的父目录
+| `target` | string | 是 | 目标：多文件时为目录；单文件时可指定新路径/文件名 |
+| `overwrite` | bool | 否 | 覆盖已存在的目标，默认 false（存在则跳过） |
 
 ```json
 { "sources": ["/a.txt", "/b.txt"], "target": "/dest/" }
-{ "sources": ["/old_name.txt"], "target": "/new_name.txt" }
+{ "sources": ["/old.txt"], "target": "/new.txt" }
 ```
 
 ### fetch
 
-发送 HTTP 请求，功能与浏览器 fetch API 一致。
-
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `url` | string | 是 | 请求 URL |
-| `method` | string | 否 | HTTP 方法，默认 GET。可选 GET/POST/PUT/DELETE/PATCH/HEAD |
-| `headers` | object | 否 | 请求头键值对 |
-| `body` | string | 否 | 请求体（POST/PUT/PATCH 时使用） |
-| `response_type` | string | 否 | 响应格式：`text`(默认) / `json`(自动格式化) / `binary`(HEX) |
+| `method` | string | 否 | GET(默认) / POST / PUT / DELETE / PATCH / HEAD |
+| `headers` | object | 否 | 请求头 |
+| `body` | string | 否 | 请求体（POST/PUT/PATCH） |
+| `response_type` | string | 否 | `text`(默认) / `json`(格式化) / `binary`(HEX) |
 | `timeout` | u64 | 否 | 超时秒数，默认 30 |
+
+> 文本响应超过 100KB 会按**字符边界**截断并标注总大小。
 
 ```json
 {
   "url": "https://api.example.com/data",
   "method": "POST",
-  "headers": { "Content-Type": "application/json", "Authorization": "Bearer token123" },
+  "headers": { "Content-Type": "application/json" },
   "body": "{\"key\": \"value\"}",
   "response_type": "json"
 }
 ```
 
+## 典型工作流
+
+**安全地改一个 Delphi 单元（GBK 编码、有并发）**
+
+1. `read_text_lines` 读取目标行 → 拿到内容、总行号、`sha256`
+2. `edit_file_lines` 用 `anchor_text` 定位 + `expected_old` 校验 + `expected_sha256` 防并发，先 `dry_run=true` 看 diff
+3. 确认无误后去掉 `dry_run` 实写；若返回 `E_EXTERNAL_CHANGED`，重新读取后再改
+4. 改错了用 `manage_backups` `action=undo` 回滚
+
 ## 项目结构
 
 ```
-test/
-├── Cargo.toml          # 项目依赖配置
-├── README.md           # 本文件
+file-io-mcp/
+├── Cargo.toml                  # 依赖配置
+├── README.md                   # 本文件
+├── build.bat                   # Windows 发布构建
+├── start-http.bat              # HTTP 模式启动
 └── src/
-    └── main.rs         # MCP 服务器实现（全部工具逻辑）
+    └── main.rs                 # MCP 服务器实现（全部工具逻辑）
 ```
+
+### 验证脚本（开发用）
+
+| 脚本 | 覆盖内容 |
+|------|----------|
+| `mcp_test_p0.py` | 并发写、原子写、BOM 保持、换行统一、OCC |
+| `mcp_test_encoding.py` | 编码保持、UTF-16、非法字节、`max_matches`、偏移边界 |
+| `mcp_test_gbk_utf8.py` | GBK/UTF-8 区分（含"GBK 字节恰好合法 UTF-8"的冲突样本） |
+| `mcp_test_backup.py` | 备份、回滚、清理、项目零污染 |
+| `mcp_test_errcodes.py` | 各类失败的错误码 |
+| `mcp_test_anchor_dryrun.py` | 锚点定位、dry-run/diff |
+| `mcp_test_consistency.py` | 指纹口径一致性、空文件、`fetch` 截断 |
+| `mcp_bench.py` | 大文件性能基准（可选传 exe 路径） |
+| `mcp_tools_size.py` | 统计 tools/list 的 schema 体量 |
+
+运行方式：`python mcp_test_p0.py [可选 exe 路径]`（默认 `target/debug/file-io-mcp.exe`）

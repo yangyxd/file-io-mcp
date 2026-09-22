@@ -153,13 +153,13 @@ fn retry_io<T, F: FnMut() -> std::io::Result<T>>(mut op: F) -> std::io::Result<T
 struct ReadTextFileParams {
     /// 文件路径
     path: String,
-    /// 起始偏移量(字节)，默认0
+    /// 起始字节偏移，默认 0
     offset: Option<u64>,
-    /// 读取长度(字节)，默认 10MB 上限。文件更大时会截断并在返回头显著标注，可用 offset 分页读取剩余部分
+    /// 读取字节数，默认 10MB 上限（超出会截断并在返回头标注，可配合 offset 分页）
     length: Option<usize>,
-    /// 字符编码，默认utf-8。支持: gbk, gb2312, gb18030, big5, shift_jis, euc-jp, euc-kr等
+    /// 编码，默认自动识别
     encoding: Option<String>,
-    /// 是否在每行前显示行号，默认false。如需按行编辑配合 edit_file_lines，请使用 read_text_lines 工具
+    /// 每行前显示行号，默认 false
     show_line_numbers: Option<bool>,
 }
 
@@ -167,11 +167,11 @@ struct ReadTextFileParams {
 struct ReadTextLinesParams {
     /// 文件路径
     path: String,
-    /// 起始行号(1-based)，默认1
+    /// 起始行号(1-based)，默认 1
     start_line: Option<usize>,
-    /// 结束行号(1-based，包含)，默认到末尾
+    /// 结束行号(1-based，含)，默认到末尾
     end_line: Option<usize>,
-    /// 字符编码，默认utf-8。支持: gbk, gb2312, gb18030, big5, shift_jis, euc-jp, euc-kr等
+    /// 编码，默认自动识别
     encoding: Option<String>,
 }
 
@@ -181,17 +181,17 @@ struct WriteTextFileParams {
     path: String,
     /// 写入内容
     content: String,
-    /// 写入模式: overwrite(覆盖)/append(追加)/insert(指定位置插入)
+    /// 模式：overwrite(默认)/append/insert(需 offset)
     mode: Option<String>,
-    /// 插入位置的偏移量(字节)
+    /// insert 的插入字节偏移（须落在字符边界）
     offset: Option<u64>,
-    /// 字符编码，默认utf-8。支持: gbk, gb2312, gb18030, big5, shift_jis, euc-jp, euc-kr等
+    /// 编码，默认保持原文件编码（不一致则拒绝）
     encoding: Option<String>,
-    /// 期望的旧内容（overwrite 模式写前校验）。若提供且与文件当前内容不一致，则拒绝写入并返回文件完整内容，防止未完整读取就整文件覆盖
+    /// 期望的旧内容（按 mode 对应：overwrite=全文 / append=末尾 / insert=offset 附近），不符则拒绝并回显实际内容
     expected_old: Option<String>,
-    /// 期望的文件 sha256（取自读取结果头部）。若提供且与写入前的实际内容不符，说明文件已被其他 AI/程序改过，拒绝写入。多人并发写同一文件时强烈建议传
+    /// 读到的 sha256；文件已被改动则拒绝写入
     expected_sha256: Option<String>,
-    /// true 时只返回修改 diff 预览，不写入文件
+    /// true=只返回 diff 预览不写入
     dry_run: Option<bool>,
 }
 
@@ -199,9 +199,9 @@ struct WriteTextFileParams {
 struct ReadBinaryFileParams {
     /// 文件路径
     path: String,
-    /// 起始偏移量(字节)，默认0
+    /// 起始字节偏移，默认 0
     offset: Option<u64>,
-    /// 读取长度(字节)，默认到末尾
+    /// 读取字节数，默认到末尾
     length: Option<usize>,
 }
 
@@ -209,33 +209,33 @@ struct ReadBinaryFileParams {
 struct WriteBinaryFileParams {
     /// 文件路径
     path: String,
-    /// 十六进制数据，如 "48656C6C6F" 或 "0x48656C6C6F"
+    /// 十六进制数据，如 "48656C6C6F"（可带 0x 前缀）
     hex_data: String,
-    /// 写入模式: overwrite/append/insert/replace
+    /// 模式：overwrite(默认)/append/insert/replace
     mode: Option<String>,
-    /// 偏移量(字节)。insert为插入位置，replace为替换起始位置
+    /// insert=插入位置 / replace=替换起始位置（字节）
     offset: Option<u64>,
-    /// replace模式下被替换的字节数
+    /// replace 模式下被替换的字节数
     replace_length: Option<usize>,
-    /// 期望的文件 sha256（取自 file_info/read 结果）。若与写入前实际内容不符，说明文件已被其他 AI/程序改过，拒绝写入
+    /// 读到的 sha256；文件已被改动则拒绝写入
     expected_sha256: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ManageBackupsParams {
-    /// 文件路径（备份按文件区分）
+    /// 文件路径
     path: String,
-    /// 操作类型: list(列出备份) / undo(回滚最近一次写入或删除) / clean(清理旧备份)
+    /// list=列出备份 / undo=回滚最近一次写入或删除 / clean=清理
     action: String,
-    /// clean 时保留的备份份数，默认 10；传 0 表示清空该文件的全部备份
+    /// clean 保留份数，默认 10；0=清空
     keep: Option<usize>,
-    /// undo 时若文件在备份之后又被改动过，默认拒绝回滚；force=true 强制回滚（会丢弃那些改动）
+    /// undo 时文件在备份后又被改过：默认拒绝，true 强制回滚
     force: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct FileInfoParams {
-    /// 文件路径
+    /// 文件或目录路径
     path: String,
 }
 
@@ -243,37 +243,37 @@ struct FileInfoParams {
 struct RegexReplaceParams {
     /// 文件路径
     path: String,
-    /// 正则表达式模式
+    /// 正则表达式
     pattern: String,
-    /// 替换内容，支持 $1, $2 捕获组引用
+    /// 替换内容，支持 $1/$2 捕获组
     replacement: String,
-    /// 字符串替换时使用的字符编码，默认utf-8。支持: gbk, gb2312, gb18030, big5, shift_jis, euc-jp, euc-kr等
+    /// 编码，默认自动识别并保持原编码
     encoding: Option<String>,
-    /// 是否全局替换，默认true。false则仅替换首个匹配
+    /// 全局替换，默认 true；false=只替换首个
     global: Option<bool>,
-    /// 是否仅预览不写入（dry-run）。true 时返回匹配数量、前20处替换预览及新文件大小，不修改文件。默认 false
+    /// true=只返回 diff 预览不写入
     dry_run: Option<bool>,
-    /// 匹配数量上限，超过则拒绝执行（防止正则过宽或匹配空串导致误替换）。默认 10000
+    /// 必填：预期最多替换几处，实际超出即拒绝（防正则过宽误伤）
     max_matches: Option<usize>,
-    /// 期望的文件 sha256（取自读取结果头部）。若与写入前实际内容不符，说明文件已被其他 AI/程序改过，拒绝写入
+    /// 读到的 sha256；文件已被改动则拒绝写入
     expected_sha256: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TextSearchParams {
-    /// 文件或目录路径。目录时搜索目录下文件
+    /// 文件或目录（目录则搜索其下文件）
     path: String,
-    /// 搜索模式(正则表达式)
+    /// 搜索用正则
     pattern: String,
-    /// 是否区分大小写，默认true
+    /// 区分大小写，默认 true
     case_sensitive: Option<bool>,
-    /// 最大返回数，默认100
+    /// 最多返回条数，默认 100
     max_results: Option<usize>,
-    /// 文件后缀过滤(如"txt")，仅path为目录时生效
+    /// 后缀过滤，如 "pas"（仅目录模式）
     extension: Option<String>,
-    /// 是否递归子目录，默认true。仅path为目录时生效
+    /// 递归子目录，默认 true（仅目录模式）
     recursive: Option<bool>,
-    /// 字符编码，默认utf-8。支持: gbk, gb2312, gb18030, big5, shift_jis, euc-jp, euc-kr等
+    /// 编码，默认 utf-8（多编码文件建议显式指定）
     encoding: Option<String>,
 }
 
@@ -281,19 +281,19 @@ struct TextSearchParams {
 struct ListFilesParams {
     /// 目录路径
     path: String,
-    /// 文件名过滤(正则)，不指定则列出所有。与 glob_pattern 二选一
+    /// 文件名正则过滤（与 glob_pattern 二选一）
     pattern: Option<String>,
-    /// Glob 通配符过滤(如 "**/*.rs" "*.txt")，比正则更直观。与 pattern 二选一
+    /// Glob 过滤，如 "*.pas"、"**/*.rs"（与 pattern 二选一）
     glob_pattern: Option<String>,
-    /// 是否递归子目录，默认false
+    /// 递归子目录，默认 false
     recursive: Option<bool>,
-    /// 是否包含目录项，默认true
+    /// 包含目录项，默认 true
     include_dirs: Option<bool>,
-    /// 最大返回数，默认500
+    /// 最多返回条数，默认 500
     max_results: Option<usize>,
-    /// 是否显示文件大小，默认true
+    /// 显示大小，默认 true
     show_size: Option<bool>,
-    /// 是否显示修改时间，默认false
+    /// 显示修改时间，默认 false
     show_modified: Option<bool>,
 }
 
@@ -305,15 +305,15 @@ struct DeleteFileParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct FetchParams {
-    /// 请求的 URL 地址
+    /// 请求 URL
     url: String,
-    /// HTTP方法，默认GET。可选: GET/POST/PUT/DELETE/PATCH/HEAD
+    /// GET(默认)/POST/PUT/DELETE/PATCH/HEAD
     method: Option<String>,
-    /// 请求头键值对
+    /// 请求头
     headers: Option<std::collections::HashMap<String, String>>,
-    /// 请求体(字符串)，POST/PUT/PATCH时使用
+    /// 请求体（POST/PUT/PATCH）
     body: Option<String>,
-    /// 响应类型: text/json/binary，默认text
+    /// text(默认)/json/binary
     response_type: Option<String>,
     /// 超时(秒)，默认30
     timeout: Option<u64>,
@@ -321,31 +321,31 @@ struct FetchParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct EditFileLinesParams {
-    /// 操作类型: delete_lines(删除行), insert_lines(插入行), replace_lines(替换行), append_lines(追加行)
+    /// delete_lines/insert_lines/replace_lines/append_lines
     operation: String,
     /// 文件路径
     path: Option<String>,
-    /// 文件路径(兼容)
+    /// 同 path（兼容字段）
     file_path: Option<String>,
-    /// 起始行号(1-based)，delete/insert/replace操作使用
+    /// 起始行号(1-based)：delete/insert/replace
     start_line: Option<usize>,
-    /// 结束行号(1-based)，delete/replace操作使用
+    /// 结束行号(1-based，含)：delete/replace；用锚点定位时可省（默认单行）
     end_line: Option<usize>,
-    /// 要插入/替换/追加的内容
+    /// insert/replace/append 的内容
     content: Option<String>,
-    /// 字符编码，默认utf-8。支持: gbk, gb2312, gb18030, big5, shift_jis, euc-jp, euc-kr等
+    /// 编码，默认保持原文件编码
     encoding: Option<String>,
-    /// 期望的旧内容(delete/replace操作必传)。与实际文件的目标行进行比对，不匹配则拒绝操作。用于防止行号算错导致误改。
+    /// delete/replace 必传：目标行的原始内容，用于二次校验防行号算错
     expected_old: Option<String>,
-    /// 期望的文件 sha256（取自 read_text_lines 结果头部）。若与写入前实际内容不符，说明文件已被其他 AI/程序改过，拒绝写入。多人并发写同一文件时强烈建议传
+    /// 读到的 sha256；文件已被改动则拒绝写入
     expected_sha256: Option<String>,
-    /// 锚点定位：把"目标行的完整文本"传进来，自动换算行号(全文必须唯一命中，否则拒绝并列出全部命中行)。与 start_line 二选一，可避免行号算错
+    /// 锚点定位：目标行的完整文本（须全文唯一命中）；与 start_line 二选一
     anchor_text: Option<String>,
-    /// 锚点定位：用正则匹配目标行(唯一命中)。与 anchor_text / start_line 二选一
+    /// 锚点定位：正则匹配目标行（须唯一命中）
     anchor_regex: Option<String>,
-    /// 锚点命中多处时，指定操作第几处(1-based)。默认要求唯一命中
+    /// 锚点命中多处时选第几处(1-based)，默认要求唯一
     anchor_occurrence: Option<usize>,
-    /// true 时只返回将要修改的 diff 预览，不写入文件
+    /// true=只返回 diff 预览不写入
     dry_run: Option<bool>,
 }
 
@@ -353,9 +353,9 @@ struct EditFileLinesParams {
 struct CopyFilesParams {
     /// 源文件路径列表
     sources: Vec<String>,
-    /// 目标路径。如果是目录则将源文件复制到该目录下；单文件时可指定新文件名
+    /// 目标：目录（多文件）或新文件路径（单文件）
     target: String,
-    /// 是否覆盖已存在的目标文件，默认false
+    /// 覆盖已存在的目标，默认 false
     overwrite: Option<bool>,
 }
 
@@ -363,9 +363,9 @@ struct CopyFilesParams {
 struct MoveFilesParams {
     /// 源文件路径列表
     sources: Vec<String>,
-    /// 目标路径。如果是目录则将源文件移动到该目录下；单文件时可指定新文件名
+    /// 目标：目录（多文件）或新文件路径（单文件改名）
     target: String,
-    /// 是否覆盖已存在的目标文件，默认false
+    /// 覆盖已存在的目标，默认 false
     overwrite: Option<bool>,
 }
 
@@ -878,26 +878,45 @@ impl FileIoServer {
         result.iter().map(|b| format!("{:02x}", b)).collect::<String>()
     }
 
-    /// SHA256 前 16 位：返回给 AI 用作 expected_sha256，兼顾可辨识度与 token 开销
-    fn sha256_short(data: &[u8]) -> String {
-        let h = Self::sha256_hex(data);
+    /// 版本指纹算法（**唯一口径**，读写与 file_info 全部走这里）：
+    /// - ≤1MB：整份内容 sha256
+    /// - >1MB：sha256("大小 + 头 64KB + 尾 64KB")，避免为了算 sha 把大文件整个读一遍
+    fn fingerprint_of_bytes(bytes: &[u8]) -> String {
+        const INLINE_MAX: usize = 1024 * 1024;
+        const SAMPLE: usize = 64 * 1024;
+        if bytes.len() <= INLINE_MAX {
+            return Self::sha256_hex(bytes);
+        }
+        let take = SAMPLE.min(bytes.len());
+        let mut buf: Vec<u8> = Vec::with_capacity(take * 2 + 8);
+        buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&bytes[..take]);
+        buf.extend_from_slice(&bytes[bytes.len() - take..]);
+        Self::sha256_hex(&buf)
+    }
+
+    /// 版本指纹（内存中已有整份内容时用这个；bytes 必须是文件的完整内容）。
+    /// 写入类工具**必须**用它计算返回给 AI 的 sha256，而不是写完后立刻读盘：
+    /// Windows 上 rename 替换后立即读取可能仍读到旧缓存页，会返回一个与实际内容不符的指纹，
+    /// 导致 AI 拿它当 expected_sha256 时被误判为"文件已被改动"。
+    fn fingerprint_short_of_bytes(bytes: &[u8]) -> String {
+        let h = Self::fingerprint_of_bytes(bytes);
         h[..16].to_string()
     }
 
-    /// 版本指纹算法：小文件全量 sha256；大文件只用"大小 + 头尾各 64KB"算 sha256。
-    /// 目的：读取/校验大文件时不必为了算 sha 而把整个大文件再读一遍。
-    /// 读写两侧（读取工具返回的 sha256 与写入前的校验）都走这里，保证口径一致。
+    /// 按路径取版本指纹的完整值；大文件只读头尾各 64KB
     fn file_fingerprint(path: &str, size: u64, bytes: Option<&[u8]>) -> Option<String> {
-        const INLINE_MAX: u64 = 1024 * 1024; // ≤1MB 全量算
+        const INLINE_MAX: u64 = 1024 * 1024;
         const SAMPLE: usize = 64 * 1024;
         if size <= INLINE_MAX {
             if let Some(b) = bytes {
                 if b.len() as u64 == size {
-                    return Some(Self::sha256_hex(b));
+                    return Some(Self::fingerprint_of_bytes(b));
                 }
             }
-            return fs::read(path).ok().map(|b| Self::sha256_hex(&b));
+            return fs::read(path).ok().map(|b| Self::fingerprint_of_bytes(&b));
         }
+        // 大文件：按 fingerprint_of_bytes 的同构顺序拼 "size + head + tail"
         let mut f = File::open(path).ok()?;
         let take = SAMPLE.min(size as usize);
         let mut buf: Vec<u8> = Vec::with_capacity(take * 2 + 8);
@@ -912,7 +931,7 @@ impl FileIoServer {
         Some(Self::sha256_hex(&buf))
     }
 
-    /// 取路径对应的版本指纹（前 16 位），失败返回 "-"
+    /// 取路径对应的版本指纹（前 16 位，返回给 AI 用），失败返回 "-"
     fn path_fingerprint_short(path: &str) -> String {
         let size = match fs::metadata(path) {
             Ok(m) if m.is_file() => m.len(),
@@ -940,7 +959,7 @@ impl FileIoServer {
         }
         // 与实际读取工具同一算法（大文件为采样指纹）
         let actual = Self::file_fingerprint(path, current_bytes.len() as u64, Some(current_bytes))
-            .unwrap_or_else(|| Self::sha256_hex(current_bytes));
+            .unwrap_or_else(|| Self::fingerprint_of_bytes(current_bytes));
         if actual.starts_with(&exp) {
             return Ok(());
         }
@@ -1171,8 +1190,10 @@ impl FileIoServer {
             }
         }
         let before_sha = before_bytes
-            .map(Self::sha256_hex)
-            .unwrap_or_else(|| Self::sha256_hex(&fs::read(&bak).unwrap_or_default()));
+            .map(Self::fingerprint_short_of_bytes)
+            .unwrap_or_else(|| {
+                Self::fingerprint_short_of_bytes(&fs::read(&bak).unwrap_or_default())
+            });
         let meta = dir.join(format!("{}.json", base));
         let info = serde_json::json!({
             "path": path,
@@ -1200,7 +1221,8 @@ impl FileIoServer {
         if let Some(obj) = v.as_object_mut() {
             obj.insert(
                 "after_sha256".to_string(),
-                serde_json::Value::String(Self::sha256_hex(after_bytes)),
+                // 与读取工具返回的 sha256 同一口径，便于直接比对
+                serde_json::Value::String(Self::fingerprint_short_of_bytes(after_bytes)),
             );
         }
         let _ = fs::write(&handle.meta, v.to_string());
@@ -1529,7 +1551,7 @@ impl FileIoServer {
     /// 读取文本文件
     #[tool(
         name = "read_text_file",
-        description = "按字节读文本。encoding 默认自动检测并返回实际编码(带BOM标注)；offset/length 截取，超 10MB 截断时返回头标红。返回头含 sha256，可作为后续写入的 expected_sha256 防止并发覆盖。编辑请用 read_text_lines",
+        description = "按字节读文本片段(offset/length，默认最多 10MB)。返回头: 路径|编码(BOM标注)|大小|sha256|区间；要按行编辑请用 read_text_lines",
         annotations(title = "读取文本文件", read_only_hint = true)
     )]
     fn read_text_file(
@@ -1655,7 +1677,7 @@ impl FileIoServer {
     /// 写入文本文件
     #[tool(
         name = "write_text_file",
-        description = "写文本(自动建目录，原子写入)。mode: overwrite/append/insert。建议传 expected_old 校验：与当前想改范围(overwrite=全文/append=末尾/insert=offset附近)不一致则拒绝并返回实际内容。dry_run=true 只返回 diff 预览不写入。encoding 默认保持原编码与BOM，不一致则拒绝。expected_sha256 传读取结果里的 sha256，可防止并发写覆盖",
+        description = "整段写文本(自动建目录)。mode=overwrite(默认)/append/insert(需 offset，须落在字符边界)。建议传 expected_old 做写前校验；dry_run=true 只看 diff",
         annotations(title = "写入文本文件", destructive_hint = true)
     )]
     fn write_text_file(
@@ -1773,7 +1795,7 @@ impl FileIoServer {
                 old_text.len(),
                 new_text.len(),
                 Self::unified_diff(&old_text, &new_text, 200),
-                Self::sha256_short(&new_full)
+                Self::fingerprint_short_of_bytes(&new_full)
             ));
         }
 
@@ -1793,10 +1815,11 @@ impl FileIoServer {
                     Self::finish_backup(h, &out);
                     tail = " | undoable".to_string();
                 }
-                Ok(format!("OK {} | {} | {}B | sha256:{}{}", params.path, encoding_label, out.len(), Self::sha256_short(&out), tail))
+                Ok(format!("OK {} | {} | {}B | sha256:{}{}", params.path, encoding_label, out.len(), Self::fingerprint_short_of_bytes(&out), tail))
             }
             "append" => {
                 // append 是"就地追加"，硬链接备份会跟着变，因此不做备份（可回滚性由 OCC + 原子写覆盖其他模式）
+                let mut full = existing_bytes.clone().unwrap_or_default();
                 retry_io(|| {
                     let mut file = OpenOptions::new()
                         .append(true)
@@ -1807,8 +1830,8 @@ impl FileIoServer {
                     Ok(())
                 })
                 .map_err(|e| e_internal(format!("E_WRITE 追加失败: {}", e), None))?;
-                let new_sha = Self::path_fingerprint_short(&params.path);
-                Ok(format!("OK {} | {} | +{}B append | sha256:{}", params.path, encoding_label, bytes.len(), new_sha))
+                full.extend_from_slice(&bytes);
+                Ok(format!("OK {} | {} | +{}B append | sha256:{}", params.path, encoding_label, bytes.len(), Self::fingerprint_short_of_bytes(&full)))
             }
             "insert" => {
                 let off = params.offset.unwrap_or(0) as usize;
@@ -1848,7 +1871,7 @@ impl FileIoServer {
                     Self::finish_backup(h, &new_data);
                     tail = " | undoable".to_string();
                 }
-                Ok(format!("OK {} | {} | +{}B @{} | {}B | sha256:{}{}", params.path, encoding_label, bytes.len(), off, new_data.len(), Self::sha256_short(&new_data), tail))
+                Ok(format!("OK {} | {} | +{}B @{} | {}B | sha256:{}{}", params.path, encoding_label, bytes.len(), off, new_data.len(), Self::fingerprint_short_of_bytes(&new_data), tail))
             }
             _ => Ok(format!(
                 "不支持的模式: {}，可选: overwrite, append, insert",
@@ -1861,7 +1884,7 @@ impl FileIoServer {
     /// 按行号读取文本文件（与 edit_file_lines 配合使用，避免行号算错）
     #[tool(
         name = "read_text_lines",
-        description = "按行读文本(1-based，带行号)，与 edit_file_lines 配套。encoding 默认自动检测并返回实际编码(带BOM标注)。返回头含 sha256，编辑同一文件时请把它传给 edit_file_lines 的 expected_sha256，防止多 AI 并发写互相覆盖",
+        description = "按行读文本(1-based，带行号)，与 edit_file_lines 配套。返回头含总行数与 sha256；编辑时把 sha256 传给 expected_sha256 可防并发覆盖",
         annotations(title = "按行读取文本", read_only_hint = true)
     )]
     fn read_text_lines(
@@ -1896,8 +1919,25 @@ impl FileIoServer {
         let ft = Self::decode_file(&bytes, encoding_name)
             .map_err(|e| e_internal(e, None))?;
         // 行数按与 edit_file_lines 相同的口径统计（split('\n')），但不构造行内容，
-        // 避免大文件下为上百万行分配 String
-        let total_lines = ft.content.split('\n').count();
+        // 避免大文件下为上百万行分配 String；空文件按 0 行处理（否则会被算成"1 个空行"）
+        let total_lines = if ft.content.is_empty() {
+            0
+        } else {
+            ft.content.split('\n').count()
+        };
+
+        if total_lines == 0 {
+            let sha = Self::file_fingerprint(&params.path, file_size as u64, Some(&bytes))
+                .map(|h| h[..16].to_string())
+                .unwrap_or_else(|| "-".to_string());
+            return Ok(format!(
+                "{} | {} | {}B | 0 lines total | sha256:{} | []```\n```",
+                params.path,
+                Self::encoding_label(&ft),
+                file_size,
+                sha
+            ));
+        }
 
         let start = params.start_line.unwrap_or(1).max(1);
         let end = params.end_line.unwrap_or(total_lines).min(total_lines);
@@ -1963,7 +2003,7 @@ impl FileIoServer {
     /// 读取二进制文件，返回HEX dump
     #[tool(
         name = "read_binary_file",
-        description = "读二进制返回 HEX dump(地址+十六进制+ASCII)。offset/length 截取",
+        description = "读二进制 HEX dump(偏移+十六进制+ASCII)，offset/length 截取。返回头含 sha256",
         annotations(title = "读取二进制文件", read_only_hint = true)
     )]
     fn read_binary_file(
@@ -2028,15 +2068,20 @@ impl FileIoServer {
         }
 
         Ok(format!(
-            "{} | {}B | [{},{})```\n{}```",
-            params.path, file_size, start, start + read_len as u64, hex_dump
+            "{} | {}B | sha256:{} | [{},{})```\n{}```",
+            params.path,
+            file_size,
+            Self::path_fingerprint_short(&params.path),
+            start,
+            start + read_len as u64,
+            hex_dump
         ))
     }
 
     /// 写入十六进制数据到二进制文件
     #[tool(
         name = "write_binary_file",
-        description = "写十六进制(原子写入)。mode: overwrite/append/insert(offset)/replace(offset+replace_length)。expected_sha256 传 file_info 里的 sha256 可防止并发写覆盖",
+        description = "按十六进制写二进制。mode=overwrite(默认)/append/insert(offset)/replace(offset+replace_length)",
         annotations(title = "写入二进制文件", destructive_hint = true)
     )]
     fn write_binary_file(
@@ -2109,9 +2154,10 @@ impl FileIoServer {
                     Self::finish_backup(h, &bytes);
                     tail = " | undoable".to_string();
                 }
-                Ok(format!("OK {} | {}B | sha256:{}{}", params.path, bytes.len(), Self::sha256_short(&bytes), tail))
+                Ok(format!("OK {} | {}B | sha256:{}{}", params.path, bytes.len(), Self::fingerprint_short_of_bytes(&bytes), tail))
             }
             "append" => {
+                let mut full = current.clone();
                 retry_io(|| {
                     let mut file = OpenOptions::new()
                         .append(true)
@@ -2122,7 +2168,8 @@ impl FileIoServer {
                     Ok(())
                 })
                 .map_err(|e| e_internal(format!("E_WRITE 追加失败: {}", e), None))?;
-                Ok(format!("OK {} | +{}B append", params.path, bytes.len()))
+                full.extend_from_slice(&bytes);
+                Ok(format!("OK {} | +{}B append | sha256:{}", params.path, bytes.len(), Self::fingerprint_short_of_bytes(&full)))
             }
             "insert" => {
                 let off = params.offset.unwrap_or(0) as usize;
@@ -2146,7 +2193,7 @@ impl FileIoServer {
                     Self::finish_backup(h, &new_data);
                     tail = " | undoable".to_string();
                 }
-                Ok(format!("OK {} | +{}B @{} | {}B | sha256:{}{}", params.path, bytes.len(), off, new_data.len(), Self::sha256_short(&new_data), tail))
+                Ok(format!("OK {} | +{}B @{} | {}B | sha256:{}{}", params.path, bytes.len(), off, new_data.len(), Self::fingerprint_short_of_bytes(&new_data), tail))
             }
             "replace" => {
                 let off = params.offset.unwrap_or(0) as usize;
@@ -2190,7 +2237,7 @@ impl FileIoServer {
                     bytes.len(),
                     off,
                     new_data.len(),
-                    Self::sha256_short(&new_data),
+                    Self::fingerprint_short_of_bytes(&new_data),
                     tail
                 ))
             }
@@ -2205,7 +2252,7 @@ impl FileIoServer {
     /// 搜索文件/目录中的文本内容(正则)
     #[tool(
         name = "text_search",
-        description = "正则搜索文件/目录文本。目录时递归，支持 extension 过滤、case_sensitive、max_results",
+        description = "在文件/目录中正则搜索，返回 文件:行号:内容(带命中数)。目录默认递归，可 extension 过滤",
         annotations(title = "文本搜索", read_only_hint = true)
     )]
     fn text_search(
@@ -2388,7 +2435,7 @@ impl FileIoServer {
     /// 正则替换文件文本
     #[tool(
         name = "regex_replace",
-        description = "正则替换文件文本(保持原编码与BOM，原子写入)，支持 $1/$2 捕获组。global 默认 true；dry_run=true 只预览不写入；max_matches 必填(预期最多替换几处，超出即拒绝，防正则过宽误伤)；expected_sha256 可防止并发写覆盖",
+        description = "正则替换(支持 $1/$2 捕获组)。max_matches 必填=预期最多替换几处，实际超出即拒绝(防正则过宽误伤)；global 默认 true；dry_run=true 只看 diff",
         annotations(title = "正则替换", destructive_hint = true)
     )]
     fn regex_replace(
@@ -2560,7 +2607,7 @@ impl FileIoServer {
             count,
             content.len(),
             new_bytes.len(),
-            Self::sha256_short(&new_bytes),
+            Self::fingerprint_short_of_bytes(&new_bytes),
             tail
         ))
         })
@@ -2569,7 +2616,7 @@ impl FileIoServer {
     /// 列出或搜索目录内容
     #[tool(
         name = "list_files",
-        description = "列目录/搜文件名。pattern(正则)或 glob_pattern 过滤、recursive、show_size/show_modified、include_dirs、max_results",
+        description = "列目录/按文件名搜索(glob_pattern 或 pattern 正则，二选一)，可 recursive、include_dirs、show_size/show_modified",
         annotations(title = "列出目录", read_only_hint = true)
     )]
     fn list_files(
@@ -2737,7 +2784,7 @@ impl FileIoServer {
     /// 获取文件元信息（大小、类型、修改时间、SHA256）
     #[tool(
         name = "file_info",
-        description = "获取文件/目录元信息：路径、类型、大小、修改时间(UNIX时间戳)、SHA256哈希",
+        description = "文件/目录元信息：路径|类型|大小|mtime(秒)|sha256。sha256 与读工具同源，可直接当 expected_sha256 用",
         annotations(title = "获取文件信息", read_only_hint = true)
     )]
     fn file_info(
@@ -2771,12 +2818,11 @@ impl FileIoServer {
             "其他"
         };
 
-        // 计算 SHA256（仅文件，目录输出 "-"）
+        // 版本指纹（与读取工具返回、写入前校验完全同一算法，可直接当 expected_sha256 用）
         let hash = if metadata.is_file() {
-            match fs::read(&params.path) {
-                Ok(bytes) => Self::sha256_hex(&bytes),
-                Err(_) => "-".to_string(),
-            }
+            Self::file_fingerprint(&params.path, metadata.len(), None)
+                .map(|h| h[..16].to_string())
+                .unwrap_or_else(|| "-".to_string())
         } else {
             "-".to_string()
         };
@@ -2790,7 +2836,7 @@ impl FileIoServer {
     /// 删除文件(需用户确认)
     #[tool(
         name = "delete_file",
-        description = "删除单个文件（不可删除目录）。不可逆，需用户确认授权",
+        description = "删除单个文件(不可删目录)。删除前自动备份，可用 manage_backups undo 恢复",
         annotations(title = "删除文件", destructive_hint = true)
     )]
     fn delete_file(
@@ -2833,7 +2879,7 @@ impl FileIoServer {
     /// 备份管理：列出 / 回滚 / 清理
     #[tool(
         name = "manage_backups",
-        description = "备份管理。备份存放在 MCP 工具自身目录下的 .file-io-mcp-backups/<文件名>-<路径hash>/，不会污染被编辑的项目。action=list 列出备份；action=undo 回滚最近一次写入或删除(force=true 可在文件之后又被改动时强制回滚)；action=clean 清理旧备份(keep 默认保留10份，keep=0 清空)。每个文件默认最多留10份，超出自动清理",
+        description = "备份管理(备份存于工具自身目录，不污染项目；每文件最多留 10 份，超出自动清理)。list=列出 / undo=回滚最近一次写入或删除(文件之后又被改动时默认拒绝，force=true 强制) / clean=清理",
         annotations(title = "备份管理", destructive_hint = true)
     )]
     fn manage_backups(
@@ -2903,19 +2949,18 @@ impl FileIoServer {
                 let after_sha = meta.get("after_sha256").and_then(|v| v.as_str());
                 if !params.force.unwrap_or(false) {
                     if let Some(after) = after_sha {
-                        let current_sha = fs::read(&params.path).ok().map(|b| Self::sha256_hex(&b));
-                        if let Some(cur) = current_sha {
-                            if !cur.starts_with(&after[..after.len().min(64)]) {
-                                return Err(e_param(
-                                    format!(
-                                        "E_EXTERNAL_CHANGED 文件在备份之后又被修改过，拒绝回滚以免丢失新改动。\n\
-                                         文件: {}\n备份对应的写入后 sha256: {}\n当前 sha256: {}\n\
-                                         确认要丢弃这些改动请用 force=true 重试",
-                                        params.path, after, cur
-                                    ),
-                                    None,
-                                ));
-                            }
+                        let cur = Self::path_fingerprint_short(&params.path);
+                        // 文件已不存在（cur="-"）时允许回滚恢复；否则要求当前内容与备份记录的"写入后内容"一致
+                        if cur != "-" && !after.eq_ignore_ascii_case(&cur) {
+                            return Err(e_param(
+                                format!(
+                                    "E_EXTERNAL_CHANGED 文件在备份之后又被修改过，拒绝回滚以免丢失新改动。\n\
+                                     文件: {}\n备份对应的写入后 sha256: {}\n当前 sha256: {}\n\
+                                     确认要丢弃这些改动请用 force=true 重试",
+                                    params.path, after, cur
+                                ),
+                                None,
+                            ));
                         }
                     }
                 }
@@ -2949,7 +2994,7 @@ impl FileIoServer {
                     bak.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
                     tool,
                     bak_bytes.len(),
-                    Self::sha256_short(&bak_bytes)
+                    Self::fingerprint_short_of_bytes(&bak_bytes)
                 ))
             }
             "clean" => {
@@ -2978,7 +3023,7 @@ impl FileIoServer {
     /// 发送HTTP请求
     #[tool(
         name = "fetch",
-        description = "发送 HTTP 请求。GET/POST/PUT/DELETE/PATCH/HEAD，headers/body/response_type(text|json|binary)/timeout",
+        description = "HTTP 请求(GET/POST/PUT/DELETE/PATCH/HEAD)。文本响应超 100KB 会截断并标注总大小",
         annotations(title = "HTTP 请求", open_world_hint = true)
     )]
     async fn fetch(
@@ -3081,11 +3126,9 @@ impl FileIoServer {
                 })?;
 
                 let preview = if body.len() > 100_000 {
-                    format!(
-                        "{}\n... {}B total",
-                        &body[..100_000],
-                        body.len()
-                    )
+                    // 按字符边界截断：第 10 万字节可能落在多字节字符中间，直接切片会 panic
+                    let cut = body.floor_char_boundary(100_000);
+                    format!("{}\n... {}B total", &body[..cut], body.len())
                 } else {
                     body
                 };
@@ -3101,7 +3144,7 @@ impl FileIoServer {
     /// 复制文件
     #[tool(
         name = "copy_files",
-        description = "批量复制到目录，或单文件改名。自动建目录，overwrite 开关",
+        description = "复制文件(自动建目录)：多文件时 target 视为目录，单文件可指定新路径/文件名；已存在默认跳过，overwrite=true 覆盖",
         annotations(title = "复制文件", destructive_hint = true)
     )]
     fn copy_files(
@@ -3192,7 +3235,7 @@ impl FileIoServer {
     /// 移动/重命名文件
     #[tool(
         name = "move_files",
-        description = "批量移动到目录，或单文件改名。自动建目录，overwrite 开关",
+        description = "移动/重命名文件(自动建目录)：多文件时 target 视为目录，单文件可指定新路径/文件名；已存在默认跳过，overwrite=true 覆盖",
         annotations(title = "移动文件", destructive_hint = true)
     )]
     fn move_files(
@@ -3284,7 +3327,7 @@ impl FileIoServer {
     /// 按行编辑文件：删除/插入/替换/追加行
     #[tool(
         name = "edit_file_lines",
-        description = "按行编辑(1-based，原子写入)：delete/insert/replace/append_lines。可用 anchor_text(目标行完整文本)或 anchor_regex 定位(要求唯一命中，避免行号算错)，也可直接给 start_line/end_line。delete/replace 必须传 expected_old 校验，不匹配拒绝。dry_run=true 只返回 diff 预览不写入。自动保持原编码与BOM，写回统一为文件主换行风格。多 AI 并发时请把 read_text_lines 返回的 sha256 传给 expected_sha256",
+        description = "按行编辑(1-based)：delete_lines/insert_lines/replace_lines/append_lines。定位用 anchor_text(整行文本，须全文唯一)或 anchor_regex，也可直接给 start_line/end_line；delete/replace 必传 expected_old 二次校验；dry_run=true 只看 diff",
         annotations(title = "按行编辑文件", destructive_hint = true)
     )]
     fn edit_file_lines(
@@ -3337,11 +3380,16 @@ impl FileIoServer {
         let encoding = ft.encoding.clone();
 
         // 拆分为"裸行"（去掉行尾 \r），写回时统一用主换行风格 line_ending 连接，
-        // 保证一个文件不会残留多种换行符
-        let lines: Vec<String> = ft.content
-            .split('\n')
-            .map(|s| s.trim_end_matches('\r').to_string())
-            .collect();
+        // 保证一个文件不会残留多种换行符。
+        // 空文件按 0 行处理：否则 append_lines 会在文件开头插出一个空行
+        let lines: Vec<String> = if ft.content.is_empty() {
+            Vec::new()
+        } else {
+            ft.content
+                .split('\n')
+                .map(|s| s.trim_end_matches('\r').to_string())
+                .collect()
+        };
         let total_lines = lines.len();
         let mut modified: Vec<String> = lines.clone();
 
@@ -3423,11 +3471,31 @@ impl FileIoServer {
             };
             match hits.len() {
                 0 => {
+                    // 未精确命中时给出"含该文本的行"作为提示，省掉一轮重新读取
+                    let mut hints: Vec<String> = Vec::new();
+                    if let Some(t) = params.anchor_text.as_deref().map(|s| s.trim()) {
+                        if !t.is_empty() {
+                            for (i, l) in lines.iter().enumerate() {
+                                let l = l.trim_end_matches('\r');
+                                if l.contains(t) {
+                                    hints.push(format!("第 {} 行: {}", i + 1, l.trim()));
+                                    if hints.len() >= 5 {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let hint = if hints.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\n可能想改的行（包含你给的文本）:\n  {}", hints.join("\n  "))
+                    };
                     return Err(e_param(
                         format!(
-                            "E_NOT_FOUND 锚点未匹配到任何行（anchor_text={:?} anchor_regex={:?}）。\
-                             请先用 read_text_lines 确认目标行文本",
-                            params.anchor_text, params.anchor_regex
+                            "E_NOT_FOUND 锚点未精确匹配到任何行（anchor_text={:?} anchor_regex={:?}）。\
+                             注意 anchor_text 需与整行完整一致（含缩进）；确认真实内容可先 read_text_lines{}",
+                            params.anchor_text, params.anchor_regex, hint
                         ),
                         None,
                     ));
@@ -3598,7 +3666,7 @@ impl FileIoServer {
                 bytes.len(),
                 new_bytes.len(),
                 Self::unified_diff(&ft.content, &new_content, 200),
-                Self::sha256_short(&new_bytes)
+                Self::fingerprint_short_of_bytes(&new_bytes)
             ));
         }
 
@@ -3630,7 +3698,7 @@ impl FileIoServer {
             total_lines,
             modified.len(),
             new_bytes.len(),
-            Self::sha256_short(&new_bytes),
+            Self::fingerprint_short_of_bytes(&new_bytes),
             tail
         ))
         })
@@ -3647,18 +3715,15 @@ impl ServerHandler for FileIoServer {
                 .build(),
             server_info: rmcp::model::Implementation::from_build_env(),
             instructions: Some(
-                "文件 I/O 工具服务器。若启动时设置了 FILE_IO_ROOT 环境变量，则所有文件操作都被限制在该根目录内（沙箱）。\
-                 delete_file、write_*、edit_file_lines、regex_replace 会修改或删除文件，属于破坏性操作，请谨慎使用。\
-                 读取类工具会在返回头给出 sha256；写入/编辑时把它传给 expected_sha256，若文件在此期间已被其他 AI 或程序改动，\
-                 写入会被拒绝（而不是覆盖别人的修改），此时请重新读取最新内容后重试。\
-                 所有覆盖类写入都是原子的：先写临时文件再 rename 替换，不会留下写坏的文件；\
-                 每次写入/删除前会自动备份，可用 manage_backups 回滚（备份放在工具自身目录，不污染项目）。\
-                 出错时错误消息带 E_XXX 错误码，便于分流处理：\
-                 E_NOT_FOUND 目标不存在 / E_NOT_UNIQUE 定位目标不唯一 / E_GUARD_MISMATCH expected_old 校验失败 / \
-                 E_EXTERNAL_CHANGED 文件已被他人改动（请重新读取后重试）/ E_ENCODING 编码问题 / \
-                 E_NO_PERMISSION 权限不足 / E_READ 读取失败 / E_WRITE 写入失败 / E_TOO_LARGE 文件过大 / \
-                 E_TOO_MANY_MATCHES 匹配数超过 max_matches / E_INVALID_PARAM 参数错误。\
-                 fetch 会与外部网络交互。".into(),
+                "文件读写服务器（可用 FILE_IO_ROOT 限制可访问目录）。通用约定：\
+                 ① 读写保持原编码+BOM+主换行风格；编码自动识别（可区分 GBK/UTF-8），识别不确定时返回头会提示；\
+                 ② 覆盖类写入是原子的（临时文件+rename），写前自动备份到工具自身目录，可用 manage_backups 回滚；\
+                 ③ 读工具返回头带 sha256（文件指纹）；写入时把上次读到的值传给 expected_sha256，\
+                    若文件已被他人改动会返回 E_EXTERNAL_CHANGED，此时请重新读取后再改，不要盲目覆盖；\
+                 ④ 改文件前先 read_text_lines 取内容与 sha256；不确定改法时先传 dry_run=true 看 diff 再实写。\
+                 错误码：E_NOT_FOUND/E_NOT_UNIQUE/E_GUARD_MISMATCH/E_EXTERNAL_CHANGED/E_ENCODING/\
+                 E_NO_PERMISSION/E_READ/E_WRITE/E_TOO_LARGE/E_TOO_MANY_MATCHES/E_INVALID_PARAM。\
+                 fetch 会访问外部网络。".into(),
             ),
         }
     }
