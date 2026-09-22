@@ -6,6 +6,7 @@
 
 # 测试脚本产生的数据目录与临时文件
 mcp_*_data/
+mcp_test_*/
 stderr.txt
 
 # 工具自身的备份目录（exe 不在 target 下时会出现）
