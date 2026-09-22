@@ -8,6 +8,11 @@ opt-level = 0  # 0=无优化，调试最舒服；1轻微优化，2/3 release级�
 debug = true
 split-debuginfo = "packed"
 
+[profile.release]
+lto = true           # 全量 LTO，跨 crate 内联/裁剪死代码
+panic = "abort"      # 去掉 panic 展开表，显著减小体积
+strip = true         # 去掉符号表
+
 [dependencies]
 rmcp = { version = "0.16", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
 tokio = { version = "1", features = ["full"] }

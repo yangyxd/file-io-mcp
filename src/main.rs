@@ -584,9 +584,11 @@ impl FileIoServer {
             Some(r) => r,
         };
 
-        let root_norm = normalize_path(root);
-        let abs_norm = normalize_path(&abs);
-        if !abs_norm.starts_with(&root_norm) {
+        // 先解析为"尽量真实"的路径：最长存在前缀由 OS canonicalize（统一大小写、展开 8.3 短名、
+        // 解析符号链接/junction），不存在的尾部按普通段原样拼接；无法安全解析时退回文本规范化。
+        // 这样"根目录内但写法不同"的路径不会被子串比较误拒，而越界/链接逃逸仍会被拦下。
+        let resolved = Self::resolve_existing_prefix(&abs);
+        if !Self::sandbox_cmp_key(&resolved).starts_with(&Self::sandbox_cmp_key(root)) {
             return Err(e_param(
                 format!(
                     "路径超出允许的根目录: {} (根目录: {})",
@@ -596,22 +598,40 @@ impl FileIoServer {
                 None,
             ));
         }
+        Ok(resolved.to_string_lossy().into_owned())
+    }
 
-        if abs.exists() {
-            let canon = abs.canonicalize().map_err(|e| {
-                e_internal(format!("无法解析路径: {}", e), None)
-            })?;
-            let canon_norm = normalize_path(&canon);
-            if !canon_norm.starts_with(&root_norm) {
-                return Err(e_param(
-                    format!("路径(解析符号链接后)超出允许的根目录: {}", path),
-                    None,
-                ));
+    /// 沙箱比较用的路径键：规范化（去 `\\?\`、折叠 `.`/`..`）+ 小写。
+    /// Windows 路径大小写不敏感，`F:\A` 与 `f:\a` 必须视为同一路径。
+    fn sandbox_cmp_key(p: &std::path::Path) -> String {
+        normalize_path(p).to_string_lossy().to_lowercase()
+    }
+
+    /// 用"最长可 canonicalize 的前缀 + 未存在的尾部"拼出尽量真实的绝对路径。
+    /// - 目标存在：等价于 canonicalize（大小写/短名/符号链接全部由 OS 解析）
+    /// - 目标不存在（如新建文件）：定位到最近的存在祖先再拼回尾部，避免整段退回文本比较
+    /// - 尾部含 `..` 等特殊段、或整条路径都不可解析：退回 normalize_path 的文本形式
+    fn resolve_existing_prefix(p: &std::path::Path) -> std::path::PathBuf {
+        use std::path::Component;
+        let comps: Vec<Component> = p.components().collect();
+        for split in (1..=comps.len()).rev() {
+            let tail = &comps[split..];
+            // 尾部只接受普通段：含 `..`/`.`/前缀段时换更短的 split，让它们进入可 canonicalize 的前缀
+            if tail.iter().any(|c| !matches!(c, Component::Normal(_))) {
+                continue;
             }
-            Ok(canon.to_string_lossy().into_owned())
-        } else {
-            Ok(abs.to_string_lossy().into_owned())
+            let prefix: std::path::PathBuf = comps[..split].iter().collect();
+            if let Ok(canon) = prefix.canonicalize() {
+                let mut out = canon;
+                for c in tail {
+                    if let Component::Normal(n) = c {
+                        out.push(n);
+                    }
+                }
+                return out;
+            }
         }
+        normalize_path(p)
     }
 
     /// 确保文件所在目录存在，不存在则自动创建
@@ -1495,7 +1515,7 @@ impl FileIoServer {
         let head: String = chars[..PREVIEW_HEAD].iter().collect();
         let tail: String = chars[chars.len() - PREVIEW_TAIL..].iter().collect();
         format!(
-            "{}\n…（中间省略 {} 字符；全文共 {} 字符，解码后文本 sha256:{})…\n{}",
+            "{}\n…（中间省略 {} 字符；全文共 {} 字符；内容指纹(非文件 sha256，勿用作 expected_sha256):{})…\n{}",
             head,
             chars.len() - PREVIEW_HEAD - PREVIEW_TAIL,
             chars.len(),
@@ -1920,8 +1940,21 @@ impl FileIoServer {
             .unwrap_or(false);
         if !enc_explicit {
             if let Some(b) = existing_bytes.as_deref() {
+                // 大文件（> 8MB）只校验头部样本：整份解码对 append/insert 大文件纯属浪费 CPU，
+                // 而编码特征在文件开头就已体现。切片须退到字符边界，否则半截字符会被
+                // decode_file 当成非法字节，导致正常文件被误拒。
+                const ENC_CHECK_FULL_LIMIT: usize = 8 * 1024 * 1024;
+                let probe: &[u8] = if b.len() <= ENC_CHECK_FULL_LIMIT {
+                    b
+                } else {
+                    let mut cut = ENC_CHECK_FULL_LIMIT;
+                    while cut > 0 && !Self::is_char_boundary(encoding_name, b, cut) {
+                        cut -= 1;
+                    }
+                    &b[..cut]
+                };
                 let lossless = matches!(
-                    Self::decode_file(b, encoding_name),
+                    Self::decode_file(probe, encoding_name),
                     Ok(ft) if !ft.has_invalid
                 );
                 if !lossless {

@@ -26,6 +26,8 @@
 | `move_files` | 移动 / 重命名文件 |
 | `fetch` | HTTP 请求 |
 
+> **关于"必填"**：下文参数表中的"是"表示**运行时必填**（服务端会校验并返回明确错误码）。其中 `delete_file.confirm`、`regex_replace.max_matches`、`edit_file_lines.expected_old`、`edit_file_lines.path` 在 `tools/list` 的 schema 里是可省略字段（`Option`），省略即触发校验错误，属于有意设计（便于给出可读的错误提示）。
+
 ## 核心机制
 
 ### 1. 编码识别与保持
@@ -130,6 +132,12 @@ cargo run                          # 开发
 | 变量 | 说明 |
 |------|------|
 | `FILE_IO_ROOT` | 可选。设置后所有文件操作被限制在该目录内（沙箱），未设置则不限制路径 |
+
+沙箱判定说明：
+
+- 越界路径一律拒绝（`E_TOO_LARGE 路径超出允许的根目录`），包括 `..` 上跳、以及经符号链接 / junction 指向根目录之外的路径（会先解析真实路径再比对）。
+- 路径**写法差异不影响判定**：大小写不同（`c:\proj` vs `C:\Proj`）、8.3 短名（`PROJEC~1`）、`sub/..` 等都会被规范化后再比较；新建文件（目标尚不存在）会定位到最近的存在祖先，因此也能通过小写盘符 / 短名路径创建。
+- 返回值统一为解析后的规范绝对路径（`\\?\C:\...` 形式），同一文件的不同写法会得到同一条字符串，备份分区与指纹不会因此分裂。
 | `FILE_IO_BACKUP_DIR` | 可选。备份根目录，默认 `<exe 所在目录>/.file-io-mcp-backups` |
 
 ### HTTP 模式（Streamable HTTP）
@@ -290,7 +298,7 @@ src/main.rs | utf-8 | 4096B | 120 lines total | sha256:8f3a1c02d94b7e15 | [10-15
 | `path` | string | 是 | 文件路径 |
 | `pattern` | string | 是 | 正则表达式 |
 | `replacement` | string | 是 | 替换内容，支持 `$1`、`$2` |
-| `max_matches` | usize | **是** | 预期最多替换几处；实际匹配数超过该值即拒绝（防止正则过宽或匹配空串造成大范围误替换） |
+| `max_matches` | usize | **是**（运行时） | 预期最多替换几处；实际匹配数超过该值即拒绝（防止正则过宽或匹配空串造成大范围误替换） |
 | `global` | bool | 否 | 全局替换，默认 true；false 时只替换首个 |
 | `dry_run` | bool | 否 | true=返回 diff 预览不写入 |
 | `encoding` | string | 否 | 默认自动识别并保持原编码 |
@@ -355,6 +363,13 @@ src/main.rs | utf-8 | 4096B | 120 lines total | sha256:8f3a1c02d94b7e15 | [10-15
 > 被隐藏规则挡掉的文件，可用 `include` 显式点名放行（如 `include: [".env"]`）。
 
 glob 同时按**文件名**与**相对搜索根的路径**匹配：`"*.rs"` 匹配文件名，`"src/**/*.rs"` 匹配路径；目录剪枝额外按 `"{dir}/子项"` 试一次，所以 `"node_modules/**"` 也能剪掉 `node_modules` 目录本身。
+
+> **大型项目建议显式排除构建产物目录**：`target/`、`node_modules/`、`dist/` 等不是隐藏目录，不会被 `skip_hidden` 挡掉，搜索时会产生大量噪音（例如 Rust 项目 `target/` 下就有成百上千个 `.rs`）。
+>
+> ```json
+> { "path": "/proj", "pattern": "fn parse", "extensions": ["rs"],
+>   "exclude": ["target/**", "node_modules/**", "dist/**", "build/**"] }
+> ```
 
 返回示例：
 
@@ -425,7 +440,7 @@ D:\proj\src\b.rs | sha256:9f8e7d6c5b4a3210 | enc:GBK | 1 matches
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `path` | string | 是 | 文件路径 |
-| `confirm` | bool | 是 | 必须为 `true` 才执行删除；未传/false 时只返回文件大小与 sha256，不删任何东西 |
+| `confirm` | bool | 是（运行时） | 必须为 `true` 才执行删除；未传/false 时返回 `E_INVALID_PARAM` 并附文件大小与 sha256，不删任何东西 |
 
 ```json
 { "path": "src/old.pas", "confirm": true }
@@ -512,6 +527,7 @@ file-io-mcp/
 | `mcp_test_errcodes.py` | 各类失败的错误码 |
 | `mcp_test_anchor_dryrun.py` | 锚点定位、dry-run/diff |
 | `mcp_test_consistency.py` | 指纹口径一致性、空文件、`fetch` 截断 |
+| `mcp_test_sandbox.py` | `FILE_IO_ROOT` 沙箱：大小写/8.3 短名/`..`/junction 的放行与拦截 |
 | `mcp_bench.py` | 大文件性能基准（可选传 exe 路径） |
 | `mcp_tools_size.py` | 统计 tools/list 的 schema 体量 |
 

@@ -1,1 +1,16 @@
 /target
+
+# 编辑器 / IDE
+.idea/
+.vscode/
+
+# 测试脚本产生的数据目录与临时文件
+mcp_*_data/
+stderr.txt
+
+# 工具自身的备份目录（exe 不在 target 下时会出现）
+.file-io-mcp-backups/
+
+# 本地发布产物（由 deploy.bat 生成）
+/dist/*.exe
+/dist/*.7z
