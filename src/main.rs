@@ -18,6 +18,56 @@ use sha2::{Sha256, Digest};
 const MAX_TEXT_READ_SIZE: usize = 10 * 1024 * 1024; // read_text_file 默认最大读取 10MB，超过则在返回头显著标注已截断
 const MAX_REGEX_FILE_SIZE: u64 = 64 * 1024 * 1024; // regex_replace 拒绝处理超过 64MB 的文件
 
+/// 文件操作失败后的重试次数（首次执行之外再重试 5 次）
+const IO_RETRY_TIMES: usize = 5;
+/// 每次重试前的等待时间(毫秒)
+const IO_RETRY_DELAY_MS: u64 = 120;
+
+// ==================== 文件操作重试 ====================
+
+/// 判断是否属于瞬时性 IO 错误：常见于文件被杀毒软件/索引器/编辑器/备份工具短暂占用，
+/// 表现为"没有权限操作文件"(PermissionDenied)，稍等再试通常即可成功。
+fn is_retryable_io_error(e: &std::io::Error) -> bool {
+    match e.kind() {
+        std::io::ErrorKind::PermissionDenied
+        | std::io::ErrorKind::WouldBlock
+        | std::io::ErrorKind::TimedOut
+        | std::io::ErrorKind::Interrupted => return true,
+        _ => {}
+    }
+    // Windows 下文件被占用时可能只带原始 OS 错误码
+    #[cfg(windows)]
+    {
+        if let Some(code) = e.raw_os_error() {
+            // 5=ACCESS_DENIED, 32=SHARING_VIOLATION, 33=LOCK_VIOLATION, 1224=USER_MAPPED_FILE
+            if matches!(code, 5 | 32 | 33 | 1224) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 执行文件操作，遇到瞬时性错误时延时重试：共重试 IO_RETRY_TIMES 次，每次间隔 IO_RETRY_DELAY_MS 毫秒。
+/// 非瞬时性错误(如路径不存在、磁盘满等)立即返回，不做无谓等待。
+fn retry_io<T, F: FnMut() -> std::io::Result<T>>(mut op: F) -> std::io::Result<T> {
+    let mut last_err = match op() {
+        Ok(v) => return Ok(v),
+        Err(e) => e,
+    };
+    for _ in 0..IO_RETRY_TIMES {
+        if !is_retryable_io_error(&last_err) {
+            return Err(last_err);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(IO_RETRY_DELAY_MS));
+        last_err = match op() {
+            Ok(v) => return Ok(v),
+            Err(e) => e,
+        };
+    }
+    Err(last_err)
+}
+
 // ==================== 参数结构体 ====================
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -301,7 +351,7 @@ impl FileIoServer {
     fn ensure_parent_dir(path: &str) -> Result<(), String> {
         if let Some(parent) = std::path::Path::new(path).parent() {
             if !parent.exists() {
-                fs::create_dir_all(parent)
+                retry_io(|| fs::create_dir_all(parent))
                     .map_err(|e| format!("创建目录失败 {}: {}", parent.display(), e))?;
             }
         }
@@ -734,20 +784,21 @@ impl FileIoServer {
 
         match mode {
             "overwrite" => {
-                fs::write(&params.path, &bytes)
+                retry_io(|| fs::write(&params.path, &bytes))
                     .map_err(|e| McpError::internal_error(format!("写入失败: {}", e), None))?;
                 Ok(format!("OK {} | {} | {}B", params.path, encoding_name, bytes.len()))
             }
             "append" => {
-                let mut file = OpenOptions::new()
-                    .append(true)
-                    .create(true)
-                    .open(&params.path)
-                    .map_err(|e| {
-                        McpError::internal_error(format!("打开文件失败: {}", e), None)
-                    })?;
-                file.write_all(&bytes)
-                    .map_err(|e| McpError::internal_error(format!("追加失败: {}", e), None))?;
+                retry_io(|| {
+                    let mut file = OpenOptions::new()
+                        .append(true)
+                        .create(true)
+                        .open(&params.path)?;
+                    file.write_all(&bytes)?;
+                    file.flush()?;
+                    Ok(())
+                })
+                .map_err(|e| McpError::internal_error(format!("追加失败: {}", e), None))?;
                 Ok(format!("OK {} | {} | +{}B append", params.path, encoding_name, bytes.len()))
             }
             "insert" => {
@@ -767,7 +818,7 @@ impl FileIoServer {
                 new_data.extend_from_slice(&original[..off]);
                 new_data.extend_from_slice(&bytes);
                 new_data.extend_from_slice(&original[off..]);
-                fs::write(&params.path, &new_data).map_err(|e| {
+                retry_io(|| fs::write(&params.path, &new_data)).map_err(|e| {
                     McpError::internal_error(format!("插入写入失败: {}", e), None)
                 })?;
                 Ok(format!("OK {} | {} | +{}B @{} | {}B", params.path, encoding_name, bytes.len(), off, new_data.len()))
@@ -985,20 +1036,21 @@ impl FileIoServer {
 
         match mode {
             "overwrite" => {
-                fs::write(&params.path, &bytes)
+                retry_io(|| fs::write(&params.path, &bytes))
                     .map_err(|e| McpError::internal_error(format!("写入失败: {}", e), None))?;
                 Ok(format!("OK {} | {}B", params.path, bytes.len()))
             }
             "append" => {
-                let mut file = OpenOptions::new()
-                    .append(true)
-                    .create(true)
-                    .open(&params.path)
-                    .map_err(|e| {
-                        McpError::internal_error(format!("打开文件失败: {}", e), None)
-                    })?;
-                file.write_all(&bytes)
-                    .map_err(|e| McpError::internal_error(format!("追加失败: {}", e), None))?;
+                retry_io(|| {
+                    let mut file = OpenOptions::new()
+                        .append(true)
+                        .create(true)
+                        .open(&params.path)?;
+                    file.write_all(&bytes)?;
+                    file.flush()?;
+                    Ok(())
+                })
+                .map_err(|e| McpError::internal_error(format!("追加失败: {}", e), None))?;
                 Ok(format!("OK {} | +{}B append", params.path, bytes.len()))
             }
             "insert" => {
@@ -1012,7 +1064,7 @@ impl FileIoServer {
                 new_data.extend_from_slice(&original[..off]);
                 new_data.extend_from_slice(&bytes);
                 new_data.extend_from_slice(&original[off..]);
-                fs::write(&params.path, &new_data).map_err(|e| {
+                retry_io(|| fs::write(&params.path, &new_data)).map_err(|e| {
                     McpError::internal_error(format!("插入写入失败: {}", e), None)
                 })?;
                 Ok(format!("OK {} | +{}B @{} | {}B", params.path, bytes.len(), off, new_data.len()))
@@ -1040,7 +1092,7 @@ impl FileIoServer {
                 new_data.extend_from_slice(&bytes);
                 new_data.extend_from_slice(&original[end..]);
 
-                fs::write(&params.path, &new_data).map_err(|e| {
+                retry_io(|| fs::write(&params.path, &new_data)).map_err(|e| {
                     McpError::internal_error(format!("替换写入失败: {}", e), None)
                 })?;
 
@@ -1367,7 +1419,7 @@ impl FileIoServer {
                 .map_err(|e| McpError::internal_error(e, None))?
         };
 
-        fs::write(&params.path, &new_bytes).map_err(|e| {
+        retry_io(|| fs::write(&params.path, &new_bytes)).map_err(|e| {
             McpError::internal_error(format!("写入文件失败: {}", e), None)
         })?;
 
@@ -1629,7 +1681,7 @@ impl FileIoServer {
             .map_err(|e| McpError::internal_error(format!("无法获取文件信息: {}", e), None))?
             .len();
 
-        fs::remove_file(path).map_err(|e| {
+        retry_io(|| fs::remove_file(path)).map_err(|e| {
             McpError::internal_error(format!("删除文件失败: {}", e), None)
         })?;
 
@@ -1797,12 +1849,12 @@ impl FileIoServer {
 
         // 确保目标目录存在
         if target_is_dir {
-            fs::create_dir_all(target_path)
+            retry_io(|| fs::create_dir_all(target_path))
                 .map_err(|e| McpError::internal_error(format!("创建目标目录失败: {}", e), None))?;
         } else {
             // 单文件且目标不是目录，确保父目录存在
             if let Some(parent) = target_path.parent() {
-                fs::create_dir_all(parent)
+                retry_io(|| fs::create_dir_all(parent))
                     .map_err(|e| McpError::internal_error(format!("创建父目录失败: {}", e), None))?;
             }
         }
@@ -1831,7 +1883,7 @@ impl FileIoServer {
                 .map_err(|e| McpError::internal_error(format!("无法读取源文件信息: {}", e), None))?
                 .len();
 
-            fs::copy(src, &dest)
+            retry_io(|| fs::copy(src, &dest))
                 .map_err(|e| McpError::internal_error(format!("复制失败 {} -> {}: {}", src, dest.display(), e), None))?;
 
             copied += size;
@@ -1885,11 +1937,11 @@ impl FileIoServer {
 
         // 确保目标目录存在
         if target_is_dir {
-            fs::create_dir_all(target_path)
+            retry_io(|| fs::create_dir_all(target_path))
                 .map_err(|e| McpError::internal_error(format!("创建目标目录失败: {}", e), None))?;
         } else {
             if let Some(parent) = target_path.parent() {
-                fs::create_dir_all(parent)
+                retry_io(|| fs::create_dir_all(parent))
                     .map_err(|e| McpError::internal_error(format!("创建父目录失败: {}", e), None))?;
             }
         }
@@ -1918,7 +1970,7 @@ impl FileIoServer {
                 .map_err(|e| McpError::internal_error(format!("无法读取源文件信息: {}", e), None))?
                 .len();
 
-            fs::rename(src, &dest)
+            retry_io(|| fs::rename(src, &dest))
                 .map_err(|e| McpError::internal_error(format!("移动失败 {} -> {}: {}", src, dest.display(), e), None))?;
 
             moved += size;
@@ -1950,7 +2002,7 @@ impl FileIoServer {
         let target = self.resolve_path(&target)?;
 
         // 读取文件字节
-        let bytes = fs::read(&target).map_err(|e| {
+        let bytes = retry_io(|| fs::read(&target)).map_err(|e| {
             match e.kind() {
                 std::io::ErrorKind::NotFound => {
                     McpError::internal_error(format!("文件不存在: {}", target), None)
@@ -2148,7 +2200,7 @@ impl FileIoServer {
         Self::ensure_parent_dir(&target)
             .map_err(|e| McpError::internal_error(e, None))?;
 
-        fs::write(&target, &new_bytes).map_err(|e| {
+        retry_io(|| fs::write(&target, &new_bytes)).map_err(|e| {
             if e.kind() == std::io::ErrorKind::PermissionDenied {
                 McpError::internal_error(format!("没有权限操作文件: {}", target), None)
             } else {
