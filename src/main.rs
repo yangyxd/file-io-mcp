@@ -164,8 +164,12 @@ struct ReadTextFileParams {
     path: String,
     /// 起始字节偏移，默认 0
     offset: Option<u64>,
-    /// 读取字节数，默认 10MB 上限（超出会截断并在返回头标注，可配合 offset 分页）
+    /// 读取字节数，默认 10MB 上限（超出会截断并在返回头标注，可配合 offset 分页）；必须 ≥1。
+    /// 注意：非 strict 时它只是“提示值”——为覆盖完整多字节字符可能多读几字节、offset 可能下取整
     length: Option<usize>,
+    /// true=按字节精确读取：不做“至少读 4 字节”、不对 offset 下取整；
+    /// 边缘切在字符中间时丢弃不完整字节，并在返回头标注
+    strict: Option<bool>,
     /// 编码，默认自动识别
     encoding: Option<String>,
     /// 每行前显示行号，默认 false
@@ -261,9 +265,11 @@ struct FileInfoParams {
 struct RegexReplaceParams {
     /// 文件路径
     path: String,
-    /// 正则表达式
+    /// 匹配模式；默认按正则解析，literal=true 时按纯文本解析
     pattern: String,
-    /// 替换内容，支持 $1/$2 捕获组
+    /// true=pattern 按纯文本处理（自动转义，元字符不再生效），replacement 里的 $ 也按字面量填入
+    literal: Option<bool>,
+    /// 替换内容，支持 $1/$2 捕获组（literal=true 时按字面量填入）
     replacement: String,
     /// 编码，默认自动识别并保持原编码
     encoding: Option<String>,
@@ -402,6 +408,34 @@ struct MoveFilesParams {
     /// 覆盖已存在的目标，默认 false
     overwrite: Option<bool>,
 }
+
+/// 批量片段编辑中的单条编辑：在原文中精确找到 expected_old，替换为 content
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SectionEdit {
+    /// 待替换的原始片段（须与文件内容逐字符一致，可含多行；读到的换行是 \r\n 也可写成 \n）
+    expected_old: String,
+    /// 替换成的新内容；空串 = 删除该片段
+    content: String,
+    /// 当 expected_old 命中多处时选第几处(1-based)，默认要求全文唯一
+    occurrence: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct EditFileSectionsParams {
+    /// 文件路径
+    path: String,
+    /// 待替换片段列表（各自基于**同一次快照**定位，允许一次改多处）
+    edits: Vec<SectionEdit>,
+    /// 编码，默认保持原文件编码（不一致则拒绝）
+    encoding: Option<String>,
+    /// 读到的 sha256；文件已被改动则拒绝写入
+    expected_sha256: Option<String>,
+    /// true(默认)=任一片段未命中/不唯一就整体不写；false=只写命中的那些，并在结果里列出被跳过的
+    all_or_nothing: Option<bool>,
+    /// true=只返回 diff 预览不写入
+    dry_run: Option<bool>,
+}
+
 
 // ==================== MCP 服务器 ====================
 
@@ -1444,6 +1478,74 @@ impl FileIoServer {
         }
     }
 
+    /// 找出 needle 在 hay 中的所有（不重叠）出现位置，返回 (start, end) 字节区间。
+    /// 两侧都是合法 UTF-8 时，匹配起点必然落在字符边界上，可安全用于切片。
+    fn find_all(hay: &str, needle: &str) -> Vec<(usize, usize)> {
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        hay.match_indices(needle)
+            .map(|(i, m)| (i, i + m.len()))
+            .collect()
+    }
+
+    /// 字节偏移对应的行号（1-based，用于把“命中在哪”讲清楚）
+    fn line_of(hay: &str, offset: usize) -> usize {
+        hay[..offset.min(hay.len())].matches('\n').count() + 1
+    }
+
+    /// 自动识别编码的“自洽性”校验：若判定的编码根本无法无损解码现有文件，
+    /// 说明识别不可靠（典型：GBK 文件被误判成 UTF-8），此时继续写会把文件毁成乱码，直接拒绝。
+    /// 显式指定 encoding 的路径无需调用（resolve_write_encoding 已保证与原文件一致）。
+    fn check_encoding_lossless(encoding_name: &str, existing: &[u8]) -> Result<(), McpError> {
+        // 大文件（> 8MB）只校验头部样本：整份解码对大文件纯属浪费 CPU，
+        // 而编码特征在文件开头就已体现。切片须退到字符边界，否则半截字符会被
+        // decode_file 当成非法字节，导致正常文件被误拒。
+        const ENC_CHECK_FULL_LIMIT: usize = 8 * 1024 * 1024;
+        let probe: &[u8] = if existing.len() <= ENC_CHECK_FULL_LIMIT {
+            existing
+        } else {
+            let mut cut = ENC_CHECK_FULL_LIMIT;
+            while cut > 0 && !Self::is_char_boundary(encoding_name, existing, cut) {
+                cut -= 1;
+            }
+            &existing[..cut]
+        };
+        let lossless = matches!(
+            Self::decode_file(probe, encoding_name),
+            Ok(ft) if !ft.has_invalid
+        );
+        if !lossless {
+            return Err(e_param(
+                format!(
+                    "自动识别的编码 [{}] 无法无损解码现有文件，编码判定不可靠，拒绝写入以免把文件写成乱码。\
+                     请先用 read_text_file 确认真实编码，再显式传入 encoding 重新调用",
+                    encoding_name
+                ),
+                None,
+            ));
+        }
+        Ok(())
+    }
+
+
+    /// 统计文本文件行数（与 read_text_lines 同一口径：非空内容按 '\n' 切分，"a\nb\n" 记 3 行；空文件记 0）。
+    /// 编码无法识别或含非法字节时返回 None（调用方显示 "-"），不做猜测。
+    fn count_lines_of(path: &str) -> Option<usize> {
+        let bytes = fs::read(path).ok()?;
+        let enc = Self::detect_encoding(&bytes);
+        let ft = Self::decode_file(&bytes, enc).ok()?;
+        if ft.has_invalid {
+            return None;
+        }
+        if ft.content.is_empty() {
+            Some(0)
+        } else {
+            Some(ft.content.matches('\n').count() + 1)
+        }
+    }
+
+
     /// 写前版本校验（乐观并发）：expected_sha256 与当前内容不符说明文件已被其他 AI/程序改过，
     /// 直接拒绝本次写入，避免"基于旧内容整文件写回"把别人的修改抹掉。支持前缀匹配。
     fn check_expected_sha(
@@ -2328,7 +2430,7 @@ impl FileIoServer {
     /// 读取文本文件
     #[tool(
         name = "read_text_file",
-        description = "按字节读文本片段(offset/length，默认最多 10MB)。返回头: 路径|编码(BOM标注)|大小|sha256|区间；要按行编辑请用 read_text_lines",
+        description = "按字节读文本片段(offset/length，默认最多 10MB，length 须≥1)。返回头: 路径|编码(BOM标注)|大小|sha256|区间。默认会为对齐字符边界微调区间(返回头会标注)，需要精确字节区间就传 strict=true；要按行编辑请用 read_text_lines",
         annotations(title = "读取文本文件", read_only_hint = true)
     )]
     fn read_text_file(
@@ -2350,6 +2452,17 @@ impl FileIoServer {
 
         let mut start = params.offset.unwrap_or(0);
 
+        // length=0 没有“合理语义”（既不是读空也不是读全部），明确拒绝而不是各人各解释
+        if params.length == Some(0) {
+            return Err(e_param(
+                "length 必须 ≥1。只想要大小/指纹请用 file_info；想读全部请省略 length",
+                None,
+            ));
+        }
+        // strict=true：length/offset 精确生效（不做“至少读 4 字节”、不对 offset 下取整），
+        // 需要精确分页/按字节对齐时用它；否则 length 只是提示值，实际区间可能被调整（返回头会标注）。
+        let strict = params.strict.unwrap_or(false);
+
         // 允许 offset=0 读空文件（返回空内容）；仅当偏移越过文件末尾才报错
         if start > 0 && start >= file_size {
             return Err(e_param(
@@ -2367,14 +2480,14 @@ impl FileIoServer {
             .unwrap_or(MAX_TEXT_READ_SIZE)
             .min(MAX_READ_HARD_LIMIT);
         let room = (file_size - start) as usize;
-        // 至少读 4 字节：保证窗口能覆盖一个完整多字节字符，避免 length 过小时分页无法前进；
-        // 但 length=0 是“明确不读内容”，需尊重（否则会被放大成 4 字节并误标截断）
-        let mut read_len = if max_len == 0 {
-            0
+        // 非 strict 下 length 是提示值：至少读 4 字节，保证窗口能覆盖一个完整多字节字符，
+        // 否则 length 过小时分页会卡住不前进；strict 下严格按 length 读。
+        let mut read_len = if strict {
+            max_len.min(room)
         } else {
             max_len.min(room).max(room.min(4))
         };
-        // read_len=0（length=0 或已到文件末尾）不算“被截断”，否则会误报截断告警
+        // 已到文件末尾（room=0）不算“被截断”，否则会误报截断告警
         let mut truncated = read_len < room && read_len > 0;
         let mut buffer = vec![0u8; read_len];
         file.read_exact(&mut buffer)
@@ -2398,14 +2511,19 @@ impl FileIoServer {
         };
         // offset 可能落在多字节字符中间（按 read_len 分页时几乎必然如此）。向下取整到字符边界，
         // 否则从“半个字符”开始解码会得到非法字节错误，导致分页读 UTF-8 文件从第二页起必然失败。
-        let aligned = Self::floor_char_boundary(encoding_name, &params.path, start, buffer.first().copied());
+        // strict 模式不做这个回退（调用方要的是精确区间），改由后面的“丢弃边缘不完整字节”兜底。
+        let aligned = if strict {
+            start
+        } else {
+            Self::floor_char_boundary(encoding_name, &params.path, start, buffer.first().copied())
+        };
         let align_note = if aligned != start {
             start = aligned;
             file.seek(SeekFrom::Start(start))
                 .map_err(|e| e_internal(format!("Seek 失败: {}", e), None))?;
             let remaining = (file_size - start) as usize;
-            read_len = if max_len == 0 {
-                0
+            read_len = if strict {
+                max_len.min(remaining)
             } else {
                 max_len.min(remaining).max(remaining.min(4))
             };
@@ -2428,7 +2546,15 @@ impl FileIoServer {
 
         // 从 offset=0 开始读取时，头部可能带 BOM，需剥离并返回给 AI 可见的编码名
         let bom = if start == 0 { Self::detect_bom(&buffer) } else { &[][..] };
-        let body = &buffer[bom.len()..];
+        // strict 模式的窗口起点可能正好切在字符中间：丢弃起始处不完整的字节
+        // （UTF-8 的续字节形如 10xxxxxx，最多 3 个；其他编码无法廉价判定，会在解码失败时报错）
+        let mut lead_skip = 0usize;
+        if strict && encoding_name.eq_ignore_ascii_case("utf-8") {
+            while lead_skip < buffer.len().min(3) && (buffer[lead_skip] & 0xC0) == 0x80 {
+                lead_skip += 1;
+            }
+        }
+        let body = &buffer[bom.len() + lead_skip..];
         let encoding_label = if bom.is_empty() {
             encoding_name.to_string()
         } else {
@@ -2443,11 +2569,13 @@ impl FileIoServer {
         // 只解码本次读取的窗口。窗口按字节截断，尾部可能是“半个多字节字符”，
         // 这属于正常截断而非文件损坏：截断时容忍尾部不完整序列，避免整次读取直接报错。
         // consumed 记录窗口内“真正构成完整字符”的字节数，用于把返回区间右端也对齐到字符边界。
+        // strict 模式同样要容忍边缘（它本来就可能切在字符中间），另用 edge_note 告知。
+        let tolerate_edges = truncated || strict;
         let mut consumed = body.len();
         let content = if encoding_name.eq_ignore_ascii_case("utf-8") {
             match std::str::from_utf8(body) {
                 Ok(s) => s.to_string(),
-                Err(e) if truncated && e.error_len().is_none() => {
+                Err(e) if tolerate_edges && e.error_len().is_none() => {
                     consumed = e.valid_up_to();
                     std::str::from_utf8(&body[..consumed])
                         .unwrap_or("")
@@ -2469,13 +2597,13 @@ impl FileIoServer {
         {
             // encoding_rs 不支持 UTF-32：按 4 字节对齐裁掉尾部不完整码元后走内置解码
             let mut end = body.len();
-            if truncated {
+            if tolerate_edges {
                 end -= end % 4;
             }
             consumed = end;
             Self::decode_utf32(&body[..end], encoding_name.eq_ignore_ascii_case("utf-32le"))
                 .map_err(|e| e_internal(e, None))?
-        } else if truncated {
+        } else if tolerate_edges {
             // 双字节/多字节编码同理：尾部可能截断在字符中间，逐字节回退（最多 4 字节）再试
             let mut end = body.len();
             let mut decoded: Option<String> = None;
@@ -2499,7 +2627,8 @@ impl FileIoServer {
                 None => {
                     return Err(e_internal(
                         format!(
-                            "按 {} 解码失败（偏移量 {} 起的窗口内包含无效字节）",
+                            "按 {} 解码失败（偏移量 {} 起的窗口内包含无效字节）。\
+                             若是为按字节精确分页（strict=true）而切在了字符中间，去掉 strict 即会自动对齐到字符边界",
                             encoding_name, start
                         ),
                         None,
@@ -2512,6 +2641,18 @@ impl FileIoServer {
         };
         // 返回区间右端：start + BOM + 实际消费的完整字符字节数（保证落在字符边界上）
         let end_off = start + bom.len() as u64 + consumed as u64;
+
+        // strict 模式丢弃了边缘不完整字节时明确告知（非 strict 的尾部容忍已体现在区间右端/已截断告警）
+        let edge_note = if strict && (lead_skip > 0 || consumed < body.len()) {
+            format!(
+                " ⚠️strict：为落在字符边界已丢弃边缘不完整字节 {}B（实际返回 [{},{})；要去掉该行为请省略 strict）",
+                lead_skip + (body.len() - consumed),
+                start,
+                end_off
+            )
+        } else {
+            String::new()
+        };
 
         let display_content = if show_ln {
             // 起始行号：前缀的换行数 + 1（1-based）
@@ -2548,10 +2689,11 @@ impl FileIoServer {
         };
 
         Ok(format!(
-            "{}{}{}{} | {} | {}B | sha256:{} | [{},{}){}```\n{}\n```",
+            "{}{}{}{}{} | {} | {}B | sha256:{} | [{},{}){}```\n{}\n```",
             params.path,
             trunc_warn,
             align_note,
+            edge_note,
             enc_warn,
             encoding_label,
             file_size,
@@ -2612,40 +2754,13 @@ impl FileIoServer {
             existing_bytes.as_deref(),
         )?;
 
-        // 编码自洽性校验（仅走自动识别的路径）：若判定出的编码根本无法无损解码现有文件，
-        // 说明编码识别不可靠（典型：GBK 文件被误判成 UTF-8），此时无论 overwrite/append/insert
-        // 继续写都可能把文件毁成另一种编码或混合编码乱码，直接拒绝并要求显式指定 encoding。
+        // 编码自洽性校验（仅走自动识别的路径）：判定出的编码若无法无损解码现有文件，
+        // 说明识别不可靠（典型：GBK 文件被误判成 UTF-8），继续写可能把文件毁成乱码，直接拒绝。
         // 显式指定 encoding 时由 resolve_write_encoding 保证与原文件一致，无需重复校验。
-        let enc_explicit = !Self::encoding_is_auto(params.encoding.as_deref());
-        if !enc_explicit {
+        // （与 edit_file_sections 共用同一实现，避免两处逻辑漂移）
+        if Self::encoding_is_auto(params.encoding.as_deref()) {
             if let Some(b) = existing_bytes.as_deref() {
-                // 大文件（> 8MB）只校验头部样本：整份解码对 append/insert 大文件纯属浪费 CPU，
-                // 而编码特征在文件开头就已体现。切片须退到字符边界，否则半截字符会被
-                // decode_file 当成非法字节，导致正常文件被误拒。
-                const ENC_CHECK_FULL_LIMIT: usize = 8 * 1024 * 1024;
-                let probe: &[u8] = if b.len() <= ENC_CHECK_FULL_LIMIT {
-                    b
-                } else {
-                    let mut cut = ENC_CHECK_FULL_LIMIT;
-                    while cut > 0 && !Self::is_char_boundary(encoding_name, b, cut) {
-                        cut -= 1;
-                    }
-                    &b[..cut]
-                };
-                let lossless = matches!(
-                    Self::decode_file(probe, encoding_name),
-                    Ok(ft) if !ft.has_invalid
-                );
-                if !lossless {
-                    return Err(e_param(
-                        format!(
-                            "自动识别的编码 [{}] 无法无损解码现有文件，编码判定不可靠，拒绝写入以免把文件写成乱码。\
-                             请先用 read_text_file 确认真实编码，再显式传入 encoding 重新调用",
-                            encoding_name
-                        ),
-                        None,
-                    ));
-                }
+                Self::check_encoding_lossless(encoding_name, b)?;
             }
         }
 
@@ -3170,6 +3285,13 @@ dry_run=true 只返回 HEX diff 预览不落盘",
 
         // 写前比对"待改范围"的实际字节：二进制没有行号/锚点，offset 算错只能靠这个兜住
         if let Some(exp_hex) = params.expected_hex.as_deref() {
+            // 空 expected_hex = “不校验”，却会让人以为已经校验过（0 字节永远匹配）→ 明确拒绝
+            if exp_hex.trim().is_empty() {
+                return Err(e_param(
+                    "expected_hex 不能为空：空串等于没有校验。不需要校验就整个省略该参数",
+                    None,
+                ));
+            }
             let expected = Self::parse_hex_flexible(exp_hex)
                 .map_err(|e| e_param(format!("expected_hex 解析失败: {}", e), None))?;
             let (actual, scope) = Self::binary_guard_range(
@@ -3652,10 +3774,238 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
         Ok(out)
     }
 
+    /// 批量原子片段编辑：一次调用完成多处“精确文本 → 新文本”替换
+    #[tool(
+        name = "edit_file_sections",
+        description = "批量精确替换(一次调用改多处，默认全成或全不成)：edits=[{expected_old, content, occurrence?}]。\
+expected_old 须与原文逐字符一致(含缩进/空行，读到的换行是 CRLF 也可写成 LF)且默认要求全文唯一，命中多处时用 occurrence 指定第几处；\
+content 传空串=删除该片段；所有片段基于同一次快照定位，重叠会报错；支持 expected_sha256 防并发覆盖、dry_run 预览 diff。\
+（多处互不相邻的修改优先用它：比 edit_file_lines 少算行号、比 regex_replace 不需转义）",
+        annotations(title = "批量片段编辑", destructive_hint = true)
+    )]
+    fn edit_file_sections(
+        &self,
+        Parameters(params): Parameters<EditFileSectionsParams>,
+    ) -> Result<String, McpError> {
+        let params = {
+            let mut p = params;
+            p.path = self.resolve_path(&p.path)?;
+            p
+        };
+        if params.edits.is_empty() {
+            return Err(e_param(
+                "edits 不能为空：请至少提供一条 {expected_old, content}",
+                None,
+            ));
+        }
+
+        // 与 regex_replace 同一保护：整份读入内存后重建，过大文件应先分割
+        let file_size = fs::metadata(&params.path)
+            .map_err(|e| e_internal(format!("无法获取文件信息: {}", e), None))?
+            .len();
+        if file_size > MAX_REGEX_FILE_SIZE {
+            return Err(e_param(
+                format!(
+                    "文件过大 ({}B)，最大支持 {}B。如需处理大文件，请先手动分割后操作",
+                    file_size, MAX_REGEX_FILE_SIZE
+                ),
+                None,
+            ));
+        }
+
+        let all_or_nothing = params.all_or_nothing.unwrap_or(true);
+        self.with_path_lock(&params.path, || {
+            let bytes = fs::read(&params.path)
+                .map_err(|e| e_internal(format!("读取文件失败: {}", e), None))?;
+            Self::check_expected_sha(&params.path, &bytes, params.expected_sha256.as_deref())?;
+
+            // 与 write_text_file/regex_replace 同一套编码决策：默认保持原编码，不一致时拒绝
+            let encoding_name = Self::resolve_write_encoding(
+                &params.path,
+                params.encoding.as_deref(),
+                Some(&bytes),
+            )?;
+            if Self::encoding_is_auto(params.encoding.as_deref()) {
+                Self::check_encoding_lossless(encoding_name, &bytes)?;
+            }
+
+            let ft = Self::decode_file(&bytes, encoding_name).map_err(|e| e_internal(e, None))?;
+            if ft.has_invalid {
+                return Err(e_internal(
+                    format!(
+                        "文件 {} 按 {} 解码时存在非法字节（已用 U+FFFD 替换），拒绝写回以免原字节永久丢失。\
+                         请确认真实编码后用正确的 encoding 重新调用",
+                        params.path, ft.encoding
+                    ),
+                    None,
+                ));
+            }
+            let encoding_label = if ft.bom.is_empty() {
+                ft.encoding.clone()
+            } else {
+                format!("{}(BOM)", ft.encoding)
+            };
+
+            // 统一到 LF 再匹配：AI 读到的文本可能带/不带 \r，两侧归一后更稳（写回时还原主换行风格）
+            let hay = ft.content.replace("\r\n", "\n");
+
+            // ---- 第一步：所有片段都在**原文快照**上定位，而不是“改一个再找下一个” ----
+            let mut planned: Vec<(usize, usize, String, usize)> = Vec::new();
+            let mut problems: Vec<String> = Vec::new();
+            for (idx, op) in params.edits.iter().enumerate() {
+                let needle = op.expected_old.replace("\r\n", "\n");
+                if needle.is_empty() {
+                    problems.push(format!(
+                        "edits[{}]: expected_old 不能为空（要插入内容请把插入点周围的原文一并作为 expected_old，并在 content 里原样带上它）",
+                        idx
+                    ));
+                    continue;
+                }
+                let hits = Self::find_all(&hay, &needle);
+                let chosen = match hits.len() {
+                    0 => None,
+                    1 if op.occurrence.is_none() => Some(hits[0]),
+                    n => match op.occurrence {
+                        Some(k) if k >= 1 && (k as usize) <= n => Some(hits[k as usize - 1]),
+                        Some(k) => {
+                            problems.push(format!(
+                                "edits[{}]: occurrence={} 超出范围（expected_old 只命中 {} 处）",
+                                idx, k, n
+                            ));
+                            continue;
+                        }
+                        None => {
+                            let spots: Vec<String> = hits
+                                .iter()
+                                .take(10)
+                                .map(|(s, _)| format!("第 {} 行", Self::line_of(&hay, *s)))
+                                .collect();
+                            let more = if hits.len() > 10 { " 等" } else { "" };
+                            problems.push(format!(
+                                "edits[{}]: expected_old 在文件中不唯一（命中 {} 处：{}{}），无法确定要改哪一处。\
+                                 请把 expected_old 写得更长以唯一定位，或用 occurrence 指定第几处",
+                                idx, n, spots.join("、"), more
+                            ));
+                            continue;
+                        }
+                    },
+                };
+                match chosen {
+                    Some((s, e)) => planned.push((s, e, op.content.replace("\r\n", "\n"), idx)),
+                    None => problems.push(format!(
+                        "edits[{}]: expected_old 与文件内容不匹配（未命中）。\
+                         它必须与原文逐字符一致（含缩进、空行、标点）；建议先用 read_text_lines 读出准确文本再复制过来",
+                        idx
+                    )),
+                }
+            }
+
+            if !problems.is_empty() && (all_or_nothing || planned.is_empty()) {
+                // 显式指定错误码：混合原因时按“命中不唯一”优先，便于调用方分流
+                let code = if problems.iter().all(|p| p.contains("不唯一")) {
+                    "E_NOT_UNIQUE"
+                } else {
+                    "E_GUARD_MISMATCH"
+                };
+                return Err(e_param(
+                    format!(
+                        "{} 批量编辑未通过校验，本次一处未改（{} 条问题，{} 条可应用）。\n=== 问题清单:\n{}",
+                        code,
+                        problems.len(),
+                        planned.len(),
+                        problems.join("\n")
+                    ),
+                    None,
+                ));
+            }
+
+            // ---- 第二步：重叠检测（同一段被两条编辑改会得到意料之外的结果） ----
+            planned.sort_by_key(|(s, _, _, _)| *s);
+            for w in planned.windows(2) {
+                if w[1].0 < w[0].1 {
+                    return Err(e_param(
+                        format!(
+                            "edits[{}] 与 edits[{}] 的命中范围重叠（参数错误），无法同时应用。请合并为一条，或让两条片段的命中区间互不相交",
+                            w[0].3, w[1].3
+                        ),
+                        None,
+                    ));
+                }
+            }
+
+            // ---- 第三步：按快照一次性拼接 ----
+            let mut new_content = String::with_capacity(hay.len());
+            let mut cursor = 0usize;
+            for (s, e, rep, _) in &planned {
+                new_content.push_str(&hay[cursor..*s]);
+                new_content.push_str(rep);
+                cursor = *e;
+            }
+            new_content.push_str(&hay[cursor..]);
+            let new_content = if ft.line_ending == "\n" {
+                new_content
+            } else {
+                new_content.replace('\n', ft.line_ending)
+            };
+
+            let new_bytes = {
+                let mut out: Vec<u8> = ft.bom.to_vec();
+                out.extend_from_slice(
+                    &Self::encode_content(&ft.encoding, &new_content)
+                        .map_err(|e| e_internal(e, None))?,
+                );
+                out
+            };
+
+            if params.dry_run.unwrap_or(false) {
+                return Ok(format!(
+                    "DRY-RUN | {} | {} | {} 处替换 | {}B→{}B | 未写入文件\n{}预计 sha256:{}\n确认无误后去掉 dry_run 重新调用即可写入",
+                    params.path,
+                    encoding_label,
+                    planned.len(),
+                    bytes.len(),
+                    new_bytes.len(),
+                    Self::unified_diff(&ft.content, &new_content, 200),
+                    Self::fingerprint_short_of_bytes(&new_bytes)
+                ));
+            }
+
+            let bak = Self::backup_before_write(&params.path, "edit_file_sections", Some(&bytes));
+            Self::atomic_write_ex(&params.path, &new_bytes, bak.as_ref().map(|b| b.bak.as_path()))
+                .map_err(|e| e_internal(format!("E_WRITE 写入失败: {}", e), None))?;
+            let mut tail = String::new();
+            if let Some(h) = &bak {
+                Self::finish_backup(h, &new_bytes);
+                tail = " | undoable".to_string();
+            }
+            let skip_note = if problems.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n⚠️ 已跳过 {} 条（all_or_nothing=false）:\n{}",
+                    problems.len(),
+                    problems.join("\n")
+                )
+            };
+            Ok(format!(
+                "OK {} | {} | {} 处替换 | {}B→{}B | sha256:{}{}{}",
+                params.path,
+                encoding_label,
+                planned.len(),
+                bytes.len(),
+                new_bytes.len(),
+                Self::fingerprint_short_of_bytes(&new_bytes),
+                tail,
+                skip_note
+            ))
+        })
+    }
+
+
     /// 正则替换文件文本
     #[tool(
         name = "regex_replace",
-        description = "正则替换(支持 $1/$2 捕获组)。max_matches 必填=预期最多替换几处，实际超出即拒绝(防正则过宽误伤)；global 默认 true；dry_run=true 只看 diff",
+        description = "正则替换(支持 $1/$2 捕获组)；只想做纯文本替换就传 literal=true（免转义、$ 按字面量）。max_matches 必填=预期最多替换几处，实际超出即拒绝(防正则过宽误伤)；global 默认 true；dry_run=true 只看 diff",
         annotations(title = "正则替换", destructive_hint = true)
     )]
     fn regex_replace(
@@ -3718,9 +4068,28 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
             format!("{}(BOM)", encoding)
         };
 
-        let re = Regex::new(&params.pattern).map_err(|e| {
+        // literal=true：pattern 按纯文本处理（转义后再编译），replacement 里的 $ 也转成字面量。
+        // 这样“把 A 精确换成 B”不需要任何正则知识，也不会被元字符/捕获组引用坑到。
+        let literal = params.literal.unwrap_or(false);
+        if literal && params.pattern.is_empty() {
+            return Err(e_param(
+                "literal 模式下 pattern 不能为空（空串会匹配任意位置）",
+                None,
+            ));
+        }
+        let pattern_src = if literal {
+            regex::escape(&params.pattern)
+        } else {
+            params.pattern.clone()
+        };
+        let re = Regex::new(&pattern_src).map_err(|e| {
             e_param(format!("正则表达式错误: {}", e), None)
         })?;
+        let repl: String = if literal {
+            params.replacement.replace('$', "$$")
+        } else {
+            params.replacement.clone()
+        };
 
         let global = params.global.unwrap_or(true);
         // max_matches 必须显式设置：强制 AI 先想清楚"预期改几处"，避免过宽正则/匹配空串造成大范围误替换
@@ -3761,9 +4130,9 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
         }
 
         let new_content = if global {
-            re.replace_all(&content, params.replacement.as_str()).into_owned()
+            re.replace_all(&content, repl.as_str()).into_owned()
         } else {
-            re.replacen(&content, 1, params.replacement.as_str()).into_owned()
+            re.replacen(&content, 1, repl.as_str()).into_owned()
         };
 
         // dry-run：只预览不写入
@@ -3774,10 +4143,10 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
                     .captures_at(&content, mat.start())
                     .map(|caps| {
                         let mut out = String::new();
-                        caps.expand(params.replacement.as_str(), &mut out);
+                        caps.expand(repl.as_str(), &mut out);
                         out
                     })
-                    .unwrap_or_else(|| params.replacement.clone());
+                    .unwrap_or_else(|| repl.clone());
                 preview.push_str(&format!(
                     "  #{}: \"{}\" => \"{}\"\n",
                     i + 1,
@@ -4057,9 +4426,19 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
             "-".to_string()
         };
 
+        // 文本文件额外回报行数：改完想确认“行数对不对 / 有没有被换行风格弄坏”时，
+        // 用 file_info 就能核对，不必把整份内容再读进上下文（非文本/无法解码时显示 -）
+        let lines = if metadata.is_file() {
+            Self::count_lines_of(&params.path)
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        } else {
+            "-".to_string()
+        };
+
         Ok(format!(
-            "{} | {} | {}B | {} | sha256:{}",
-            params.path, file_type, metadata.len(), modified_str, hash
+            "{} | {} | {}B | {} | sha256:{} | lines:{}",
+            params.path, file_type, metadata.len(), modified_str, hash, lines
         ))
     }
 
@@ -4753,14 +5132,31 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
                         width = width
                     ));
                 }
+                // 行数不符是“行号算错”最常见的成因，直接点明，省掉一轮试错往返
+                let count_hint = if expected_lines.len() == actual_lines.len() {
+                    String::new()
+                } else {
+                    format!(
+                        "⚠️ 行数不符：声明的区间 {}~{} 只覆盖 {} 行，而 expected_old 是 {} 行（{} {} 行）。\
+                         请核对 start_line/end_line，或让 expected_old 的行数与区间完全一致。\n",
+                        range.start + 1,
+                        range.end,
+                        actual_lines.len(),
+                        expected_lines.len(),
+                        if expected_lines.len() > actual_lines.len() { "多" } else { "少" },
+                        (expected_lines.len() as isize - actual_lines.len() as isize).abs()
+                    )
+                };
                 return Err(e_param(
                     format!(
                         "expected_old 不匹配！行号可能算错了。期望 {}~{} 行的实际内容与提供的 expected_old 不一致。\n\
+                         {}\
                          文件总行数: {}\n\
                          === 期望内容({}行):\n{}\n\
                          === 实际内容(上下文 >>> 标记目标行):\n{}",
                         range.start + 1,
                         range.end,
+                        count_hint,
                         total_lines,
                         expected_lines.len(),
                         expected,

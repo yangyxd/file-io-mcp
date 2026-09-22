@@ -14,12 +14,13 @@
 | `read_text_lines` | 按行读文本（带行号），编辑前取内容与指纹 |
 | `write_text_file` | 整段写文本，支持覆盖/追加/插入，可 dry-run 预览 diff |
 | `edit_file_lines` | 按行编辑：删/插/替/追，支持锚点定位与 `expected_old` 校验 |
-| `regex_replace` | 正则替换，`max_matches` 必填防误伤，可 dry-run |
+| `edit_file_sections` | **批量精确替换**：一次调用改多处，默认全成或全不成，全部基于同一次快照定位 |
+| `regex_replace` | 正则替换（`literal=true` 即免转义的纯文本替换），`max_matches` 必填防误伤，可 dry-run |
 | `read_binary_file` | 读二进制 HEX dump |
 | `write_binary_file` | 按十六进制写二进制（覆盖/追加/插入/替换），支持 `expected_hex` 写前校验与 HEX diff dry-run |
 | `text_search` | 文件/目录内容搜索（`regex`/`literal` 双模式，结果按文件分组，带 sha256，可直接接 `edit_file_lines`） |
 | `list_files` | 列目录 / 按文件名搜索（支持 glob） |
-| `file_info` | 文件/目录元信息（大小、mtime、指纹） |
+| `file_info` | 文件/目录元信息（大小、mtime、指纹、文本行数） |
 | `manage_backups` | 备份管理：列出 / 回滚 / 清理 |
 | `delete_file` | 删除文件（需 `confirm=true`，自动备份，可回滚） |
 | `copy_files` | 复制文件 |
@@ -186,11 +187,12 @@ cargo run -- --http --addr 127.0.0.1:8080            # 自定义地址
 |------|------|------|------|
 | `path` | string | 是 | 文件路径 |
 | `offset` | u64 | 否 | 起始字节偏移，默认 0 |
-| `length` | usize | 否 | 读取字节数，默认上限 10MB（超出会截断并在返回头标注 ⚠️） |
+| `length` | usize | 否 | 读取字节数，默认上限 10MB（超出会截断并在返回头标注 ⚠️）；必须 ≥1。它默认只是**提示值**：为覆盖完整多字节字符可能多读几字节、`offset` 可能下取整到字符边界（返回头会标注实际区间） |
+| `strict` | bool | 否 | true=按字节精确读取：不做“至少读 4 字节”、不对 `offset` 下取整；边缘切在字符中间时丢弃不完整字节并在返回头标注 |
 | `encoding` | string | 否 | 编码，默认自动识别 |
 | `show_line_numbers` | bool | 否 | 每行前显示行号，默认 false |
 
-**返回头**：`路径 | 编码(BOM标注) | 大小 | sha256 | [起,止)`；编码识别不确定时会追加 ⚠️ 提示。
+**返回头**：`路径 | 编码(BOM标注) | 大小 | sha256 | [起,止)`；编码识别不确定、区间被调整、边缘被丢弃时会追加 ⚠️ 提示；自动识别编码始终基于**完整文件**，不受分页窗口影响。需要“精确字节区间”时用 `strict=true`。
 
 ### read_text_lines
 
@@ -291,6 +293,34 @@ src/main.rs | utf-8 | 4096B | 120 lines total | sha256:8f3a1c02d94b7e15 | [10-15
 }
 ```
 
+### edit_file_sections
+
+**一次调用改多处**的精确文本替换（补上 `edit_file_lines` 与 `regex_replace` 之间的空档：前者要算行号，后者要写正则）。
+默认**全成或全不成**：任一片段未命中或不唯一就整体不写，不会只改一半。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `path` | string | 是 | 文件路径 |
+| `edits` | array | 是 | 片段列表，每项 `{expected_old, content, occurrence?}` |
+| `edits[].expected_old` | string | 是 | 待替换的原始片段，须与文件内容**逐字符一致**（缩进/空行/标点都要对）；默认要求全文唯一命中 |
+| `edits[].content` | string | 是 | 替换成的新内容；空串 = 删除该片段 |
+| `edits[].occurrence` | usize | 否 | `expected_old` 命中多处时选第几处（1-based） |
+| `all_or_nothing` | bool | 否 | 默认 true；false = 只写命中的那些，其余在结果里列出 |
+| `encoding` | string | 否 | 默认保持原文件编码（不一致则拒绝） |
+| `expected_sha256` | string | 否 | 上次读到的指纹，防并发覆盖 |
+| `dry_run` | bool | 否 | true = 只返回 diff 预览与预计指纹 |
+
+- 所有片段都在**同一次快照**上定位，所以可以放心地“按原文”写多处改动；两条片段命中范围重叠会直接报错。
+- `expected_old` 里的换行写 `\n` 或 `\r\n` 都可以（两侧归一后匹配），写回时按文件主换行风格还原；BOM/编码/备份/`expected_sha256` 与其他写工具一致。
+- 失败时：未命中给 `E_GUARD_MISMATCH`，命中多处给 `E_NOT_UNIQUE`（会列出各处行号），并明确告知“本次一处未改”。
+
+```json
+{ "path": "src/main.rs", "edits": [
+  { "expected_old": "let a = 1;", "content": "let a = 2;" },
+  { "expected_old": "// TODO: 清理", "content": "" } ] }
+```
+
+
 ### regex_replace
 
 正则替换，支持 `$1`/`$2` 捕获组。
@@ -298,8 +328,9 @@ src/main.rs | utf-8 | 4096B | 120 lines total | sha256:8f3a1c02d94b7e15 | [10-15
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `path` | string | 是 | 文件路径 |
-| `pattern` | string | 是 | 正则表达式 |
-| `replacement` | string | 是 | 替换内容，支持 `$1`、`$2` |
+| `pattern` | string | 是 | 正则表达式；`literal=true` 时按纯文本处理 |
+| `literal` | bool | 否 | true=纯文本替换：`pattern` 自动转义（`.*()` 等不再是元字符），`replacement` 里的 `$` 也按字面量填入。适合“把 A 精确换成 B”而懒得转义的场景 |
+| `replacement` | string | 是 | 替换内容，支持 `$1`、`$2`（`literal=true` 时按字面量） |
 | `max_matches` | usize | **是**（运行时） | 预期最多替换几处；实际匹配数超过该值即拒绝（防止正则过宽或匹配空串造成大范围误替换） |
 | `global` | bool | 否 | 全局替换，默认 true；false 时只替换首个 |
 | `dry_run` | bool | 否 | true=返回 diff 预览不写入 |
@@ -334,7 +365,7 @@ src/main.rs | utf-8 | 4096B | 120 lines total | sha256:8f3a1c02d94b7e15 | [10-15
 | `mode` | string | 否 | `overwrite`(默认) / `append` / `insert` / `replace` |
 | `offset` | u64 | 否 | insert 为插入位置，replace 为替换起始位置 |
 | `replace_length` | usize | 否 | replace 模式下被替换的字节数 |
-| `expected_hex` | string | 否 | **写前校验待改范围的原始字节**（HEX，可带 `0x` 与空格/冒号分隔，便于从 HEX dump 直接粘贴）。按 mode 取范围：`overwrite`=全文 / `append`=文件末尾 / `insert`=`offset` 起 / `replace`=`[offset, offset+replace_length)`；不符返回 `E_GUARD_MISMATCH` 并回显该范围的实际字节 |
+| `expected_hex` | string | 否 | **写前校验待改范围的原始字节**（HEX，可带 `0x` 与空格/冒号分隔，便于从 HEX dump 直接粘贴；不能为空串——空串等于没校验，会被拒绝）。按 mode 取范围：`overwrite`=全文 / `append`=文件末尾 / `insert`=`offset` 起 / `replace`=`[offset, offset+replace_length)`；不符返回 `E_GUARD_MISMATCH` 并回显该范围的实际字节 |
 | `expected_sha256` | string | 否 | 上次读到的指纹（整文件级，防外部改动） |
 | `dry_run` | bool | 否 | true=只返回 HEX diff 预览与预计指纹，不写文件 |
 | `confirm` | bool | 否 | `hex_data` 为空且 `mode=overwrite`（会清空文件）时必须传 `true` 才执行 |
