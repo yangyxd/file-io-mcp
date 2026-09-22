@@ -98,9 +98,10 @@ print("  CRLF 保持:", b"aaa\r\nBBB\r\nccc\r\n" == raw)
 # ---------- 5. regex_replace dry_run + max_matches ----------
 f6 = P("re.txt")
 call("write_text_file", {"path": f6, "content": "foo foo foo\nbar\n"})
-show("5.1 dry_run 预览不写入", call("regex_replace", {"path": f6, "pattern": "foo", "replacement": "FOO", "dry_run": True}))
+show("5.1 dry_run 预览不写入", call("regex_replace", {"path": f6, "pattern": "foo", "replacement": "FOO", "dry_run": True, "max_matches": 3}))
 show("5.2 dry_run 后文件未变", call("read_text_file", {"path": f6}))
-show("5.3 实际写入", call("regex_replace", {"path": f6, "pattern": "foo", "replacement": "FOO"}))
+show("5.3 实际写入", call("regex_replace", {"path": f6, "pattern": "foo", "replacement": "FOO", "max_matches": 3}))
+show("5.3b 未设置 max_matches 拒绝", call("regex_replace", {"path": f6, "pattern": "bar", "replacement": "BAR"}))
 show("5.4 max_matches 超限拒绝", call("regex_replace", {"path": f6, "pattern": "O", "replacement": "0", "max_matches": 2}))
 
 # ---------- 6. 编码一致性 ----------
