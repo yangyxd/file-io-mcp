@@ -122,7 +122,9 @@ print("B6 edit then undo:", open(f2, "rb").read(), ok(open(f2, 'rb').read() == b
 f3 = P("c.pas")
 call("write_text_file", {"path": f3, "content": "important\n"})
 r = call("delete_file", {"path": f3})
-print("B7 delete marks undoable:", ok("undoable" in r), "| exists:", ok(not os.path.exists(f3)))
+print("B7a delete without confirm is refused:", ok(os.path.exists(f3) and "confirm" in r))
+r = call("delete_file", {"path": f3, "confirm": True})
+print("B7b delete marks undoable:", ok("undoable" in r), "| exists:", ok(not os.path.exists(f3)))
 r = call("manage_backups", {"path": f3, "action": "undo"})
 print("   undo restores deleted file:", ok(os.path.exists(f3) and open(f3, "rb").read() == b"important\n"))
 

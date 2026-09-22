@@ -215,7 +215,7 @@ src/main.rs | utf-8 | 4096B | 120 lines total | sha256:8f3a1c02d94b7e15 | [10-15
 | `mode` | string | 否 | `overwrite`(默认) / `append` / `insert` |
 | `offset` | u64 | 否 | insert 的插入字节偏移（必须落在字符边界，否则拒绝，防止把汉字劈开） |
 | `encoding` | string | 否 | 默认保持原文件编码（新建文件默认 UTF-8；`utf-16le/be` 新建会自动带 BOM） |
-| `expected_old` | string | 否 | 写前校验：overwrite=全文 / append=末尾 / insert=offset 附近，不符则拒绝并回显实际内容 |
+| `expected_old` | string | 否 | 写前校验：overwrite=全文 / append=末尾 / insert=offset 附近，不符则拒绝；回显实际内容时超长内容只给头尾摘要+长度+指纹 |
 | `expected_sha256` | string | 否 | 上次读到的指纹，文件被改动则拒绝写入 |
 | `dry_run` | bool | 否 | true=只返回 diff 与预计指纹，不写文件 |
 
