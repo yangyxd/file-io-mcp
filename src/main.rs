@@ -52,7 +52,9 @@ fn infer_error_code(msg: &str, param_side: bool) -> ErrorCode {
         ),
         (&["不存在", "未找到", "无法解析路径"], "E_NOT_FOUND", true),
         (&["匹配数量"], "E_TOO_MANY_MATCHES", true),
-        (&["过大", "超出文件大小", "超出允许的根目录"], "E_TOO_LARGE", true),
+        // 沙箱越界属于权限问题，单独归类（不要混进 E_TOO_LARGE）
+        (&["超出允许的根目录"], "E_NO_PERMISSION", true),
+        (&["过大", "超出文件大小"], "E_TOO_LARGE", true),
         (&["权限"], "E_NO_PERMISSION", false),
         (&["HTTP", "请求失败", "响应"], "E_HTTP", false),
         (
@@ -398,9 +400,6 @@ struct FileIoServer {
     tool_router: rmcp::handler::server::router::tool::ToolRouter<Self>,
     /// 允许访问的根目录（沙箱）。为 None 时不限制路径。
     root: Option<std::path::PathBuf>,
-    /// 同路径串行化锁：保证"读-改-写"对同一文件互斥，多个 AI 并发写同一文件时不互相覆盖。
-    /// 用 Arc 包裹，使 Clone 出来的实例共享同一份锁表。
-    path_locks: std::sync::Arc<std::sync::Mutex<HashMap<std::path::PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>>,
 }
 
 /// 备份相关常量
@@ -492,16 +491,23 @@ impl FileIoServer {
         Self {
             tool_router: Self::tool_router(),
             root,
-            path_locks: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
     /// 取某个路径的串行化锁。同一路径（字符串相同）返回同一把锁。
+    /// 用**进程级**全局锁表：HTTP 模式下每个会话是独立的 FileIoServer 实例，
+    /// 只有全局表才能让不同会话共享同一把锁（否则“同进程多会话互斥”的承诺并不成立）。
     fn lock_for(&self, path: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
-        let mut map = self
-            .path_locks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        static GLOBAL_PATH_LOCKS: std::sync::OnceLock<
+            std::sync::Arc<
+                std::sync::Mutex<
+                    HashMap<std::path::PathBuf, std::sync::Arc<std::sync::Mutex<()>>>,
+                >,
+            >,
+        > = std::sync::OnceLock::new();
+        let table = GLOBAL_PATH_LOCKS
+            .get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())));
+        let mut map = table.lock().unwrap_or_else(|e| e.into_inner());
         map.entry(std::path::PathBuf::from(path))
             .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
             .clone()
@@ -594,7 +600,7 @@ impl FileIoServer {
         // 解析符号链接/junction），不存在的尾部按普通段原样拼接；无法安全解析时退回文本规范化。
         // 这样"根目录内但写法不同"的路径不会被子串比较误拒，而越界/链接逃逸仍会被拦下。
         let resolved = Self::resolve_existing_prefix(&abs);
-        if !Self::sandbox_cmp_key(&resolved).starts_with(&Self::sandbox_cmp_key(root)) {
+        if !Self::sandbox_within(&resolved, root) {
             return Err(e_param(
                 format!(
                     "路径超出允许的根目录: {} (根目录: {})",
@@ -607,10 +613,82 @@ impl FileIoServer {
         Ok(resolved.to_string_lossy().into_owned())
     }
 
+    /// 判断 IO 错误是否为“跨设备/跨卷”（Windows ERROR_NOT_SAME_DEVICE=17，Unix EXDEV=18），
+    /// 用于把 move 回退成“复制 + 删除”。
+    fn is_cross_device_error(e: &std::io::Error) -> bool {
+        matches!(e.raw_os_error(), Some(17) | Some(18))
+    }
+
+    /// 路径是否位于沙箱根目录之下（含根目录自身）。按**路径组件**比较，
+    /// 避免 "C:\data" 误把同前缀的 "C:\data-evil" 当作根内路径放行。
+    fn sandbox_within(path: &std::path::Path, root: &std::path::Path) -> bool {
+        let p = std::path::PathBuf::from(Self::sandbox_cmp_key(path));
+        let r = std::path::PathBuf::from(Self::sandbox_cmp_key(root));
+        p.starts_with(&r)
+    }
+
+    /// 判定 target 应视为目录还是文件路径（resolved 为已解析绝对路径，raw 为调用方原始入参）：
+    /// - target 已存在：以文件系统实际类型为准
+    /// - target 不存在：多文件时为目录；单文件时为新文件路径（可改名），
+    ///   除非原始入参以 `/` 或 `\` 结尾（显式表明要放进目录）
+    fn target_is_dir_for(resolved: &std::path::Path, raw: &str, source_count: usize) -> bool {
+        if resolved.exists() {
+            return resolved.is_dir();
+        }
+        if source_count > 1 {
+            return true;
+        }
+        let t = raw.trim_end();
+        t.ends_with('/') || t.ends_with('\\')
+    }
+
+    /// 编码识别取样：优先使用**完整文件内容**；当本次读取窗口不是完整文件时，
+    /// 重新读取整份文件（超过 MAX_TEXT_READ_SIZE 的超大文件只取头部）用于识别，
+    /// 避免因窗口截断在多字节字符中间而误判编码。
+    fn encoding_probe_bytes(
+        path: &str,
+        window_start: u64,
+        window_truncated: bool,
+        window: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        if window_start == 0 && !window_truncated {
+            return Ok(window.to_vec());
+        }
+        let size = fs::metadata(path)
+            .map_err(|e| format!("读取文件失败: {}", e))?
+            .len();
+        if size <= MAX_TEXT_READ_SIZE as u64 {
+            let bytes = fs::read(path).map_err(|e| format!("读取文件失败: {}", e))?;
+            Ok(Self::utf8_trim_incomplete_tail(&bytes).to_vec())
+        } else {
+            let mut f = File::open(path).map_err(|e| format!("打开文件失败: {}", e))?;
+            let mut head = vec![0u8; MAX_TEXT_READ_SIZE];
+            f.read_exact(&mut head)
+                .map_err(|e| format!("读取文件失败: {}", e))?;
+            Ok(Self::utf8_trim_incomplete_tail(&head).to_vec())
+        }
+    }
+
+    /// 编码识别采样用：若切片唯一的问题是“尾部有一个不完整的多字节字符”，则截到最后一个完整字符；
+    /// 存在真正非法字节时保持原样，交由识别逻辑判定为非 UTF-8 文本。
+    fn utf8_trim_incomplete_tail(bytes: &[u8]) -> &[u8] {
+        match std::str::from_utf8(bytes) {
+            Ok(_) => bytes,
+            Err(e) if e.error_len().is_none() => &bytes[..e.valid_up_to()],
+            Err(_) => bytes,
+        }
+    }
+
     /// 沙箱比较用的路径键：规范化（去 `\\?\`、折叠 `.`/`..`）+ 小写。
     /// Windows 路径大小写不敏感，`F:\A` 与 `f:\a` 必须视为同一路径。
     fn sandbox_cmp_key(p: &std::path::Path) -> String {
-        normalize_path(p).to_string_lossy().to_lowercase()
+        let s = normalize_path(p).to_string_lossy().into_owned();
+        // 仅 Windows 路径大小写不敏感；类 Unix 保持大小写敏感，避免把两个不同路径误判为同一路径
+        if cfg!(windows) {
+            s.to_lowercase()
+        } else {
+            s
+        }
     }
 
     /// 用"最长可 canonicalize 的前缀 + 未存在的尾部"拼出尽量真实的绝对路径。
@@ -692,16 +770,16 @@ impl FileIoServer {
             }
             "insert" => {
                 let off = (offset.unwrap_or(0) as usize).min(cur.len());
-                let end = (off + expect_len).min(cur.len());
+                let end = off.saturating_add(expect_len).min(cur.len());
                 (cur[off..end].to_vec(), format!("插入点 offset={}", off))
             }
             "replace" => {
                 let off = offset.unwrap_or(0) as usize;
                 let len = replace_length.unwrap_or(0);
                 if off >= cur.len() {
-                    return (Vec::new(), format!("[{}..{}) 越界", off, off + len));
+                    return (Vec::new(), format!("[{}..{}) 越界", off, off.saturating_add(len)));
                 }
-                let end = (off + len).min(cur.len());
+                let end = off.saturating_add(len).min(cur.len());
                 (cur[off..end].to_vec(), format!("[{}..{})", off, end))
             }
             _ => (cur.to_vec(), "整个文件".to_string()),
@@ -935,18 +1013,23 @@ impl FileIoServer {
             &encoding_rs::Encoding::for_label(b"gbk").unwrap().decode(sample).0,
         );
 
-        let (best, best_score) = if s_gbk > s_utf8 {
+        // 结构合法的 UTF-8 是强信号：与 GBK 分数接近（差<=0.02）时优先 UTF-8，
+        // 避免“UTF-8 中文被 GBK 解成另一批汉字”导致误判。真正的 GBK 冲突样本分差远大于此阈值。
+        let (best, best_score) = if s_utf8.is_finite() && s_gbk <= s_utf8 + 0.02 {
+            ("utf-8", s_utf8)
+        } else if s_gbk > s_utf8 {
             ("gbk", s_gbk)
         } else {
             ("utf-8", s_utf8)
         };
 
-        // 两个候选都不像正常文本时，再试其他 CJK 编码，取分最高的一个（置信度标低）
+        // 两个候选都不像正常文本时，再试其他 CJK 编码，取分最高的一个（置信度标低）。
+        // 这里同样只用样本打分，避免大文件为识别把整份内容按 4 种编码各解一遍。
         if !(best_score >= 0.85) {
             let mut alt = (best, best_score);
             for &enc in &["big5", "euc-kr", "shift_jis", "euc-jp"] {
                 let s = Self::text_likelihood(
-                    &encoding_rs::Encoding::for_label(enc.as_bytes()).unwrap().decode(bytes).0,
+                    &encoding_rs::Encoding::for_label(enc.as_bytes()).unwrap().decode(sample).0,
                 );
                 if s > alt.1 {
                     alt = (enc, s);
@@ -1009,11 +1092,21 @@ impl FileIoServer {
             // 不能从"最近的 ASCII 字节"起步：GBK 双字节的第二字节也可能落在 ASCII 范围
             // （0x40-0x7E），会把字符内部误当成边界，从而在字符中间插入、切断多字节字符。
             _ => {
+                // GB18030 有四字节序列（首 0x81-0xFE，次 0x30-0x39，三 0x81-0xFE，四 0x30-0x39）
+                let gb18030 = encoding.eq_ignore_ascii_case("gb18030");
                 let mut pos = 0usize;
                 while pos < off {
                     let b = bytes[pos];
                     if b < 0x80 {
                         pos += 1;
+                    } else if gb18030
+                        && pos + 3 < bytes.len()
+                        && (0x81..=0xFE).contains(&b)
+                        && (0x30..=0x39).contains(&bytes[pos + 1])
+                        && (0x81..=0xFE).contains(&bytes[pos + 2])
+                        && (0x30..=0x39).contains(&bytes[pos + 3])
+                    {
+                        pos += 4;
                     } else if (0x81..=0xFE).contains(&b) {
                         pos += 2;
                     } else {
@@ -1123,12 +1216,14 @@ impl FileIoServer {
     fn file_fingerprint(path: &str, size: u64, bytes: Option<&[u8]>) -> Option<String> {
         const INLINE_MAX: u64 = 1024 * 1024;
         const SAMPLE: usize = 64 * 1024;
-        if size <= INLINE_MAX {
-            if let Some(b) = bytes {
-                if b.len() as u64 == size {
-                    return Some(Self::fingerprint_of_bytes(b));
-                }
+        // 调用方已持有完整内容时，无论大小都直接在内存里算（fingerprint_of_bytes 内部对大文件采样头尾），
+        // 避免为了算指纹把大文件再读一遍盘
+        if let Some(b) = bytes {
+            if b.len() as u64 == size {
+                return Some(Self::fingerprint_of_bytes(b));
             }
+        }
+        if size <= INLINE_MAX {
             return fs::read(path).ok().map(|b| Self::fingerprint_of_bytes(&b));
         }
         // 大文件：按 fingerprint_of_bytes 的同构顺序拼 "size + head + tail"
@@ -1600,24 +1695,33 @@ impl FileIoServer {
         mode: &str,
         offset: Option<u64>,
         expected_old: Option<&str>,
+        existing: Option<&[u8]>,
     ) -> Result<(), McpError> {
         let Some(exp) = expected_old else {
             return Ok(());
         };
-        if !std::path::Path::new(path).exists() {
-            return Err(e_param(
-                format!(
-                    "文件不存在: {}。已提供 expected_old 说明期望文件存在，请核对路径",
-                    path
-                ),
-                None,
-            ));
-        }
-        let bytes = fs::read(path)
-            .map_err(|e| e_internal(format!("读取文件失败: {}", e), None))?;
+        // 复用调用方已读到的字节，避免同一文件被重复读盘；未提供时才回退读盘
+        let owned;
+        let bytes: &[u8] = match existing {
+            Some(b) => b,
+            None => {
+                if !std::path::Path::new(path).exists() {
+                    return Err(e_param(
+                        format!(
+                            "文件不存在: {}。已提供 expected_old 说明期望文件存在，请核对路径",
+                            path
+                        ),
+                        None,
+                    ));
+                }
+                owned = fs::read(path)
+                    .map_err(|e| e_internal(format!("读取文件失败: {}", e), None))?;
+                &owned
+            }
+        };
 
         // 统一解码入口（剥离 BOM），保证与写入时的内容口径一致
-        let actual_content = Self::decode_file(&bytes, encoding_name)
+        let actual_content = Self::decode_file(bytes, encoding_name)
             .map_err(|e| e_internal(e, None))?
             .content;
 
@@ -1761,7 +1865,7 @@ impl FileIoServer {
             .map_err(|e| format!("无法读取目录 {}: {}", dir.display(), e))?;
 
         let mut sorted: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-        sorted.sort_by_key(|e| e.file_name());
+        sorted.sort_by_cached_key(|e| e.file_name());
 
         for entry in sorted {
             if files.len() >= max_files {
@@ -1909,8 +2013,16 @@ impl FileIoServer {
         let fp = Self::fingerprint_short_of_bytes(&bytes);
         if encoding_auto {
             let detected = Self::detect_encoding(&bytes);
-            let content = Self::decode_bytes(&bytes, detected)
-                .map_err(|e| format!("按 {} 解码失败({})", detected, e))?;
+            // 自动识别的编码若仍有非法字节，退化为宽松解码（U+FFFD 替换）而不是跳过整个文件，
+            // 以免目录搜索漏文件；显式指定 encoding 时仍严格报错。
+            let content = match Self::decode_bytes(&bytes, detected) {
+                Ok(s) => s,
+                Err(_) => {
+                    let enc = Self::get_encoding(detected)
+                        .map_err(|e| format!("按 {} 解码失败({})", detected, e))?;
+                    enc.decode(&bytes).0.into_owned()
+                }
+            };
             Ok((detected.to_string(), content, fp))
         } else {
             let name = encoding_raw.unwrap_or("utf-8");
@@ -1968,21 +2080,36 @@ impl FileIoServer {
 
         let start = params.offset.unwrap_or(0);
 
-        // 若需要显示行号且有偏移，需先读取前面的内容数行数
+        // 若需要显示行号且有偏移，需先数一遍前缀里的换行数；
+        // 用固定大小缓冲分块统计，避免为一个大偏移分配整段前缀内存
         let prefix_line_count = if show_ln && start > 0 {
             file.seek(SeekFrom::Start(0))
                 .map_err(|e| e_internal(format!("Seek 失败: {}", e), None))?;
-            let mut prefix_buf = vec![0u8; start as usize];
-            file.read_exact(&mut prefix_buf)
-                .map_err(|e| e_internal(format!("读取前缀失败: {}", e), None))?;
-            // 数前缀中的换行数（即偏移位置处已经过了多少行，行号从1开始，所以行数+1是起始行号）
-            prefix_buf.iter().filter(|&&b| b == b'\n').count()
+            let mut remaining = start;
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut count = 0usize;
+            while remaining > 0 {
+                let want = (remaining.min(buf.len() as u64)) as usize;
+                let n = file
+                    .read(&mut buf[..want])
+                    .map_err(|e| e_internal(format!("读取前缀失败: {}", e), None))?;
+                if n == 0 {
+                    break;
+                }
+                count += buf[..n].iter().filter(|&&b| b == b'\n').count();
+                remaining -= n as u64;
+            }
+            count
         } else {
             0
         };
 
-        if start >= file_size {
-            return Ok(format!("偏移量 {} 超出文件大小 {}", start, file_size));
+        // 允许 offset=0 读空文件（返回空内容）；仅当偏移越过文件末尾才报错
+        if start > 0 && start >= file_size {
+            return Err(e_param(
+                format!("offset={} 超出文件范围（文件共 {}B）", start, file_size),
+                None,
+            ));
         }
 
         file.seek(SeekFrom::Start(start))
@@ -1996,11 +2123,21 @@ impl FileIoServer {
         file.read_exact(&mut buffer)
             .map_err(|e| e_internal(format!("读取失败: {}", e), None))?;
 
-        let (encoding_name, enc_confident) = Self::resolve_encoding_with_confidence(
-            params.encoding.as_deref().or(Some("auto")),
-            &buffer,
-        )
-        .map_err(|e| e_param(e, None))?;
+        // 编码决策：显式指定则直接采用；auto/未指定时始终基于**完整文件**识别编码，
+        // 不能用本次读取窗口——窗口可能从多字节字符中间开始/结束，会让 UTF-8 校验失败而误判成 GBK。
+        let requested_enc = params.encoding.as_deref();
+        let auto_detect = requested_enc
+            .map(|e| e.is_empty() || e.eq_ignore_ascii_case("auto"))
+            .unwrap_or(true);
+        let (encoding_name, enc_confident) = if auto_detect {
+            let probe = Self::encoding_probe_bytes(&params.path, start, truncated, &buffer)
+                .map_err(|e| e_internal(e, None))?;
+            Self::detect_encoding_with_confidence(&probe)
+        } else {
+            let enc = Self::get_encoding(requested_enc.unwrap_or("utf-8"))
+                .map_err(|e| e_param(e, None))?;
+            (enc.name(), true)
+        };
         // 从 offset=0 开始读取时，头部可能带 BOM，需剥离并返回给 AI 可见的编码名
         let bom = if start == 0 { Self::detect_bom(&buffer) } else { &[][..] };
         let body = &buffer[bom.len()..];
@@ -2015,13 +2152,57 @@ impl FileIoServer {
             " ⚠️编码识别不确定(GBK/UTF-8 难以区分)，建议显式指定 encoding 后重新读取".to_string()
         };
 
+        // 只解码本次读取的窗口。窗口按字节截断，尾部可能是“半个多字节字符”，
+        // 这属于正常截断而非文件损坏：截断时容忍尾部不完整序列，避免整次读取直接报错。
         let content = if encoding_name.eq_ignore_ascii_case("utf-8") {
-            String::from_utf8(body.to_vec()).map_err(|_| {
-                e_internal(
-                    format!("文件不是有效的 UTF-8 编码（可能在偏移量 {} 处包含非法字节），请尝试指定正确的 encoding 参数", start),
-                    None,
-                )
-            })?
+            match std::str::from_utf8(body) {
+                Ok(s) => s.to_string(),
+                Err(e) if truncated && e.error_len().is_none() => {
+                    std::str::from_utf8(&body[..e.valid_up_to()])
+                        .unwrap_or("")
+                        .to_string()
+                }
+                Err(_) => {
+                    return Err(e_internal(
+                        format!(
+                            "文件不是有效的 UTF-8 编码（从偏移量 {} 起读取的 {} 字节内包含非法字节），请尝试指定正确的 encoding 参数",
+                            start,
+                            body.len()
+                        ),
+                        None,
+                    ));
+                }
+            }
+        } else if truncated {
+            // 双字节/多字节编码同理：尾部可能截断在字符中间，逐字节回退（最多 4 字节）再试
+            let mut end = body.len();
+            let mut decoded: Option<String> = None;
+            loop {
+                match Self::decode_bytes(&body[..end], encoding_name) {
+                    Ok(s) => {
+                        decoded = Some(s);
+                        break;
+                    }
+                    Err(_) => {
+                        if end == 0 || body.len() - end >= 4 {
+                            break;
+                        }
+                        end -= 1;
+                    }
+                }
+            }
+            match decoded {
+                Some(s) => s,
+                None => {
+                    return Err(e_internal(
+                        format!(
+                            "按 {} 解码失败（偏移量 {} 起的窗口内包含无效字节）",
+                            encoding_name, start
+                        ),
+                        None,
+                    ));
+                }
+            }
         } else {
             Self::decode_bytes(body, encoding_name)
                 .map_err(|e| e_internal(e, None))?
@@ -2091,6 +2272,13 @@ impl FileIoServer {
             p
         };
         let mode = params.mode.as_deref().unwrap_or("overwrite");
+        // 先校验模式，避免未知 mode 也走完建目录/写前校验等副作用
+        if !matches!(mode, "overwrite" | "append" | "insert") {
+            return Err(e_param(
+                format!("不支持的模式: {}，可选: overwrite, append, insert", mode),
+                None,
+            ));
+        }
 
         // 同一文件的读-改-写串行化：多个 AI 并发写同一文件时不会互相覆盖
         self.with_path_lock(&params.path, || {
@@ -2166,13 +2354,15 @@ impl FileIoServer {
         Self::ensure_parent_dir(&params.path)
             .map_err(|e| e_internal(e, None))?;
 
-        // 写前校验（按 mode 校验"当前想改范围"的内容）：防止未确认当前内容就误写
+        // 写前校验（按 mode 校验“当前想改范围”的内容）：防止未确认当前内容就误写；
+        // 复用上面已读到的 existing_bytes，避免同一文件被重复读盘
         Self::check_write_guard(
             &params.path,
             encoding_name,
             mode,
             params.offset,
             params.expected_old.as_deref(),
+            existing_bytes.as_deref(),
         )?;
 
         // BOM 处理：
@@ -2315,9 +2505,9 @@ impl FileIoServer {
                 }
                 Ok(format!("OK {} | {} | +{}B @{} | {}B | sha256:{}{}", params.path, encoding_label, bytes.len(), off, new_data.len(), Self::fingerprint_short_of_bytes(&new_data), tail))
             }
-            _ => Ok(format!(
-                "不支持的模式: {}，可选: overwrite, append, insert",
-                mode
+            _ => Err(e_param(
+                format!("不支持的模式: {}，可选: overwrite, append, insert", mode),
+                None,
             )),
         }
         })
@@ -2465,8 +2655,12 @@ impl FileIoServer {
             .len();
 
         let start = params.offset.unwrap_or(0);
-        if start >= file_size {
-            return Ok(format!("偏移量 {} 超出文件大小 {}", start, file_size));
+        // 允许 offset=0 读空文件（返回空内容）；仅当偏移越过文件末尾才报错
+        if start > 0 && start >= file_size {
+            return Err(e_param(
+                format!("offset={} 超出文件范围（文件共 {}B）", start, file_size),
+                None,
+            ));
         }
 
         file.seek(SeekFrom::Start(start))
@@ -2547,42 +2741,15 @@ dry_run=true 只返回 HEX diff 预览不落盘",
         };
         let mode = params.mode.as_deref().unwrap_or("overwrite");
         if !matches!(mode, "overwrite" | "append" | "insert" | "replace") {
-            return Ok(format!(
-                "不支持的模式: {}，可选: overwrite, append, insert, replace",
-                mode
+            return Err(e_param(
+                format!("不支持的模式: {}，可选: overwrite, append, insert, replace", mode),
+                None,
             ));
         }
         let dry_run = params.dry_run.unwrap_or(false);
-        // 兼容处理：去掉 0x 前缀
-        let hex_str = params.hex_data.trim();
-        let hex_str = if hex_str.starts_with("0x") {
-            &hex_str[2..]
-        } else {
-            hex_str
-        };
-        // 校验：只允许十六进制字符
-        if !hex_str.chars().all(|c| c.is_ascii_hexdigit()) {
-            let invalid: String = hex_str.chars().filter(|c| !c.is_ascii_hexdigit()).collect();
-            return Err(e_param(
-                format!("十六进制数据包含非法字符: [{}]。只允许 0-9, A-F, a-f", invalid),
-                None,
-            ));
-        }
-
-        if hex_str.len() % 2 != 0 {
-            return Err(e_param(
-                "十六进制字符串长度必须为偶数".to_string(),
-                None,
-            ));
-        }
-
-        let bytes: Result<Vec<u8>, _> = (0..hex_str.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&hex_str[i..i + 2], 16))
-            .collect();
-        let bytes = bytes.map_err(|e| {
-            e_internal(format!("十六进制解析失败: {}", e), None)
-        })?;
+        // 与 expected_hex 使用同一套宽松解析：支持 0x/0X 前缀与空格/冒号等分隔符；空内容直接拒绝
+        let bytes = Self::parse_hex_flexible(&params.hex_data)
+            .map_err(|e| e_param(format!("hex_data 解析失败: {}", e), None))?;
 
         // 自动创建父目录
         Self::ensure_parent_dir(&params.path)
@@ -2659,20 +2826,22 @@ dry_run=true 只返回 HEX diff 预览不落盘",
                         None,
                     ));
                 }
-                if off + replace_len > current.len() {
-                    return Err(e_param(
-                        format!(
-                            "replace 范围越界：offset={} + replace_length={} = {} 超出文件大小 {}B。\
-                             请核对偏移（可用 read_binary_file 查看真实内容），或调小 replace_length",
-                            off,
-                            replace_len,
-                            off + replace_len,
-                            current.len()
-                        ),
-                        None,
-                    ));
-                }
-                let end = off + replace_len;
+                // checked_add 防止 offset + replace_length 溢出后绕过越界校验
+                let end = match off.checked_add(replace_len) {
+                    Some(end) if end <= current.len() => end,
+                    _ => {
+                        return Err(e_param(
+                            format!(
+                                "replace 范围越界：offset={} + replace_length={} 超出文件大小 {}B。\
+                                 请核对偏移（可用 read_binary_file 查看真实内容），或调小 replace_length",
+                                off,
+                                replace_len,
+                                current.len()
+                            ),
+                            None,
+                        ));
+                    }
+                };
                 let mut v = Vec::with_capacity(off + bytes.len() + (current.len() - end));
                 v.extend_from_slice(&current[..off]);
                 v.extend_from_slice(&bytes);
@@ -2889,16 +3058,16 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
                         continue;
                     }
                 };
-            let lines: Vec<&str> = content.lines().collect();
-
-            struct Hit {
+            struct Hit<'a> {
                 line_idx: usize,
                 col: usize,
                 text: String,
+                line_text: &'a str,
             }
-            // 达到 max_results 后不再存储，但继续计数，便于给出真实命中总量
-            let mut hits: Vec<Hit> = Vec::new();
-            for (line_idx, line) in lines.iter().enumerate() {
+            // 达到 max_results 后不再存储，但继续计数，便于给出真实命中总量。
+            // 直接流式遍历 content.lines()，不再为首个命中就收集整份行向量（大文件省内存）
+            let mut hits: Vec<Hit<'_>> = Vec::new();
+            for (line_idx, line) in content.lines().enumerate() {
                 for mat in re.find_iter(line) {
                     found += 1;
                     if stored + hits.len() >= max_results {
@@ -2910,6 +3079,7 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
                         line_idx,
                         col,
                         text: mat.as_str().to_string(),
+                        line_text: line,
                     });
                 }
             }
@@ -2937,10 +3107,12 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
                         h.line_idx + 1,
                         h.col,
                         h.text,
-                        Self::clip_line(lines[h.line_idx])
+                        Self::clip_line(h.line_text)
                     ));
                 }
             } else {
+                // 上下文模式需要按下标访问相邻行，这时才收集行向量
+                let lines: Vec<&str> = content.lines().collect();
                 // 合并相邻的上下文区间，同一行只输出一次
                 let mut ranges: Vec<(usize, usize)> = Vec::new();
                 for h in &hits {
@@ -3305,6 +3477,7 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
         let mut dir_count = 0usize;
         let mut scanned_dirs = 0usize;
         let mut total_size = 0u64;
+        let mut truncated_flag = false;
 
         fn fmt_modified(entry: &std::fs::DirEntry) -> String {
             entry.metadata().ok()
@@ -3328,14 +3501,18 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
             dir_count: &mut usize,
             scanned_dirs: &mut usize,
             total_size: &mut u64,
+            truncated: &mut bool,
         ) -> Result<(), String> {
             *scanned_dirs += 1;
             let entries_dir = fs::read_dir(dir_path)
                 .map_err(|e| format!("无法读取目录 {}: {}", dir_path.display(), e))?;
             let mut sorted: Vec<_> = entries_dir.filter_map(|e| e.ok()).collect();
-            sorted.sort_by_key(|e| e.file_name());
+            sorted.sort_by_cached_key(|e| e.file_name());
             for entry in sorted {
-                if entries.len() >= max_results { return Ok(()); }
+                if entries.len() >= max_results {
+                    *truncated = true;
+                    return Ok(());
+                }
                 let name = entry.file_name().to_string_lossy().to_string();
                 // 跳过本工具自己产生的临时文件与锁文件
                 if is_internal_file(&name) { continue; }
@@ -3347,9 +3524,12 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
                     scan_dir(
                         &entry.path(), re, glob_matcher, recursive, include_dirs, max_results,
                         show_size, show_modified, entries, file_count, dir_count,
-                        scanned_dirs, total_size,
+                        scanned_dirs, total_size, truncated,
                     )?;
-                    if entries.len() >= max_results { return Ok(()); }
+                    if entries.len() >= max_results {
+                        *truncated = true;
+                        return Ok(());
+                    }
                 }
 
                 // 匹配：正则 / glob / 全部列出
@@ -3394,10 +3574,11 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
             &mut dir_count,
             &mut scanned_dirs,
             &mut total_size,
+            &mut truncated_flag,
         )
         .map_err(|e| e_internal(e, None))?;
 
-        let truncated = if entries.len() >= max_results {
+        let truncated = if truncated_flag {
             format!("\n... 结果已截断，最多显示 {} 条", max_results)
         } else {
             String::new()
@@ -3482,7 +3663,7 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
     /// 删除文件(需用户确认)
     #[tool(
         name = "delete_file",
-        description = "删除单个文件(不可删目录)。必须显式传 confirm=true 才会真正删除，否则只回报文件信息；删除前自动备份，可用 manage_backups undo 恢复",
+        description = "删除单个文件(不可删目录)。必须显式传 confirm=true 才会真正删除；未确认时返回 E_INVALID_PARAM 并回显文件大小与指纹；删除前自动备份，可用 manage_backups undo 恢复",
         annotations(title = "删除文件", destructive_hint = true)
     )]
     fn delete_file(
@@ -3496,9 +3677,10 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
         };
         let path = std::path::Path::new(&params.path);
 
-        // 与该文件的写操作互斥，避免"边写边删"
+        // 与该文件的写操作互斥，避免“边写边删”（进程内锁 + 跨进程文件锁）
         let lock = self.lock_for(&params.path);
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _file_guard = Self::acquire_file_lock(&params.path);
 
         if !path.exists() {
             return Ok(format!("文件不存在: {}", params.path));
@@ -3555,9 +3737,10 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
         };
         let action = params.action.to_lowercase();
 
-        // 与该文件的写操作互斥
+        // 与该文件的写操作互斥（进程内锁 + 跨进程文件锁）
         let lock = self.lock_for(&params.path);
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _file_guard = Self::acquire_file_lock(&params.path);
 
         match action.as_str() {
             "list" => {
@@ -3693,7 +3876,11 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
         Parameters(params): Parameters<FetchParams>,
     ) -> Result<String, McpError> {
         let method = params.method.as_deref().unwrap_or("GET").to_uppercase();
-        let timeout_secs = params.timeout.unwrap_or(30);
+        // timeout=0 会被 reqwest 当成“立即超时”，这里回退到默认 30 秒，避免误传 0 导致请求必然失败
+        let timeout_secs = match params.timeout.unwrap_or(30) {
+            0 => 30,
+            n => n,
+        };
         let response_type = params.response_type.as_deref().unwrap_or("text");
 
         // 进程级共享客户端：复用 TCP/TLS 连接池，避免每次调用重新握手。
@@ -3821,12 +4008,14 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
         let overwrite = params.overwrite.unwrap_or(false);
         let target = self.resolve_path(&params.target)?;
         let target_path = std::path::Path::new(&target);
-        let target_is_dir = target_path.is_dir() || !target_path.exists();
 
         // 解析所有源文件路径
         let sources: Vec<String> = params.sources.iter()
             .map(|s| self.resolve_path(s))
             .collect::<Result<Vec<_>, _>>()?;
+
+        // 目标语义：已存在按实际类型；不存在时多文件=目录、单文件=新文件路径（除非路径以分隔符结尾）
+        let target_is_dir = Self::target_is_dir_for(target_path, &params.target, sources.len());
 
         // 校验所有源文件存在
         for s in &sources {
@@ -3857,6 +4046,7 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
         }
 
         let mut copied = 0u64;
+        let mut skipped = 0u64;
         let mut results = Vec::new();
 
         for src in &sources {
@@ -3873,6 +4063,7 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
 
             if dest.exists() && !overwrite {
                 results.push(format!("跳过 {} (已存在)", dest.display()));
+                skipped += 1;
                 continue;
             }
 
@@ -3880,9 +4071,11 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
                 .map_err(|e| e_internal(format!("无法读取源文件信息: {}", e), None))?
                 .len();
 
-            // 与目标文件的其他写操作互斥
-            let lock = self.lock_for(&dest.to_string_lossy());
+            // 与目标文件的其他写操作互斥（进程内锁 + 跨进程文件锁）
+            let dest_str = dest.to_string_lossy().to_string();
+            let lock = self.lock_for(&dest_str);
             let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let _file_guard = Self::acquire_file_lock(&dest_str);
             retry_io(|| fs::copy(src, &dest))
                 .map_err(|e| e_internal(format!("复制失败 {} -> {}: {}", src, dest.display(), e), None))?;
 
@@ -3891,9 +4084,10 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
         }
 
         Ok(format!(
-            "{} | {} files | {}B copied\n{}",
+            "{} | {} copied, {} skipped | {}B copied\n{}",
             if target_is_dir { target.to_string() } else { target_path.to_string_lossy().to_string() },
-            results.len(),
+            results.len() as u64 - skipped,
+            skipped,
             copied,
             results.join("\n"),
         ))
@@ -3912,12 +4106,14 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
         let overwrite = params.overwrite.unwrap_or(false);
         let target = self.resolve_path(&params.target)?;
         let target_path = std::path::Path::new(&target);
-        let target_is_dir = target_path.is_dir() || !target_path.exists();
 
         // 解析所有源文件路径
         let sources: Vec<String> = params.sources.iter()
             .map(|s| self.resolve_path(s))
             .collect::<Result<Vec<_>, _>>()?;
+
+        // 目标语义：已存在按实际类型；不存在时多文件=目录、单文件=新文件路径（除非路径以分隔符结尾）
+        let target_is_dir = Self::target_is_dir_for(target_path, &params.target, sources.len());
 
         // 校验所有源文件存在
         for s in &sources {
@@ -3947,6 +4143,7 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
         }
 
         let mut moved = 0u64;
+        let mut skipped = 0u64;
         let mut results = Vec::new();
 
         for src in &sources {
@@ -3963,6 +4160,7 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
 
             if dest.exists() && !overwrite {
                 results.push(format!("跳过 {} (已存在)", dest.display()));
+                skipped += 1;
                 continue;
             }
 
@@ -3970,22 +4168,51 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
                 .map_err(|e| e_internal(format!("无法读取源文件信息: {}", e), None))?
                 .len();
 
-            // 与源/目标文件的其他写操作互斥
-            let lock = self.lock_for(&dest.to_string_lossy());
-            let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-            let lock_src = self.lock_for(src);
-            let _guard_src = lock_src.lock().unwrap_or_else(|e| e.into_inner());
-            retry_io(|| fs::rename(src, &dest))
-                .map_err(|e| e_internal(format!("移动失败 {} -> {}: {}", src, dest.display(), e), None))?;
+            let dest_str = dest.to_string_lossy().to_string();
+            // 源与目标相同（重命名到自身）：无需操作
+            if src.as_str() == dest_str {
+                results.push(format!("跳过 {} (源与目标相同)", dest.display()));
+                skipped += 1;
+                continue;
+            }
+            // 固定顺序加锁（进程内 + 跨进程文件锁），避免并发 A→B / B→A 时互相等待死锁
+            let src_first = src.as_str() < dest_str.as_str();
+            let (p1, p2) = if src_first {
+                (src.as_str(), dest_str.as_str())
+            } else {
+                (dest_str.as_str(), src.as_str())
+            };
+            let l1 = self.lock_for(p1);
+            let _g1 = l1.lock().unwrap_or_else(|e| e.into_inner());
+            let l2 = self.lock_for(p2);
+            let _g2 = l2.lock().unwrap_or_else(|e| e.into_inner());
+            let _f1 = Self::acquire_file_lock(p1);
+            let _f2 = Self::acquire_file_lock(p2);
+            // 跨卷时 rename 会失败（Windows ERROR_NOT_SAME_DEVICE=17 / Unix EXDEV=18），回退为“复制 + 删除”
+            match retry_io(|| fs::rename(src, &dest)) {
+                Ok(()) => {}
+                Err(e) if Self::is_cross_device_error(&e) => {
+                    retry_io(|| fs::copy(src, &dest)).map_err(|e| {
+                        e_internal(format!("跨卷移动复制失败 {} -> {}: {}", src, dest.display(), e), None)
+                    })?;
+                    retry_io(|| fs::remove_file(src)).map_err(|e| {
+                        e_internal(format!("跨卷移动删除源文件失败 {}: {}", src, e), None)
+                    })?;
+                }
+                Err(e) => {
+                    return Err(e_internal(format!("移动失败 {} -> {}: {}", src, dest.display(), e), None));
+                }
+            }
 
             moved += size;
             results.push(format!("OK {} -> {} | {}B", src, dest.display(), size));
         }
 
         Ok(format!(
-            "{} | {} files | {}B moved\n{}",
+            "{} | {} moved, {} skipped | {}B moved\n{}",
             if target_is_dir { target.to_string() } else { target_path.to_string_lossy().to_string() },
-            results.len(),
+            results.len() as u64 - skipped,
+            skipped,
             moved,
             results.join("\n"),
         ))
@@ -4295,7 +4522,18 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
                     .split('\n')
                     .map(|s| s.trim_end_matches('\r').to_string())
                     .collect();
-                modified.extend(append_lines);
+                // 文件以换行结尾时，split 产生的末尾空串只是“结尾换行标记”而不是真实空行：
+                // 追加应插在它之前，否则会凭空多出一个空行（"a\nb\n" + "c" 会变成 "a\nb\n\nc"）。
+                let insert_at = if modified.last().map(|s| s.is_empty()).unwrap_or(false) {
+                    modified.len() - 1
+                } else {
+                    modified.len()
+                };
+                let mut new_lines = Vec::with_capacity(modified.len() + append_lines.len());
+                new_lines.extend(modified.drain(..insert_at));
+                new_lines.extend(append_lines);
+                new_lines.extend(modified);
+                modified = new_lines;
                 format!("append")
             }
 
