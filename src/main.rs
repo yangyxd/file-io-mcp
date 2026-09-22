@@ -5603,6 +5603,12 @@ impl<'a> PanicSafeRouter<'a> {
     }
 
     fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+        eprintln!(
+            "DEBUG typeid str={} String={} any={:?}",
+            payload.type_id() == std::any::TypeId::of::<&str>(),
+            payload.type_id() == std::any::TypeId::of::<String>(),
+            payload.type_id()
+        );
         if let Some(s) = payload.downcast_ref::<&str>() {
             (*s).to_string()
         } else if let Some(s) = payload.downcast_ref::<String>() {

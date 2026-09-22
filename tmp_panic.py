@@ -93,6 +93,9 @@ try:
 except Exception:
     p.kill()
 err = p.stderr.read().decode("utf-8", "replace")
+print("---- STDERR ----")
+print(err[:2000])
+print("---- /STDERR ----")
 rep("7 stderr 里留下了可定位的 panic 记录",
     "file_info" in err and ("panic" in err.lower() or "main.rs" in err), err.strip().splitlines()[-1][:150] if err.strip() else "<empty>")
 
