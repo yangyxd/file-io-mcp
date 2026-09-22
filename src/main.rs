@@ -418,6 +418,19 @@ struct SectionEdit {
     content: String,
     /// 当 expected_old 命中多处时选第几处(1-based)，默认要求全文唯一
     occurrence: Option<usize>,
+    /// 期望该片段**从原文第几行开始**(1-based)。给出后只承认起始行匹配的命中：
+    /// 既可为多处相同的片段消歧，也能在声明的行号算错时直接告知它实际在第几行
+    start_line: Option<usize>,
+}
+
+/// 一条已定位成功的片段编辑（内部用）：原文区间 + 新内容 + 在 edits 中的下标 + 改动前行区间
+struct PlannedSection {
+    start: usize,
+    end: usize,
+    repl: String,
+    idx: usize,
+    line_from: usize,
+    line_to: usize,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1543,6 +1556,23 @@ impl FileIoServer {
         } else {
             Some(ft.content.matches('\n').count() + 1)
         }
+    }
+
+
+    /// 把批量编辑的落点整理成一行，便于调用方核对“改的是不是我说的那几处”。
+    /// 行号是**改动前**原文的行号（后续片段的影响不叠加），与传入 edits 的下标一一对应。
+    fn format_section_positions(planned: &[PlannedSection]) -> String {
+        let items: Vec<String> = planned
+            .iter()
+            .map(|p| {
+                if p.line_from == p.line_to {
+                    format!("edits[{}] 第 {} 行", p.idx, p.line_from)
+                } else {
+                    format!("edits[{}] 第 {}~{} 行", p.idx, p.line_from, p.line_to)
+                }
+            })
+            .collect();
+        format!("改动位置(改动前行号): {}", items.join("、"))
     }
 
 
@@ -3777,8 +3807,8 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
     /// 批量原子片段编辑：一次调用完成多处“精确文本 → 新文本”替换
     #[tool(
         name = "edit_file_sections",
-        description = "批量精确替换(一次调用改多处，默认全成或全不成)：edits=[{expected_old, content, occurrence?}]。\
-expected_old 须与原文逐字符一致(含缩进/空行，读到的换行是 CRLF 也可写成 LF)且默认要求全文唯一，命中多处时用 occurrence 指定第几处；\
+        description = "批量精确替换(一次调用改多处，默认全成或全不成)：edits=[{expected_old, content, occurrence?, start_line?}]。\
+expected_old 须与原文逐字符一致(含缩进/空行，读到的换行是 CRLF 也可写成 LF)且默认要求全文唯一；命中多处时用 occurrence 指定第几处，或用 start_line 声明它从第几行开始(行号算错时会直接告知实际行号)；\
 content 传空串=删除该片段；所有片段基于同一次快照定位，重叠会报错；支持 expected_sha256 防并发覆盖、dry_run 预览 diff。\
 （多处互不相邻的修改优先用它：比 edit_file_lines 少算行号、比 regex_replace 不需转义）",
         annotations(title = "批量片段编辑", destructive_hint = true)
@@ -3850,7 +3880,7 @@ content 传空串=删除该片段；所有片段基于同一次快照定位，�
             let hay = ft.content.replace("\r\n", "\n");
 
             // ---- 第一步：所有片段都在**原文快照**上定位，而不是“改一个再找下一个” ----
-            let mut planned: Vec<(usize, usize, String, usize)> = Vec::new();
+            let mut planned: Vec<PlannedSection> = Vec::new();
             let mut problems: Vec<String> = Vec::new();
             for (idx, op) in params.edits.iter().enumerate() {
                 let needle = op.expected_old.replace("\r\n", "\n");
@@ -3861,7 +3891,38 @@ content 传空串=删除该片段；所有片段基于同一次快照定位，�
                     ));
                     continue;
                 }
-                let hits = Self::find_all(&hay, &needle);
+                let mut hits = Self::find_all(&hay, &needle);
+                // 可选的行号约束（文本 + 行号双约束）：只承认“从声明的第 start_line 行开始”的命中。
+                // 既能消歧（同一片段出现多次），也能在行号算错时直接告诉调用方它实际在第几行。
+                if let Some(k) = op.start_line {
+                    let pinned: Vec<(usize, usize)> = hits
+                        .iter()
+                        .copied()
+                        .filter(|(s, _)| Self::line_of(&hay, *s) == k)
+                        .collect();
+                    if pinned.is_empty() {
+                        let spots: Vec<String> = hits
+                            .iter()
+                            .take(10)
+                            .map(|(s, _)| format!("第 {} 行", Self::line_of(&hay, *s)))
+                            .collect();
+                        problems.push(if spots.is_empty() {
+                            format!(
+                                "edits[{}]: expected_old 与文件内容不匹配（全文件均未命中，第 {} 行自然也没有）。\
+                                 它必须与原文逐字符一致（含缩进、空行、标点）；建议先用 read_text_lines 读出准确文本再复制过来",
+                                idx, k
+                            )
+                        } else {
+                            format!(
+                                "edits[{}]: start_line={} 与 expected_old 的实际位置不一致：它出现在 {}。\
+                                 请修正 start_line，或删掉 start_line 让它按默认的唯一性规则定位",
+                                idx, k, spots.join("、")
+                            )
+                        });
+                        continue;
+                    }
+                    hits = pinned;
+                }
                 let chosen = match hits.len() {
                     0 => None,
                     1 if op.occurrence.is_none() => Some(hits[0]),
@@ -3883,7 +3944,7 @@ content 传空串=删除该片段；所有片段基于同一次快照定位，�
                             let more = if hits.len() > 10 { " 等" } else { "" };
                             problems.push(format!(
                                 "edits[{}]: expected_old 在文件中不唯一（命中 {} 处：{}{}），无法确定要改哪一处。\
-                                 请把 expected_old 写得更长以唯一定位，或用 occurrence 指定第几处",
+                                 请把 expected_old 写得更长以唯一定位，或用 occurrence 指定第几处，或用 start_line 声明它从第几行开始",
                                 idx, n, spots.join("、"), more
                             ));
                             continue;
@@ -3891,7 +3952,19 @@ content 传空串=删除该片段；所有片段基于同一次快照定位，�
                     },
                 };
                 match chosen {
-                    Some((s, e)) => planned.push((s, e, op.content.replace("\r\n", "\n"), idx)),
+                    Some((s, e)) => {
+                        // 记下该片段在**改动前**原文中的行区间，供返回头回报落点
+                        let line_from = Self::line_of(&hay, s);
+                        let line_to = Self::line_of(&hay, e.saturating_sub(1).max(s));
+                        planned.push(PlannedSection {
+                            start: s,
+                            end: e,
+                            repl: op.content.replace("\r\n", "\n"),
+                            idx,
+                            line_from,
+                            line_to,
+                        });
+                    }
                     None => problems.push(format!(
                         "edits[{}]: expected_old 与文件内容不匹配（未命中）。\
                          它必须与原文逐字符一致（含缩进、空行、标点）；建议先用 read_text_lines 读出准确文本再复制过来",
@@ -3920,13 +3993,13 @@ content 传空串=删除该片段；所有片段基于同一次快照定位，�
             }
 
             // ---- 第二步：重叠检测（同一段被两条编辑改会得到意料之外的结果） ----
-            planned.sort_by_key(|(s, _, _, _)| *s);
+            planned.sort_by_key(|p| p.start);
             for w in planned.windows(2) {
-                if w[1].0 < w[0].1 {
+                if w[1].start < w[0].end {
                     return Err(e_param(
                         format!(
                             "edits[{}] 与 edits[{}] 的命中范围重叠（参数错误），无法同时应用。请合并为一条，或让两条片段的命中区间互不相交",
-                            w[0].3, w[1].3
+                            w[0].idx, w[1].idx
                         ),
                         None,
                     ));
@@ -3936,10 +4009,10 @@ content 传空串=删除该片段；所有片段基于同一次快照定位，�
             // ---- 第三步：按快照一次性拼接 ----
             let mut new_content = String::with_capacity(hay.len());
             let mut cursor = 0usize;
-            for (s, e, rep, _) in &planned {
-                new_content.push_str(&hay[cursor..*s]);
-                new_content.push_str(rep);
-                cursor = *e;
+            for p in &planned {
+                new_content.push_str(&hay[cursor..p.start]);
+                new_content.push_str(&p.repl);
+                cursor = p.end;
             }
             new_content.push_str(&hay[cursor..]);
             let new_content = if ft.line_ending == "\n" {
@@ -3957,16 +4030,30 @@ content 传空串=删除该片段；所有片段基于同一次快照定位，�
                 out
             };
 
+            // 被跳过的条目（all_or_nothing=false 时才有）：dry-run 也必须能看到，
+            // 否则“先预览再决定”就失去了意义
+            let skip_note = if problems.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n⚠️ 跳过 {} 条（all_or_nothing=false）:\n{}",
+                    problems.len(),
+                    problems.join("\n")
+                )
+            };
+
             if params.dry_run.unwrap_or(false) {
                 return Ok(format!(
-                    "DRY-RUN | {} | {} | {} 处替换 | {}B→{}B | 未写入文件\n{}预计 sha256:{}\n确认无误后去掉 dry_run 重新调用即可写入",
+                    "DRY-RUN | {} | {} | {} 处替换 | {}B→{}B | 未写入文件\n{}\n{}预计 sha256:{}\n确认无误后去掉 dry_run 重新调用即可写入{}",
                     params.path,
                     encoding_label,
                     planned.len(),
                     bytes.len(),
                     new_bytes.len(),
+                    Self::format_section_positions(&planned),
                     Self::unified_diff(&ft.content, &new_content, 200),
-                    Self::fingerprint_short_of_bytes(&new_bytes)
+                    Self::fingerprint_short_of_bytes(&new_bytes),
+                    skip_note
                 ));
             }
 
@@ -3978,17 +4065,8 @@ content 传空串=删除该片段；所有片段基于同一次快照定位，�
                 Self::finish_backup(h, &new_bytes);
                 tail = " | undoable".to_string();
             }
-            let skip_note = if problems.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "\n⚠️ 已跳过 {} 条（all_or_nothing=false）:\n{}",
-                    problems.len(),
-                    problems.join("\n")
-                )
-            };
             Ok(format!(
-                "OK {} | {} | {} 处替换 | {}B→{}B | sha256:{}{}{}",
+                "OK {} | {} | {} 处替换 | {}B→{}B | sha256:{}{}\n{}{}",
                 params.path,
                 encoding_label,
                 planned.len(),
@@ -3996,6 +4074,8 @@ content 传空串=删除该片段；所有片段基于同一次快照定位，�
                 new_bytes.len(),
                 Self::fingerprint_short_of_bytes(&new_bytes),
                 tail,
+                // 落点行号（改动前）：便于调用方核对“改的是不是我说的那几处”，不必再读一次文件
+                Self::format_section_positions(&planned),
                 skip_note
             ))
         })
