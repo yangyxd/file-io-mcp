@@ -164,11 +164,9 @@ struct ReadTextFileParams {
     path: String,
     /// 起始字节偏移，默认 0
     offset: Option<u64>,
-    /// 读取字节数，默认 10MB 上限（超出会截断并在返回头标注，可配合 offset 分页）；必须 ≥1。
-    /// 注意：非 strict 时它只是“提示值”——为覆盖完整多字节字符可能多读几字节、offset 可能下取整
+    /// 读取字节数(≥1)，默认最多 10MB；非 strict 时为“提示值”，会为字符边界微调(返回头标注)
     length: Option<usize>,
-    /// true=按字节精确读取：不做“至少读 4 字节”、不对 offset 下取整；
-    /// 边缘切在字符中间时丢弃不完整字节，并在返回头标注
+    /// true=精确按 [offset, offset+length) 读取，不做≥4字节扩读/offset下取整；边缘不完整字节丢弃并标注
     strict: Option<bool>,
     /// 编码，默认自动识别
     encoding: Option<String>,
@@ -214,7 +212,7 @@ struct ReadBinaryFileParams {
     path: String,
     /// 起始字节偏移，默认 0
     offset: Option<u64>,
-    /// 读取字节数，默认到末尾；单次最多 dump 4MB（超出会截断并在返回头标注 ⚠️已截断）
+    /// 读取字节数，默认到末尾；单次最多 4MB（超出截断并标注）
     length: Option<usize>,
 }
 
@@ -222,24 +220,21 @@ struct ReadBinaryFileParams {
 struct WriteBinaryFileParams {
     /// 文件路径
     path: String,
-    /// 十六进制数据，如 "48656C6C6F"（可带 0x 前缀与空格/冒号等分隔符）；
-    /// 空串 = 0 字节：仅 replace 可用于删除字节，overwrite 需配 confirm=true
+    /// 十六进制数据，如 "48656C6C6F"（可带 0x/空格冒号分隔）；空串=0字节：仅 replace 可删字节，overwrite 需 confirm=true
     hex_data: String,
     /// 模式：overwrite(默认)/append/insert/replace
     mode: Option<String>,
-    /// insert=插入位置 / replace=替换起始位置（字节）
+    /// insert=插入位置 / replace=起始位置（字节）
     offset: Option<u64>,
-    /// replace 模式下被替换的字节数
+    /// replace 被替换的字节数
     replace_length: Option<usize>,
-    /// 期望的旧字节(HEX，可带 0x 前缀与空格/冒号分隔)。按 mode 校验"待改范围"：
-    /// overwrite=全文 / append=文件末尾 / insert=offset 起 / replace=[offset, offset+replace_length)；
-    /// 不符则拒绝写入并回显该位置的实际字节（防 offset 算错）
+    /// 写前校验"待改范围"原始字节(HEX，可带 0x/空格冒号，不能为空串)：overwrite=全文/append=末尾/insert=offset起/replace=[offset,+len)；不符则拒绝并回显实际字节
     expected_hex: Option<String>,
-    /// 读到的 sha256；文件已被改动则拒绝写入
+    /// 读到的 sha256，文件被改动则拒绝
     expected_sha256: Option<String>,
     /// true=只返回 HEX diff 预览与预计指纹，不写文件
     dry_run: Option<bool>,
-    /// 显式确认：hex_data 为空时 overwrite 会把文件清空为 0 字节，必须传 true 才执行
+    /// hex_data 为空且 overwrite（会清空文件）时必须传 true
     confirm: Option<bool>,
 }
 
@@ -355,7 +350,7 @@ struct FetchParams {
     body: Option<String>,
     /// text(默认)/json/binary
     response_type: Option<String>,
-    /// 超时(秒)，默认30
+    /// 超时(秒)，默认15（传 0 也按 15 处理）
     timeout: Option<u64>,
 }
 
@@ -409,17 +404,16 @@ struct MoveFilesParams {
     overwrite: Option<bool>,
 }
 
-/// 批量片段编辑中的单条编辑：在原文中精确找到 expected_old，替换为 content
+/// 批量编辑的单条：精确找到 expected_old 并替换为 content
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SectionEdit {
-    /// 待替换的原始片段（须与文件内容逐字符一致，可含多行；读到的换行是 \r\n 也可写成 \n）
+    /// 待替换原文片段，须逐字符一致（可含多行；\r\n 写 \n 亦可）
     expected_old: String,
-    /// 替换成的新内容；空串 = 删除该片段
+    /// 新内容；空串=删除该片段
     content: String,
-    /// 当 expected_old 命中多处时选第几处(1-based)，默认要求全文唯一
+    /// 命中多处时选第几处(1-based)
     occurrence: Option<usize>,
-    /// 期望该片段**从原文第几行开始**(1-based)。给出后只承认起始行匹配的命中：
-    /// 既可为多处相同的片段消歧，也能在声明的行号算错时直接告知它实际在第几行
+    /// 期望片段起始行(1-based)；可消歧，写错时回报实际行号
     start_line: Option<usize>,
 }
 
@@ -437,13 +431,13 @@ struct PlannedSection {
 struct EditFileSectionsParams {
     /// 文件路径
     path: String,
-    /// 待替换片段列表（各自基于**同一次快照**定位，允许一次改多处）
+    /// 片段列表（基于同一次快照定位）
     edits: Vec<SectionEdit>,
-    /// 编码，默认保持原文件编码（不一致则拒绝）
+    /// 编码，默认保持原编码（不一致则拒绝）
     encoding: Option<String>,
-    /// 读到的 sha256；文件已被改动则拒绝写入
+    /// 读到的 sha256，文件被改动则拒绝
     expected_sha256: Option<String>,
-    /// true(默认)=任一片段未命中/不唯一就整体不写；false=只写命中的那些，并在结果里列出被跳过的
+    /// true(默认)=任一未命中/不唯一则整体不写；false=只写命中的并列出跳过项
     all_or_nothing: Option<bool>,
     /// true=只返回 diff 预览不写入
     dry_run: Option<bool>,
@@ -1504,7 +1498,11 @@ impl FileIoServer {
 
     /// 字节偏移对应的行号（1-based，用于把“命中在哪”讲清楚）
     fn line_of(hay: &str, offset: usize) -> usize {
-        hay[..offset.min(hay.len())].matches('\n').count() + 1
+        // 调用方不能保证 offset 落在字符边界上（落在多字节字符中间很常见），
+        // 这里向下取整到最近的边界后再切片，避免直接 panic
+        let off = offset.min(hay.len());
+        let off = (0..=off).rev().find(|i| hay.is_char_boundary(*i)).unwrap_or(0);
+        hay[..off].matches('\n').count() + 1
     }
 
     /// 自动识别编码的“自洽性”校验：若判定的编码根本无法无损解码现有文件，
@@ -2460,7 +2458,7 @@ impl FileIoServer {
     /// 读取文本文件
     #[tool(
         name = "read_text_file",
-        description = "按字节读文本片段(offset/length，默认最多 10MB，length 须≥1)。返回头: 路径|编码(BOM标注)|大小|sha256|区间。默认会为对齐字符边界微调区间(返回头会标注)，需要精确字节区间就传 strict=true；要按行编辑请用 read_text_lines",
+        description = "按字节读文本片段(offset/length≥1，默认最多 10MB)。返回头: 路径|编码(BOM)|大小|sha256|区间；默认会为字符边界微调区间(会标注)，要精确字节区间用 strict=true。按行编辑请用 read_text_lines",
         annotations(title = "读取文本文件", read_only_hint = true)
     )]
     fn read_text_file(
@@ -3140,7 +3138,7 @@ impl FileIoServer {
     /// 读取二进制文件，返回HEX dump
     #[tool(
         name = "read_binary_file",
-        description = "读二进制 HEX dump(偏移+十六进制+ASCII)，offset/length 截取。返回头含 sha256",
+        description = "读二进制 HEX dump(偏移+十六进制+ASCII)，offset/length 截取(单次最多 4MB，超出会标注截断)。返回头含 sha256",
         annotations(title = "读取二进制文件", read_only_hint = true)
     )]
     fn read_binary_file(
@@ -3246,8 +3244,8 @@ impl FileIoServer {
     /// 写入十六进制数据到二进制文件
     #[tool(
         name = "write_binary_file",
-        description = "按十六进制写二进制。mode=overwrite(默认)/append/insert(offset)/replace(offset+replace_length)。\
-replace/insert 的 offset 越界会直接报错（不再静默截断）；建议传 expected_hex 校验待改位置的原始字节（offset 算错时兜底）；\
+        description = "按十六进制写二进制。mode=overwrite(默认)/append/insert(offset)/replace(offset+replace_length)；offset 越界报错。\
+expected_hex=写前校验待改范围原始字节(不能为空串)；\
 dry_run=true 只返回 HEX diff 预览不落盘",
         annotations(title = "写入二进制文件", destructive_hint = true)
     )]
@@ -3807,10 +3805,9 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
     /// 批量原子片段编辑：一次调用完成多处“精确文本 → 新文本”替换
     #[tool(
         name = "edit_file_sections",
-        description = "批量精确替换(一次调用改多处，默认全成或全不成)：edits=[{expected_old, content, occurrence?, start_line?}]。\
-expected_old 须与原文逐字符一致(含缩进/空行，读到的换行是 CRLF 也可写成 LF)且默认要求全文唯一；命中多处时用 occurrence 指定第几处，或用 start_line 声明它从第几行开始(行号算错时会直接告知实际行号)；\
-content 传空串=删除该片段；所有片段基于同一次快照定位，重叠会报错；支持 expected_sha256 防并发覆盖、dry_run 预览 diff。\
-（多处互不相邻的修改优先用它：比 edit_file_lines 少算行号、比 regex_replace 不需转义）",
+        description = "一次调用改多处(默认全成或全不成)：edits=[{expected_old, content, occurrence?, start_line?}]。\
+expected_old 须逐字符一致、默认全文唯一；多处时可用 occurrence 或 start_line(写错会回报实际行号)；content 空串=删除。\
+基于同一次快照定位、重叠报错；支持 expected_sha256 与 dry_run；返回头第二行给每处改动的行号",
         annotations(title = "批量片段编辑", destructive_hint = true)
     )]
     fn edit_file_sections(
@@ -3953,9 +3950,16 @@ content 传空串=删除该片段；所有片段基于同一次快照定位，�
                 };
                 match chosen {
                     Some((s, e)) => {
-                        // 记下该片段在**改动前**原文中的行区间，供返回头回报落点
+                        // 记下该片段在**改动前**原文中的行区间，供返回头回报落点。
+                        // 结束行只能用“匹配文本里的换行数”推算：不能用 e-1（多字节字符的
+                        // 最后一个字节不在字符边界上，切片会 panic）。
                         let line_from = Self::line_of(&hay, s);
-                        let line_to = Self::line_of(&hay, e.saturating_sub(1).max(s));
+                        let nl = hay[s..e].matches('\n').count();
+                        let line_to = if nl > 0 && hay.as_bytes()[e - 1] == b'\n' {
+                            line_from + nl - 1
+                        } else {
+                            line_from + nl
+                        };
                         planned.push(PlannedSection {
                             start: s,
                             end: e,
@@ -4085,7 +4089,7 @@ content 传空串=删除该片段；所有片段基于同一次快照定位，�
     /// 正则替换文件文本
     #[tool(
         name = "regex_replace",
-        description = "正则替换(支持 $1/$2 捕获组)；只想做纯文本替换就传 literal=true（免转义、$ 按字面量）。max_matches 必填=预期最多替换几处，实际超出即拒绝(防正则过宽误伤)；global 默认 true；dry_run=true 只看 diff",
+        description = "正则替换(支持$1/$2)；literal=true=纯文本替换(免转义、$按字面)。max_matches 必填=预期最多替换几处，超出即拒绝；global 默认 true；dry_run=true 只看 diff",
         annotations(title = "正则替换", destructive_hint = true)
     )]
     fn regex_replace(
@@ -4463,7 +4467,7 @@ content 传空串=删除该片段；所有片段基于同一次快照定位，�
     /// 获取文件元信息（大小、类型、修改时间、SHA256）
     #[tool(
         name = "file_info",
-        description = "文件/目录元信息：路径|类型|大小|mtime(秒)|sha256。sha256 与读工具同源，可直接当 expected_sha256 用",
+        description = "文件/目录元信息：路径|类型|大小|mtime(秒)|sha256|lines(文本行数)。sha256 与读工具同源，可直接当 expected_sha256",
         annotations(title = "获取文件信息", read_only_hint = true)
     )]
     fn file_info(
@@ -4744,8 +4748,8 @@ content 传空串=删除该片段；所有片段基于同一次快照定位，�
     ) -> Result<String, McpError> {
         let method = params.method.as_deref().unwrap_or("GET").to_uppercase();
         // timeout=0 会被 reqwest 当成“立即超时”，这里回退到默认 30 秒，避免误传 0 导致请求必然失败
-        let timeout_secs = match params.timeout.unwrap_or(30) {
-            0 => 30,
+        let timeout_secs = match params.timeout.unwrap_or(15) {
+            0 => 15,
             n => n,
         };
         let response_type = params.response_type.as_deref().unwrap_or("text");

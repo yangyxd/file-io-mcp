@@ -528,7 +528,7 @@ D:\proj\src\b.rs | sha256:9f8e7d6c5b4a3210 | enc:GBK | 1 matches
 | `headers` | object | 否 | 请求头 |
 | `body` | string | 否 | 请求体（POST/PUT/PATCH） |
 | `response_type` | string | 否 | `text`(默认) / `json`(格式化) / `binary`(HEX) |
-| `timeout` | u64 | 否 | 超时秒数，默认 30 |
+| `timeout` | u64 | 否 | 超时秒数，默认 15（传 0 也按 15 处理） |
 
 > 文本响应超过 100KB 会按**字符边界**截断并标注总大小。
 
