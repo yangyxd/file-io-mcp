@@ -1013,14 +1013,16 @@ impl FileIoServer {
             &encoding_rs::Encoding::for_label(b"gbk").unwrap().decode(sample).0,
         );
 
-        // 结构合法的 UTF-8 是强信号：与 GBK 分数接近（差<=0.02）时优先 UTF-8，
-        // 避免“UTF-8 中文被 GBK 解成另一批汉字”导致误判。真正的 GBK 冲突样本分差远大于此阈值。
-        let (best, best_score) = if s_utf8.is_finite() && s_gbk <= s_utf8 + 0.02 {
-            ("utf-8", s_utf8)
-        } else if s_gbk > s_utf8 {
-            ("gbk", s_gbk)
+        // 结构合法的 UTF-8 是强信号：只要 UTF-8 全量校验通过、且打分不低于 GBK（允许 GBK 领先 <=0.02 的
+        // 噪声），就判 UTF-8 并且**高置信**。
+        // 不能再用“两候选分数差足够大”当作确定性条件——像纯 ASCII 占多数的 UTF-8 源码，
+        // 用 GBK 解同样通顺，两者打分都接近 1.0、差距极小，会被误报为“编码识别不确定”。
+        // 只有 GBK 分数明显更高（领先 >0.02）时才考虑 GBK，且领先 >=0.1 才算高置信。
+        let (best, best_score, confident) = if s_utf8.is_finite() && s_gbk <= s_utf8 + 0.02 {
+            ("utf-8", s_utf8, true)
         } else {
-            ("utf-8", s_utf8)
+            // 走到这里说明 s_gbk > s_utf8（含 s_utf8 为负无穷，即非法 UTF-8）
+            ("gbk", s_gbk, s_gbk - s_utf8 >= 0.1)
         };
 
         // 两个候选都不像正常文本时，再试其他 CJK 编码，取分最高的一个（置信度标低）。
@@ -1038,13 +1040,7 @@ impl FileIoServer {
             return (alt.0, false);
         }
 
-        // 置信度：分数够高，且与另一候选差距明显
-        let gap = if s_utf8.is_infinite() || s_gbk.is_infinite() {
-            1.0
-        } else {
-            (s_utf8 - s_gbk).abs()
-        };
-        (best, best_score >= 0.85 && gap >= 0.1)
+        (best, confident)
     }
 
     /// 解码后的文本"像不像中文文本"的打分（0.0~1.0）：
