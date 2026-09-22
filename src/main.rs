@@ -819,19 +819,22 @@ impl FileIoServer {
             // UTF-16 按 2 字节对齐、UTF-32 按 4 字节对齐（不校验代理项对，够用且不会误拒绝）
             "utf-16le" | "utf-16be" => off % 2 == 0,
             "utf-32le" | "utf-32be" => off % 4 == 0,
-            // GBK/Big5 等双字节编码：从最近的 ASCII 字节起逐字符前进，看能否正好停在 off
+            // GBK/Big5 等双字节编码：从文件头按"ASCII 单字节 / 双字节字符"逐字符推进，
+            // 看能否正好停在 off。
+            // 不能从"最近的 ASCII 字节"起步：GBK 双字节的第二字节也可能落在 ASCII 范围
+            // （0x40-0x7E），会把字符内部误当成边界，从而在字符中间插入、切断多字节字符。
             _ => {
-                let mut start = off;
-                while start > 0 && off - start < 8 && bytes[start] >= 0x80 {
-                    start -= 1;
-                }
-                if bytes[start] >= 0x80 {
-                    // 起点仍落在多字节字符中间，无法可靠判定 → 放行（宁可不拦也不错拦）
-                    return true;
-                }
-                let mut pos = start;
+                let mut pos = 0usize;
                 while pos < off {
-                    pos += if bytes[pos] < 0x80 { 1 } else { 2 };
+                    let b = bytes[pos];
+                    if b < 0x80 {
+                        pos += 1;
+                    } else if (0x81..=0xFE).contains(&b) {
+                        pos += 2;
+                    } else {
+                        // 非法/孤立字节，无法可靠判定 → 放行（宁可不拦也不错拦）
+                        return true;
+                    }
                 }
                 pos == off
             }
@@ -1630,7 +1633,7 @@ impl FileIoServer {
                         .and_then(|e| e.to_str())
                         .map(|e| e.to_lowercase())
                         .unwrap_or_default();
-                    if !ext_filter.iter().any(|e| *e == file_ext) {
+                    if !ext_filter.contains(&file_ext) {
                         stat.filtered += 1;
                         continue;
                     }
@@ -1905,6 +1908,34 @@ impl FileIoServer {
             params.encoding.as_deref(),
             existing_bytes.as_deref(),
         )?;
+
+        // 编码自洽性校验（仅走自动识别的路径）：若判定出的编码根本无法无损解码现有文件，
+        // 说明编码识别不可靠（典型：GBK 文件被误判成 UTF-8），此时无论 overwrite/append/insert
+        // 继续写都可能把文件毁成另一种编码或混合编码乱码，直接拒绝并要求显式指定 encoding。
+        // 显式指定 encoding 时由 resolve_write_encoding 保证与原文件一致，无需重复校验。
+        let enc_explicit = params
+            .encoding
+            .as_deref()
+            .map(|n| !n.eq_ignore_ascii_case("auto"))
+            .unwrap_or(false);
+        if !enc_explicit {
+            if let Some(b) = existing_bytes.as_deref() {
+                let lossless = matches!(
+                    Self::decode_file(b, encoding_name),
+                    Ok(ft) if !ft.has_invalid
+                );
+                if !lossless {
+                    return Err(e_param(
+                        format!(
+                            "自动识别的编码 [{}] 无法无损解码现有文件，编码判定不可靠，拒绝写入以免把文件写成乱码。\
+                             请先用 read_text_file 确认真实编码，再显式传入 encoding 重新调用",
+                            encoding_name
+                        ),
+                        None,
+                    ));
+                }
+            }
+        }
 
         // 按指定编码将内容转换为字节（不含 BOM；BOM 仅 overwrite 时补在文件头）
         let bytes: Vec<u8> = Self::encode_content(encoding_name, &params.content)
@@ -2464,7 +2495,7 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
         let skip_hidden = params.skip_hidden.unwrap_or(true);
         // 默认 regex（保持既有行为）；literal 时把 pattern 当普通文本
         let literal = match params.mode.as_deref() {
-            None => false,
+            None | Some("") => false,
             Some(m) if m.eq_ignore_ascii_case("literal") => true,
             Some(m) if m.eq_ignore_ascii_case("regex") => false,
             Some(m) => {
@@ -2474,9 +2505,16 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
                 ))
             }
         };
+        // 空 pattern 会匹配每行的每个位置（产生大量无意义命中），直接拒绝
+        if params.pattern.is_empty() {
+            return Err(e_param(
+                "pattern 不能为空；请给出要搜索的文本或正则".to_string(),
+                None,
+            ));
+        }
         // 默认 auto：与 read_text_file 一致，逐文件自动识别编码（可区分 GBK/UTF-8）
         let encoding_raw = params.encoding.as_deref();
-        let encoding_auto = encoding_raw.map_or(true, |e| e.eq_ignore_ascii_case("auto"));
+        let encoding_auto = encoding_raw.is_none_or(|e| e.eq_ignore_ascii_case("auto"));
 
         // literal 模式转义正则元字符：AI 常直接传含 . * [ 的普通文本，避免被当正则误匹配
         let pattern_str = if literal {
@@ -3152,6 +3190,18 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
         };
         let path = std::path::Path::new(&params.path);
 
+        // 与该文件的写操作互斥，避免"边写边删"
+        let lock = self.lock_for(&params.path);
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+
+        if !path.exists() {
+            return Ok(format!("文件不存在: {}", params.path));
+        }
+
+        if !path.is_file() {
+            return Ok(format!("路径不是普通文件，无法删除: {}", params.path));
+        }
+
         // 删除不可逆：必须显式确认，未传 confirm=true 时只回报信息（含大小与指纹）供调用方判断
         if params.confirm != Some(true) {
             let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
@@ -3166,18 +3216,6 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
                 ),
                 None,
             ));
-        }
-
-        // 与该文件的写操作互斥，避免"边写边删"
-        let lock = self.lock_for(&params.path);
-        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-
-        if !path.exists() {
-            return Ok(format!("文件不存在: {}", params.path));
-        }
-
-        if !path.is_file() {
-            return Ok(format!("路径不是普通文件，无法删除: {}", params.path));
         }
 
         let size = fs::metadata(path)
