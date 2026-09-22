@@ -210,7 +210,7 @@ struct ReadBinaryFileParams {
     path: String,
     /// 起始字节偏移，默认 0
     offset: Option<u64>,
-    /// 读取字节数，默认到末尾
+    /// 读取字节数，默认到末尾；单次最多 dump 4MB（超出会截断并在返回头标注 ⚠️已截断）
     length: Option<usize>,
 }
 
@@ -218,7 +218,8 @@ struct ReadBinaryFileParams {
 struct WriteBinaryFileParams {
     /// 文件路径
     path: String,
-    /// 十六进制数据，如 "48656C6C6F"（可带 0x 前缀）
+    /// 十六进制数据，如 "48656C6C6F"（可带 0x 前缀与空格/冒号等分隔符）；
+    /// 空串 = 0 字节：仅 replace 可用于删除字节，overwrite 需配 confirm=true
     hex_data: String,
     /// 模式：overwrite(默认)/append/insert/replace
     mode: Option<String>,
@@ -234,6 +235,8 @@ struct WriteBinaryFileParams {
     expected_sha256: Option<String>,
     /// true=只返回 HEX diff 预览与预计指纹，不写文件
     dry_run: Option<bool>,
+    /// 显式确认：hex_data 为空时 overwrite 会把文件清空为 0 字节，必须传 true 才执行
+    confirm: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -592,37 +595,70 @@ impl FileIoServer {
     }
 
     /// 校验并解析路径，确保不超出 root 沙箱（若配置了 root）。
-    /// 返回可用于实际文件系统操作的标准化路径字符串。
+    /// 返回值同时用于**文件系统操作**与**回显**，因此要求：
+    /// 1) 稳定：同一文件的各种写法（相对/绝对/含 `..`/大小写不同）映射到同一字符串，
+    ///    否则锁键与备份分区会分裂（备份 key 另见 `backup_path_key`，它按绝对形式再归一一次）；
+    /// 2) 可读：在**当前目录之下**的文件回显相对路径（如 `src\main.rs`），
+    ///    其余回显去掉 `\\?\` 的绝对路径（`\\?\F:\a` → `F:\a`）。
+    /// 相对写法必须以当前目录为基准——文件系统层就是这样解析相对路径的；
+    /// 若改用别的基准（如沙箱 root）回显，回显出的相对路径会被写到别处。
     fn resolve_path(&self, path: &str) -> Result<String, McpError> {
+        let cwd = std::env::current_dir()
+            .map_err(|e| e_internal(format!("无法获取当前目录: {}", e), None))?;
+
         let p = std::path::Path::new(path);
         let abs = if p.is_absolute() {
             p.to_path_buf()
         } else {
-            std::env::current_dir()
-                .map_err(|e| e_internal(format!("无法获取当前目录: {}", e), None))?
-                .join(p)
-        };
-
-        let root = match &self.root {
-            None => return Ok(abs.to_string_lossy().into_owned()),
-            Some(r) => r,
+            cwd.join(p)
         };
 
         // 先解析为"尽量真实"的路径：最长存在前缀由 OS canonicalize（统一大小写、展开 8.3 短名、
         // 解析符号链接/junction），不存在的尾部按普通段原样拼接；无法安全解析时退回文本规范化。
         // 这样"根目录内但写法不同"的路径不会被子串比较误拒，而越界/链接逃逸仍会被拦下。
         let resolved = Self::resolve_existing_prefix(&abs);
-        if !Self::sandbox_within(&resolved, root) {
-            return Err(e_param(
-                format!(
-                    "路径超出允许的根目录: {} (根目录: {})",
-                    path,
-                    root.display()
-                ),
-                None,
-            ));
+
+        if let Some(r) = &self.root {
+            if !Self::sandbox_within(&resolved, r) {
+                return Err(e_param(
+                    format!(
+                        "路径超出允许的根目录: {} (根目录: {})",
+                        path,
+                        r.display()
+                    ),
+                    None,
+                ));
+            }
         }
-        Ok(resolved.to_string_lossy().into_owned())
+
+        Ok(Self::display_path(&resolved, &cwd))
+    }
+
+    /// 去掉 Windows 扩展长度前缀：`\\?\F:\a` → `F:\a`、`\\?\UNC\srv\share\a` → `\\srv\share\a`。
+    /// `\\?\` 形式可读性差，会禁用后续路径规范化，不适合回显给调用方。
+    fn strip_verbatim_prefix(p: &std::path::Path) -> std::path::PathBuf {
+        let s = p.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return std::path::PathBuf::from(format!(r"\\{}", rest));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return std::path::PathBuf::from(rest);
+        }
+        p.to_path_buf()
+    }
+
+    /// 生成回显路径：位于 base（当前目录）之下时返回相对写法，否则返回去掉 `\\?\` 的绝对路径。
+    /// base 必须是当前目录，这样调用方把回显的相对路径再传回来时能被正确解析。
+    /// 入参须是已规范化的绝对路径（不含 `.`/`..`）。
+    fn display_path(resolved: &std::path::Path, base: &std::path::Path) -> String {
+        let plain = Self::strip_verbatim_prefix(resolved);
+        let base_plain = Self::strip_verbatim_prefix(base);
+        match plain.strip_prefix(&base_plain) {
+            // 就是基准目录本身
+            Ok(rel) if rel.as_os_str().is_empty() => ".".to_string(),
+            Ok(rel) => rel.to_string_lossy().into_owned(),
+            Err(_) => plain.to_string_lossy().into_owned(),
+        }
     }
 
     /// 判断 IO 错误是否为“跨设备/跨卷”（Windows ERROR_NOT_SAME_DEVICE=17，Unix EXDEV=18），
@@ -673,7 +709,9 @@ impl FileIoServer {
         window_truncated: bool,
         window: &[u8],
     ) -> Result<Vec<u8>, String> {
-        if window_start == 0 && !window_truncated {
+        // window 非空才算“本次窗口就是完整文件”；否则（如 length=0）空样本会被识别成 utf-8，
+        // 让 GBK 文件也被报成 utf-8。
+        if window_start == 0 && !window_truncated && !window.is_empty() {
             return Ok(window.to_vec());
         }
         let size = fs::metadata(path)
@@ -1115,6 +1153,8 @@ impl FileIoServer {
             // UTF-16 按 2 字节对齐、UTF-32 按 4 字节对齐（不校验代理项对，够用且不会误拒绝）
             "utf-16le" | "utf-16be" => off % 2 == 0,
             "utf-32le" | "utf-32be" => off % 4 == 0,
+            // 单字节编码（iso-8859-1/latin1、windows-125x、koi8-r 等）：任何偏移都是字符边界
+            n if Self::is_single_byte_encoding(n) => true,
             // GBK/Big5 等双字节编码：从文件头按"ASCII 单字节 / 双字节字符"逐字符推进，
             // 看能否正好停在 off。
             // 不能从"最近的 ASCII 字节"起步：GBK 双字节的第二字节也可能落在 ASCII 范围
@@ -1174,6 +1214,8 @@ impl FileIoServer {
                 }
                 off
             }
+            // 单字节编码：每个字节就是一个字符，边界就是 off 本身
+            n if Self::is_single_byte_encoding(n) => off,
             _ => {
                 // GBK/Big5/GB18030 等：边界必须从文件头逐字符推进才能判定（O(off)）。
                 // 偏移过大时不值得为此整读前缀，原样返回；否则读 [0, off+4) 后推进，
@@ -1233,6 +1275,15 @@ impl FileIoServer {
             return Some(pos + 2);
         }
         None
+    }
+
+    /// 是否为单字节编码（iso-8859-1/latin1、windows-125x、koi8-r、macintosh 等）。
+    /// 这类编码每个字节就是一个字符，任何偏移都是字符边界；
+    /// 若误按 GBK 的双字节规则对齐，会把 offset=1 这种合法位置回退到 0（内容与定位都错）。
+    fn is_single_byte_encoding(name: &str) -> bool {
+        Self::get_encoding(name)
+            .map(|e| e.is_single_byte())
+            .unwrap_or(false)
     }
 
     /// 从文件开头统计到 `upto` 字节为止的换行数（分块读取，避免为大偏移分配整段前缀）。
@@ -1636,10 +1687,23 @@ impl FileIoServer {
             .join(BACKUP_DIR_NAME)
     }
 
-    /// 备份 key 归一化：同一文件无论路径来自 canonicalize（Windows 上带 \\?\ 前缀、反斜杠）
-    /// 还是普通拼接（正斜杠），都必须得到同一个 key，否则备份会找不回来。
+    /// 备份 key 归一化：必须先转成**规范化绝对路径**再归一，原因有二：
+    /// 1) resolve_path 现在回显相对路径，直接对相对路径取 key 会让同一文件的相对/绝对写法
+    ///    落到不同备份分区（manage_backups/undo 就会找不到）；
+    /// 2) 历史版本的 key 就是"绝对路径去 \\?\ 前缀（Windows 下再小写）"，保持一致才能继续找到旧备份。
     fn backup_path_key(path: &str) -> String {
-        let s = path.replace('/', "\\");
+        let p = std::path::Path::new(path);
+        let abs = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            match std::env::current_dir() {
+                Ok(cwd) => cwd.join(p),
+                Err(_) => p.to_path_buf(),
+            }
+        };
+        let s = Self::resolve_existing_prefix(&abs)
+            .to_string_lossy()
+            .replace('/', "\\");
         let s = s.strip_prefix(r"\\?\").unwrap_or(&s).to_string();
         if cfg!(windows) {
             s.to_lowercase()
@@ -2215,13 +2279,15 @@ impl FileIoServer {
             let detected = Self::detect_encoding(&bytes);
             // 自动识别的编码若仍有非法字节，退化为宽松解码（U+FFFD 替换）而不是跳过整个文件，
             // 以免目录搜索漏文件；显式指定 encoding 时仍严格报错。
-            let content = match Self::decode_bytes(&bytes, detected) {
-                Ok(s) => s,
-                Err(_) => {
-                    let enc = Self::get_encoding(detected)
-                        .map_err(|e| format!("按 {} 解码失败({})", detected, e))?;
-                    enc.decode(&bytes).0.into_owned()
-                }
+            // 统一走 decode_file：UTF-16/UTF-32 由内置实现处理（encoding_rs 不支持 UTF-32），
+            // 并顺带剥掉 BOM，避免 BOM 字符混进搜索结果。
+            let content = match Self::decode_file(&bytes, detected) {
+                Ok(ft) => ft.content,
+                // 宽松兜底：编码不在 encoding_rs 里或含非法字节时用替换式解码，避免整份文件被跳过
+                Err(_) => match Self::get_encoding(detected) {
+                    Ok(enc) => enc.decode(&bytes).0.into_owned(),
+                    Err(_) => String::from_utf8_lossy(&bytes).into_owned(),
+                },
             };
             Ok((detected.to_string(), content, bytes))
         } else {
@@ -2235,8 +2301,10 @@ impl FileIoServer {
                     ),
                 }
             } else {
-                let content = Self::decode_bytes(&bytes, name)
-                    .map_err(|e| format!("按 {} 解码失败({})", name, e))?;
+                // 同样走 decode_file：显式指定 utf-16/utf-32 也能搜索
+                let content = Self::decode_file(&bytes, name)
+                    .map_err(|e| format!("按 {} 解码失败({})", name, e))?
+                    .content;
                 Ok((name.to_string(), content, bytes))
             }
         }
@@ -2321,9 +2389,12 @@ impl FileIoServer {
                 .map_err(|e| e_internal(e, None))?;
             Self::detect_encoding_with_confidence(&probe)
         } else {
-            let enc = Self::get_encoding(requested_enc.unwrap_or("utf-8"))
-                .map_err(|e| e_param(e, None))?;
-            (enc.name(), true)
+            // 走 canonical_encoding：UTF-32 不在 encoding_rs 里，显式指定时也必须能通过
+            (
+                Self::canonical_encoding(requested_enc.unwrap_or("utf-8"))
+                    .map_err(|e| e_param(e, None))?,
+                true,
+            )
         };
         // offset 可能落在多字节字符中间（按 read_len 分页时几乎必然如此）。向下取整到字符边界，
         // 否则从“半个字符”开始解码会得到非法字节错误，导致分页读 UTF-8 文件从第二页起必然失败。
@@ -2466,10 +2537,11 @@ impl FileIoServer {
         };
 
         // 版本指纹（供后续写入时作为 expected_sha256 回传，防止并发改动被覆盖）。
-        // 大文件用采样指纹，避免"只读一小段却要把整个大文件再读一遍算 sha"；
-        // 本次已完整读取整个文件时（offset=0 且未截断）可直接复用 buffer，连采样读盘也省掉。
+        // 大文件用采样指纹，避免"只读一小段却要把整个大文件再读一遍算 sha"。
+        // 判据必须是“buffer 确实覆盖了整文件”，不能用 !truncated：length=0 时 truncated 为 false
+        // 但 buffer 为空，会把空串哈希当成文件指纹（AI 回传后必然 E_EXTERNAL_CHANGED 假报错）。
         // 注意：必须用完整 buffer（含 BOM），不能用剥离 BOM 后的 body，否则指纹与实际文件不符。
-        let sha = if start == 0 && !truncated {
+        let sha = if start == 0 && buffer.len() as u64 == file_size {
             Self::fingerprint_short_of_bytes(&buffer)
         } else {
             Self::path_fingerprint_short(&params.path)
@@ -2996,7 +3068,7 @@ impl FileIoServer {
             hex_dump.push_str("|\n");
         }
 
-        // 本次读取覆盖整个文件时（offset=0 且未截断）可直接复用已读 buffer 算指纹，
+        // 本次读取覆盖整个文件时（offset=0 且读满）可直接复用已读 buffer 算指纹，
         // 省掉 path_fingerprint_short 的重新读盘；部分读取时仍需按路径读盘。
         let sha = if start == 0 && read_len as u64 == file_size {
             Self::fingerprint_short_of_bytes(&buffer)
@@ -3004,13 +3076,24 @@ impl FileIoServer {
             Self::path_fingerprint_short(&params.path)
         };
 
+        // 4MB 硬上限造成的截断必须显式告知，否则调用方会按返回长度误判文件大小
+        let trunc_warn = if (read_len as u64) < remaining as u64 {
+            format!(
+                " ⚠️已截断: 文件共 {}B（offset {} 起剩余 {}B），单次最多 dump {}B；请用 offset 分页读取剩余部分",
+                file_size, start, remaining, MAX_BINARY_DUMP_LIMIT
+            )
+        } else {
+            String::new()
+        };
+
         Ok(format!(
-            "{} | {}B | sha256:{} | [{},{})```\n{}```",
+            "{} | {}B | sha256:{} | [{},{}){}```\n{}```",
             params.path,
             file_size,
             sha,
             start,
             start + read_len as u64,
+            trunc_warn,
             hex_dump
         ))
     }
@@ -3041,14 +3124,33 @@ dry_run=true 只返回 HEX diff 预览不落盘",
         }
         let dry_run = params.dry_run.unwrap_or(false);
         // 与 expected_hex 使用同一套宽松解析：支持 0x/0X 前缀与空格/冒号等分隔符。
-        // 空内容 = 0 字节：replace 可用于“删除字节”，但 overwrite 会把文件清空，故要求显式确认。
+        // 空内容 = 0 字节：只有 replace 天然需要“删除字节”语义，其余模式多为笔误
         let bytes = Self::parse_hex_flexible(&params.hex_data)
             .map_err(|e| e_param(format!("hex_data 解析失败: {}", e), None))?;
-        if bytes.is_empty() && mode == "overwrite" && params.expected_hex.is_none() {
-            return Err(e_param(
-                "hex_data 为空，overwrite 会把文件清空为 0 字节。确需清空请显式传 expected_hex 作为确认；只是要删除部分字节请改用 mode=replace + replace_length",
-                None,
-            ));
+        if bytes.is_empty() {
+            match mode {
+                // replace 用空内容删除字节，属正常用法
+                "replace" => {}
+                "overwrite" => {
+                    // overwrite 会把文件清空为 0 字节，必须显式确认（expected_hex 是 OCC 校验，
+                    // 在 overwrite 下需要贴出全文 hex 才能通过，不适合当确认开关）
+                    if !params.confirm.unwrap_or(false) {
+                        return Err(e_param(
+                            "hex_data 为空，overwrite 会把文件清空为 0 字节。确需清空请传 confirm=true",
+                            None,
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(e_param(
+                        format!(
+                            "hex_data 为空，mode={} 下不会改动任何内容（静默空操作）。请提供要写入的 HEX；若确实不想写入，跳过本次调用即可",
+                            mode
+                        ),
+                        None,
+                    ));
+                }
+            }
         }
 
         // 自动创建父目录

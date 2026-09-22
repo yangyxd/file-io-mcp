@@ -37,7 +37,9 @@
 - **GBK 与 UTF-8 可靠区分**：大量 GBK 汉字的字节序列恰好也是合法 UTF-8（如 `隆` = `C2 A1`），仅凭"是否合法 UTF-8"会把 GBK 文件误判成 UTF-8 并写出乱码。因此工具会对两种候选分别解码并做"像不像中文文本"打分，取分数高者；两者接近时判定为**低置信度**并在返回头提示（建议显式指定 `encoding`）。
 - **换行风格**：写入按文件的主换行风格（CRLF/LF 多数派）统一，避免出现混合换行。
 - **非法字节保护**：解码时出现 `U+FFFD` 替换（内容已损坏）时**拒绝写回**，避免原字节被永久破坏。
-- **支持的编码**：`utf-8`、`gbk`/`gb18030`、`big5`、`shift_jis`、`euc-jp`、`euc-kr`、`utf-16le`、`utf-16be`、`iso-8859-1` 等（UTF-32 仅能识别，不支持编解码）。
+- **支持的编码**：`utf-8`、`gbk`/`gb18030`、`big5`、`shift_jis`、`euc-jp`、`euc-kr`、`utf-16le`、`utf-16be`、`utf-32le`、`utf-32be`、`iso-8859-1`（含 `windows-125x`）等；UTF-16/UTF-32 由内置编解码实现（`encoding_rs` 不支持 UTF-32），读取、写入与搜索均已支持。
+- **单次读取上限**：`read_text_file` 与 `read_text_lines` 最多 64MB（更大文件请用 `read_text_file` 的 offset/length 分页）、`read_binary_file` 单次最多 dump 4MB、`fetch` 响应体最多 8MB；被上限截断时返回头会标注 `⚠️已截断`。
+- **路径回显**：路径回显为**相对服务进程当前目录**的写法（如 `src\main.rs`，不再出现 Windows 的 `\\?\` 前缀）；在当前目录之外时回显普通绝对路径（如 `F:\data\x.txt`）。相对入参也以当前目录为基准解析，故回显的路径可直接回传。备份与锁按绝对路径归一，同一文件的相对/绝对/大小写写法不会分裂成两份。想让回显更简短，就把启动时的当前目录设为实际要操作的项目目录。
 
 ### 2. 文件指纹（`sha256`）与并发写入
 
@@ -135,7 +137,7 @@ cargo run                          # 开发
 
 沙箱判定说明：
 
-- 越界路径一律拒绝（`E_TOO_LARGE 路径超出允许的根目录`），包括 `..` 上跳、以及经符号链接 / junction 指向根目录之外的路径（会先解析真实路径再比对）。
+- 越界路径一律拒绝（`E_NO_PERMISSION 路径超出允许的根目录`），包括 `..` 上跳、以及经符号链接 / junction 指向根目录之外的路径（会先解析真实路径再比对）；同前缀的兄弟目录（如根 `C:\data` 与 `C:\data-evil`）也会被正确拦截。
 - 路径**写法差异不影响判定**：大小写不同（`c:\proj` vs `C:\Proj`）、8.3 短名（`PROJEC~1`）、`sub/..` 等都会被规范化后再比较；新建文件（目标尚不存在）会定位到最近的存在祖先，因此也能通过小写盘符 / 短名路径创建。
 - 返回值统一为解析后的规范绝对路径（`\\?\C:\...` 形式），同一文件的不同写法会得到同一条字符串，备份分区与指纹不会因此分裂。
 | `FILE_IO_BACKUP_DIR` | 可选。备份根目录，默认 `<exe 所在目录>/.file-io-mcp-backups` |
@@ -319,7 +321,7 @@ src/main.rs | utf-8 | 4096B | 120 lines total | sha256:8f3a1c02d94b7e15 | [10-15
 |------|------|------|------|
 | `path` | string | 是 | 文件路径 |
 | `offset` | u64 | 否 | 起始字节偏移，默认 0 |
-| `length` | usize | 否 | 读取字节数，默认到末尾 |
+| `length` | usize | 否 | 读取字节数，默认到末尾；单次最多 dump 4MB，超出会截断并在返回头标注 `⚠️已截断`（可用 offset 分页读剩余） |
 
 ### write_binary_file
 
@@ -328,13 +330,14 @@ src/main.rs | utf-8 | 4096B | 120 lines total | sha256:8f3a1c02d94b7e15 | [10-15
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `path` | string | 是 | 文件路径 |
-| `hex_data` | string | 是 | 十六进制数据，如 `"48656C6C6F"` 或 `"0x48656C6C6F"` |
+| `hex_data` | string | 是 | 十六进制数据，如 `"48656C6C6F"` 或 `"0x48656C6C6F"`，也接受空格/冒号/逗号等分隔符（与 `expected_hex` 同一套宽松解析）。空串 = 0 字节：仅 `replace` 可用于删除字节，`overwrite` 需配 `confirm=true`，`append`/`insert` 直接拒绝 |
 | `mode` | string | 否 | `overwrite`(默认) / `append` / `insert` / `replace` |
 | `offset` | u64 | 否 | insert 为插入位置，replace 为替换起始位置 |
 | `replace_length` | usize | 否 | replace 模式下被替换的字节数 |
 | `expected_hex` | string | 否 | **写前校验待改范围的原始字节**（HEX，可带 `0x` 与空格/冒号分隔，便于从 HEX dump 直接粘贴）。按 mode 取范围：`overwrite`=全文 / `append`=文件末尾 / `insert`=`offset` 起 / `replace`=`[offset, offset+replace_length)`；不符返回 `E_GUARD_MISMATCH` 并回显该范围的实际字节 |
 | `expected_sha256` | string | 否 | 上次读到的指纹（整文件级，防外部改动） |
 | `dry_run` | bool | 否 | true=只返回 HEX diff 预览与预计指纹，不写文件 |
+| `confirm` | bool | 否 | `hex_data` 为空且 `mode=overwrite`（会清空文件）时必须传 `true` 才执行 |
 
 ```json
 { "path": "data/file.bin", "hex_data": "0xFF01", "mode": "replace", "offset": 3, "replace_length": 4 }
@@ -458,7 +461,7 @@ D:\proj\src\b.rs | sha256:9f8e7d6c5b4a3210 | enc:GBK | 1 matches
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `sources` | string[] | 是 | 源文件路径列表 |
-| `target` | string | 是 | 目标：多文件时为目录；单文件时可指定新路径/文件名 |
+| `target` | string | 是 | 目标：多文件时为目录；单文件时视为新路径/文件名（目标不存在且不以 `/`、`\` 结尾），以分隔符结尾则视为目录 |
 | `overwrite` | bool | 否 | 覆盖已存在的目标，默认 false（存在则跳过） |
 
 ```json
@@ -471,7 +474,7 @@ D:\proj\src\b.rs | sha256:9f8e7d6c5b4a3210 | enc:GBK | 1 matches
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `sources` | string[] | 是 | 源文件路径列表 |
-| `target` | string | 是 | 目标：多文件时为目录；单文件时可指定新路径/文件名 |
+| `target` | string | 是 | 目标：多文件时为目录；单文件时视为新路径/文件名（目标不存在且不以 `/`、`\` 结尾），以分隔符结尾则视为目录 |
 | `overwrite` | bool | 否 | 覆盖已存在的目标，默认 false（存在则跳过） |
 
 ```json
