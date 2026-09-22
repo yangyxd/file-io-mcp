@@ -217,8 +217,14 @@ struct WriteBinaryFileParams {
     offset: Option<u64>,
     /// replace 模式下被替换的字节数
     replace_length: Option<usize>,
+    /// 期望的旧字节(HEX，可带 0x 前缀与空格/冒号分隔)。按 mode 校验"待改范围"：
+    /// overwrite=全文 / append=文件末尾 / insert=offset 起 / replace=[offset, offset+replace_length)；
+    /// 不符则拒绝写入并回显该位置的实际字节（防 offset 算错）
+    expected_hex: Option<String>,
     /// 读到的 sha256；文件已被改动则拒绝写入
     expected_sha256: Option<String>,
+    /// true=只返回 HEX diff 预览与预计指纹，不写文件
+    dry_run: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -632,6 +638,165 @@ impl FileIoServer {
             }
         }
         normalize_path(p)
+    }
+
+    /// 宽松解析 HEX 字符串：允许 0x 前缀与空格/冒号/逗号/短横线分隔（便于从 hex dump 直接粘贴）
+    fn parse_hex_flexible(s: &str) -> Result<Vec<u8>, String> {
+        let trimmed = s.trim();
+        let body = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+            .unwrap_or(trimmed);
+        let cleaned: String = body
+            .chars()
+            .filter(|c| !c.is_ascii_whitespace() && !matches!(c, ':' | ',' | '-' | '_'))
+            .collect();
+        if cleaned.is_empty() {
+            return Err("内容为空".to_string());
+        }
+        if !cleaned.len().is_multiple_of(2) {
+            return Err(format!(
+                "长度为 {} 个十六进制字符（奇数），每字节需要两位",
+                cleaned.len()
+            ));
+        }
+        let bad: String = cleaned
+            .chars()
+            .filter(|c| !c.is_ascii_hexdigit())
+            .collect();
+        if !bad.is_empty() {
+            return Err(format!("包含非法字符: [{}]，只允许 0-9, A-F, a-f", bad));
+        }
+        (0..cleaned.len())
+            .step_by(2)
+            .map(|i| {
+                u8::from_str_radix(&cleaned[i..i + 2], 16)
+                    .map_err(|e| format!("解析失败: {}", e))
+            })
+            .collect()
+    }
+
+    /// 取"待改范围"的实际字节 + 范围说明，用于 expected_hex 校验。
+    /// 刻意不做 clamp 补齐：越界时返回偏短/空切片，从而必然判定为不匹配。
+    fn binary_guard_range(
+        cur: &[u8],
+        mode: &str,
+        offset: Option<u64>,
+        replace_length: Option<usize>,
+        expect_len: usize,
+    ) -> (Vec<u8>, String) {
+        match mode {
+            "append" => {
+                let start = cur.len().saturating_sub(expect_len);
+                (cur[start..].to_vec(), "文件末尾(追加点)".to_string())
+            }
+            "insert" => {
+                let off = (offset.unwrap_or(0) as usize).min(cur.len());
+                let end = (off + expect_len).min(cur.len());
+                (cur[off..end].to_vec(), format!("插入点 offset={}", off))
+            }
+            "replace" => {
+                let off = offset.unwrap_or(0) as usize;
+                let len = replace_length.unwrap_or(0);
+                if off >= cur.len() {
+                    return (Vec::new(), format!("[{}..{}) 越界", off, off + len));
+                }
+                let end = (off + len).min(cur.len());
+                (cur[off..end].to_vec(), format!("[{}..{})", off, end))
+            }
+            _ => (cur.to_vec(), "整个文件".to_string()),
+        }
+    }
+
+    /// HEX 预览：空格分隔的大写字节，超长截断，避免大范围刷屏
+    fn hex_preview(bytes: &[u8]) -> String {
+        const MAX_SHOW: usize = 128;
+        if bytes.is_empty() {
+            return String::new();
+        }
+        let shown: Vec<String> = bytes
+            .iter()
+            .take(MAX_SHOW)
+            .map(|b| format!("{:02X}", b))
+            .collect();
+        if bytes.len() > MAX_SHOW {
+            format!(
+                "{} …（共 {} 字节，仅显示前 {} 字节）",
+                shown.join(" "),
+                bytes.len(),
+                MAX_SHOW
+            )
+        } else {
+            shown.join(" ")
+        }
+    }
+
+    /// dry_run 预览：只输出变更窗口（限长）+ 前后大小与指纹，不写文件
+    fn binary_dry_run_report(path: &str, old: &[u8], new: &[u8], action: &str) -> String {
+        const CTX: usize = 16;
+        const MAX_SHOW: usize = 256;
+        let max_len = old.len().max(new.len());
+        let mut first: Option<usize> = None;
+        let mut last = 0usize;
+        let mut changed = 0usize;
+        for i in 0..max_len {
+            if old.get(i) != new.get(i) {
+                if first.is_none() {
+                    first = Some(i);
+                }
+                last = i;
+                changed += 1;
+            }
+        }
+
+        let mut out = format!(
+            "[DRY-RUN] {} | {} | {}B→{}B | sha256:{}→{}\n未写入文件（去掉 dry_run 或传 dry_run=false 才执行）",
+            path,
+            action,
+            old.len(),
+            new.len(),
+            Self::fingerprint_short_of_bytes(old),
+            Self::fingerprint_short_of_bytes(new)
+        );
+
+        let Some(f) = first else {
+            out.push_str("\n内容无变化");
+            return out;
+        };
+
+        let win_start = f.saturating_sub(CTX);
+        let win_end = (last + 1 + CTX).min(max_len);
+        let show_end = (win_start + MAX_SHOW).min(win_end);
+        let take = |data: &[u8]| -> Vec<u8> {
+            let end = show_end.min(data.len());
+            if win_start >= end {
+                Vec::new()
+            } else {
+                data[win_start..end].to_vec()
+            }
+        };
+        out.push_str(&format!(
+            "\n差异窗口 [{}, {})：{} 字节不同{}",
+            win_start,
+            win_end,
+            changed,
+            if show_end < win_end {
+                format!("（窗口过长，仅显示前 {} 字节）", MAX_SHOW)
+            } else {
+                String::new()
+            }
+        ));
+        out.push_str(&format!(
+            "\n  旧 @{:08X}: {}",
+            win_start,
+            Self::hex_preview(&take(old))
+        ));
+        out.push_str(&format!(
+            "\n  新 @{:08X}: {}",
+            win_start,
+            Self::hex_preview(&take(new))
+        ));
+        out
     }
 
     /// 确保文件所在目录存在，不存在则自动创建
@@ -2335,7 +2500,9 @@ impl FileIoServer {
     /// 写入十六进制数据到二进制文件
     #[tool(
         name = "write_binary_file",
-        description = "按十六进制写二进制。mode=overwrite(默认)/append/insert(offset)/replace(offset+replace_length)",
+        description = "按十六进制写二进制。mode=overwrite(默认)/append/insert(offset)/replace(offset+replace_length)。\
+replace/insert 的 offset 越界会直接报错（不再静默截断）；建议传 expected_hex 校验待改位置的原始字节（offset 算错时兜底）；\
+dry_run=true 只返回 HEX diff 预览不落盘",
         annotations(title = "写入二进制文件", destructive_hint = true)
     )]
     fn write_binary_file(
@@ -2348,6 +2515,13 @@ impl FileIoServer {
             p
         };
         let mode = params.mode.as_deref().unwrap_or("overwrite");
+        if !matches!(mode, "overwrite" | "append" | "insert" | "replace") {
+            return Ok(format!(
+                "不支持的模式: {}，可选: overwrite, append, insert, replace",
+                mode
+            ));
+        }
+        let dry_run = params.dry_run.unwrap_or(false);
         // 兼容处理：去掉 0x 前缀
         let hex_str = params.hex_data.trim();
         let hex_str = if hex_str.starts_with("0x") {
@@ -2394,6 +2568,101 @@ impl FileIoServer {
         };
         Self::check_expected_sha(&params.path, &current, params.expected_sha256.as_deref())?;
 
+        // 写前比对"待改范围"的实际字节：二进制没有行号/锚点，offset 算错只能靠这个兜住
+        if let Some(exp_hex) = params.expected_hex.as_deref() {
+            let expected = Self::parse_hex_flexible(exp_hex)
+                .map_err(|e| e_param(format!("expected_hex 解析失败: {}", e), None))?;
+            let (actual, scope) = Self::binary_guard_range(
+                &current,
+                mode,
+                params.offset,
+                params.replace_length,
+                expected.len(),
+            );
+            if actual != expected {
+                return Err(e_param(
+                    format!(
+                        "expected_hex 校验不通过：待改范围的原始字节与期望不一致（offset/replace_length 可能算错）。\n\
+                         === 范围[{}]实际字节:\n{}\n=== 你给的期望字节:\n{}",
+                        scope,
+                        Self::hex_preview(&actual),
+                        Self::hex_preview(&expected)
+                    ),
+                    None,
+                ));
+            }
+        }
+
+        // 先算出"改后字节"：真实写入与 dry_run 预览共用同一套逻辑，避免两处不一致
+        let (new_data, action) = match mode {
+            "overwrite" => (bytes.clone(), format!("{}B", bytes.len())),
+            "append" => {
+                let mut v = current.clone();
+                v.extend_from_slice(&bytes);
+                (v, format!("+{}B append", bytes.len()))
+            }
+            "insert" => {
+                let off = params.offset.unwrap_or(0) as usize;
+                if off > current.len() {
+                    return Err(e_param(
+                        format!(
+                            "insert 的 offset={} 超出文件大小 {}B；请先用 read_binary_file 确认真实长度后重试",
+                            off,
+                            current.len()
+                        ),
+                        None,
+                    ));
+                }
+                let mut v = Vec::with_capacity(current.len() + bytes.len());
+                v.extend_from_slice(&current[..off]);
+                v.extend_from_slice(&bytes);
+                v.extend_from_slice(&current[off..]);
+                (v, format!("+{}B @{}", bytes.len(), off))
+            }
+            "replace" => {
+                let off = params.offset.unwrap_or(0) as usize;
+                let replace_len = params.replace_length.unwrap_or(0);
+                if off > current.len() {
+                    return Err(e_param(
+                        format!("replace 的 offset={} 超出文件大小 {}B", off, current.len()),
+                        None,
+                    ));
+                }
+                if off + replace_len > current.len() {
+                    return Err(e_param(
+                        format!(
+                            "replace 范围越界：offset={} + replace_length={} = {} 超出文件大小 {}B。\
+                             请核对偏移（可用 read_binary_file 查看真实内容），或调小 replace_length",
+                            off,
+                            replace_len,
+                            off + replace_len,
+                            current.len()
+                        ),
+                        None,
+                    ));
+                }
+                let end = off + replace_len;
+                let mut v = Vec::with_capacity(off + bytes.len() + (current.len() - end));
+                v.extend_from_slice(&current[..off]);
+                v.extend_from_slice(&bytes);
+                v.extend_from_slice(&current[end..]);
+                (v, format!("{}B→{}B @{}", replace_len, bytes.len(), off))
+            }
+            other => {
+                return Err(e_param(format!("不支持的模式: {}", other), None));
+            }
+        };
+
+        // dry_run：只返回 diff 预览，不落盘
+        if dry_run {
+            return Ok(Self::binary_dry_run_report(
+                &params.path,
+                &current,
+                &new_data,
+                &action,
+            ));
+        }
+
         match mode {
             "overwrite" => {
                 let bak = Self::backup_before_write(
@@ -2401,17 +2670,17 @@ impl FileIoServer {
                     "write_binary_file:overwrite",
                     Some(&current),
                 );
-                Self::atomic_write_ex(&params.path, &bytes, bak.as_ref().map(|b| b.bak.as_path()))
+                Self::atomic_write_ex(&params.path, &new_data, bak.as_ref().map(|b| b.bak.as_path()))
                     .map_err(|e| e_internal(format!("E_WRITE 写入失败: {}", e), None))?;
                 let mut tail = String::new();
                 if let Some(h) = &bak {
-                    Self::finish_backup(h, &bytes);
+                    Self::finish_backup(h, &new_data);
                     tail = " | undoable".to_string();
                 }
-                Ok(format!("OK {} | {}B | sha256:{}{}", params.path, bytes.len(), Self::fingerprint_short_of_bytes(&bytes), tail))
+                Ok(format!("OK {} | {}B | sha256:{}{}", params.path, new_data.len(), Self::fingerprint_short_of_bytes(&new_data), tail))
             }
+            // 追加仍走 O_APPEND（避免大文件整份重写）；new_data 只用于指纹
             "append" => {
-                let mut full = current.clone();
                 retry_io(|| {
                     let mut file = OpenOptions::new()
                         .append(true)
@@ -2422,22 +2691,14 @@ impl FileIoServer {
                     Ok(())
                 })
                 .map_err(|e| e_internal(format!("E_WRITE 追加失败: {}", e), None))?;
-                full.extend_from_slice(&bytes);
-                Ok(format!("OK {} | +{}B append | sha256:{}", params.path, bytes.len(), Self::fingerprint_short_of_bytes(&full)))
+                Ok(format!("OK {} | +{}B append | sha256:{}", params.path, bytes.len(), Self::fingerprint_short_of_bytes(&new_data)))
             }
             "insert" => {
                 let off = params.offset.unwrap_or(0) as usize;
-                let original = current;
-                let off = off.min(original.len());
-                let mut new_data =
-                    Vec::with_capacity(original.len() + bytes.len());
-                new_data.extend_from_slice(&original[..off]);
-                new_data.extend_from_slice(&bytes);
-                new_data.extend_from_slice(&original[off..]);
                 let bak = Self::backup_before_write(
                     &params.path,
                     "write_binary_file:insert",
-                    Some(&original),
+                    Some(&current),
                 );
                 Self::atomic_write_ex(&params.path, &new_data, bak.as_ref().map(|b| b.bak.as_path())).map_err(|e| {
                     e_internal(format!("E_WRITE 插入写入失败: {}", e), None)
@@ -2452,28 +2713,10 @@ impl FileIoServer {
             "replace" => {
                 let off = params.offset.unwrap_or(0) as usize;
                 let replace_len = params.replace_length.unwrap_or(0);
-                let original = current;
-
-                if off > original.len() {
-                    return Ok(format!(
-                        "偏移量 {} 超出文件大小 {}",
-                        off, original.len()
-                    ));
-                }
-
-                let end = (off + replace_len).min(original.len());
-                let actual_replaced = end - off;
-
-                let mut new_data =
-                    Vec::with_capacity(off + bytes.len() + (original.len() - end));
-                new_data.extend_from_slice(&original[..off]);
-                new_data.extend_from_slice(&bytes);
-                new_data.extend_from_slice(&original[end..]);
-
                 let bak = Self::backup_before_write(
                     &params.path,
                     "write_binary_file:replace",
-                    Some(&original),
+                    Some(&current),
                 );
                 Self::atomic_write_ex(&params.path, &new_data, bak.as_ref().map(|b| b.bak.as_path())).map_err(|e| {
                     e_internal(format!("E_WRITE 替换写入失败: {}", e), None)
@@ -2487,7 +2730,7 @@ impl FileIoServer {
                 Ok(format!(
                     "OK {} | {}B→{}B @{} | {}B | sha256:{}{}",
                     params.path,
-                    actual_replaced,
+                    replace_len,
                     bytes.len(),
                     off,
                     new_data.len(),
@@ -2495,10 +2738,7 @@ impl FileIoServer {
                     tail
                 ))
             }
-            _ => Ok(format!(
-                "不支持的模式: {}，可选: overwrite, append, insert, replace",
-                mode
-            )),
+            other => Err(e_param(format!("不支持的模式: {}", other), None)),
         }
         })
     }
@@ -2771,14 +3011,15 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
             extras.push(format!("skipped:{}", skipped.len()));
         }
 
+        // 命中数：未截断直接给总数；截断时写成 返回数/已扫描到的实际数 并显式标注 truncated
         let matches_label = if found > stored {
-            format!("{}/{}", stored, found)
+            format!("{}/{} matches(truncated)", stored, found)
         } else {
-            format!("{}", found)
+            format!("{} matches", found)
         };
 
         let mut out = format!(
-            "{} | {} | {} | {}/{} files | {} matches{}```",
+            "{} | {} | {} | {}/{} files | {}{}```",
             params.path,
             params.pattern,
             if case_sensitive { "cs" } else { "ci" },
