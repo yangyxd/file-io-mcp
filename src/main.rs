@@ -1119,6 +1119,67 @@ impl FileIoServer {
         }
     }
 
+    /// 把字节偏移向下取整到该编码的字符边界（仅处理边界可廉价判定的编码；无法判定时原样返回）。
+    /// `byte_at_off`：偏移处首字节（调用方已读到窗口时传入），用于判断 UTF-8 是否正好落在边界。
+    fn floor_char_boundary(encoding: &str, path: &str, off: u64, byte_at_off: Option<u8>) -> u64 {
+        if off == 0 {
+            return 0;
+        }
+        match encoding.to_ascii_lowercase().as_str() {
+            "utf-16le" | "utf-16be" => off - (off % 2),
+            "utf-32le" | "utf-32be" => off - (off % 4),
+            "utf-8" => {
+                // UTF-8 续字节形如 10xxxxxx；若 off 处就是首字节，则本就在边界上
+                if let Some(b) = byte_at_off {
+                    if (b & 0xC0) != 0x80 {
+                        return off;
+                    }
+                }
+                // 最多回看 3 字节，即可找到离 off 最近的非续字节位置
+                let back = off.min(3) as usize;
+                if back == 0 {
+                    return 0;
+                }
+                let mut f = match File::open(path) {
+                    Ok(f) => f,
+                    Err(_) => return off,
+                };
+                if f.seek(SeekFrom::Start(off - back as u64)).is_err() {
+                    return off;
+                }
+                let mut buf = vec![0u8; back];
+                if f.read_exact(&mut buf).is_err() {
+                    return off;
+                }
+                for k in 1..=back {
+                    if (buf[back - k] & 0xC0) != 0x80 {
+                        return off - k as u64;
+                    }
+                }
+                off
+            }
+            _ => off,
+        }
+    }
+
+    /// 从文件开头统计到 `upto` 字节为止的换行数（分块读取，避免为大偏移分配整段前缀）。
+    fn count_newlines_before(file: &mut File, upto: u64) -> std::io::Result<usize> {
+        file.seek(SeekFrom::Start(0))?;
+        let mut remaining = upto;
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut count = 0usize;
+        while remaining > 0 {
+            let want = (remaining.min(buf.len() as u64)) as usize;
+            let n = file.read(&mut buf[..want])?;
+            if n == 0 {
+                break;
+            }
+            count += buf[..n].iter().filter(|&&b| b == b'\n').count();
+            remaining -= n as u64;
+        }
+        Ok(count)
+    }
+
     /// 新建文件时该编码应自带的 BOM。UTF-16/32 必须带 BOM 才能被再次识别，
     /// 否则会被 detect_encoding 误判成 GBK；UTF-8 等保持不带 BOM（沿用现状）
     fn default_bom_for(encoding: &str) -> &'static [u8] {
@@ -2078,31 +2139,7 @@ impl FileIoServer {
             .map_err(|e| e_internal(format!("无法获取文件元数据: {}", e), None))?
             .len();
 
-        let start = params.offset.unwrap_or(0);
-
-        // 若需要显示行号且有偏移，需先数一遍前缀里的换行数；
-        // 用固定大小缓冲分块统计，避免为一个大偏移分配整段前缀内存
-        let prefix_line_count = if show_ln && start > 0 {
-            file.seek(SeekFrom::Start(0))
-                .map_err(|e| e_internal(format!("Seek 失败: {}", e), None))?;
-            let mut remaining = start;
-            let mut buf = vec![0u8; 64 * 1024];
-            let mut count = 0usize;
-            while remaining > 0 {
-                let want = (remaining.min(buf.len() as u64)) as usize;
-                let n = file
-                    .read(&mut buf[..want])
-                    .map_err(|e| e_internal(format!("读取前缀失败: {}", e), None))?;
-                if n == 0 {
-                    break;
-                }
-                count += buf[..n].iter().filter(|&&b| b == b'\n').count();
-                remaining -= n as u64;
-            }
-            count
-        } else {
-            0
-        };
+        let mut start = params.offset.unwrap_or(0);
 
         // 允许 offset=0 读空文件（返回空内容）；仅当偏移越过文件末尾才报错
         if start > 0 && start >= file_size {
@@ -2115,10 +2152,11 @@ impl FileIoServer {
         file.seek(SeekFrom::Start(start))
             .map_err(|e| e_internal(format!("Seek 失败: {}", e), None))?;
 
-        let remaining = (file_size - start) as usize;
         let max_len = params.length.unwrap_or(MAX_TEXT_READ_SIZE);
-        let read_len = max_len.min(remaining);
-        let truncated = read_len < remaining;
+        let room = (file_size - start) as usize;
+        // 至少读 4 字节：保证窗口能覆盖一个完整多字节字符，避免 length 过小时分页无法前进
+        let mut read_len = max_len.min(room).max(room.min(4));
+        let mut truncated = read_len < room;
         let mut buffer = vec![0u8; read_len];
         file.read_exact(&mut buffer)
             .map_err(|e| e_internal(format!("读取失败: {}", e), None))?;
@@ -2138,6 +2176,32 @@ impl FileIoServer {
                 .map_err(|e| e_param(e, None))?;
             (enc.name(), true)
         };
+        // offset 可能落在多字节字符中间（按 read_len 分页时几乎必然如此）。向下取整到字符边界，
+        // 否则从“半个字符”开始解码会得到非法字节错误，导致分页读 UTF-8 文件从第二页起必然失败。
+        let aligned = Self::floor_char_boundary(encoding_name, &params.path, start, buffer.first().copied());
+        let align_note = if aligned != start {
+            start = aligned;
+            file.seek(SeekFrom::Start(start))
+                .map_err(|e| e_internal(format!("Seek 失败: {}", e), None))?;
+            let remaining = (file_size - start) as usize;
+            read_len = max_len.min(remaining).max(remaining.min(4));
+            truncated = read_len < remaining;
+            buffer = vec![0u8; read_len];
+            file.read_exact(&mut buffer)
+                .map_err(|e| e_internal(format!("读取失败: {}", e), None))?;
+            format!(" ⚠️offset 已下取整到字符边界 {}", start)
+        } else {
+            String::new()
+        };
+
+        // 行号前缀统计放在边界对齐之后，保证显示的行号与最终 start 一致
+        let prefix_line_count = if show_ln && start > 0 {
+            Self::count_newlines_before(&mut file, start)
+                .map_err(|e| e_internal(format!("读取前缀失败: {}", e), None))?
+        } else {
+            0
+        };
+
         // 从 offset=0 开始读取时，头部可能带 BOM，需剥离并返回给 AI 可见的编码名
         let bom = if start == 0 { Self::detect_bom(&buffer) } else { &[][..] };
         let body = &buffer[bom.len()..];
@@ -2154,11 +2218,14 @@ impl FileIoServer {
 
         // 只解码本次读取的窗口。窗口按字节截断，尾部可能是“半个多字节字符”，
         // 这属于正常截断而非文件损坏：截断时容忍尾部不完整序列，避免整次读取直接报错。
+        // consumed 记录窗口内“真正构成完整字符”的字节数，用于把返回区间右端也对齐到字符边界。
+        let mut consumed = body.len();
         let content = if encoding_name.eq_ignore_ascii_case("utf-8") {
             match std::str::from_utf8(body) {
                 Ok(s) => s.to_string(),
                 Err(e) if truncated && e.error_len().is_none() => {
-                    std::str::from_utf8(&body[..e.valid_up_to()])
+                    consumed = e.valid_up_to();
+                    std::str::from_utf8(&body[..consumed])
                         .unwrap_or("")
                         .to_string()
                 }
@@ -2181,6 +2248,7 @@ impl FileIoServer {
                 match Self::decode_bytes(&body[..end], encoding_name) {
                     Ok(s) => {
                         decoded = Some(s);
+                        consumed = end;
                         break;
                     }
                     Err(_) => {
@@ -2207,6 +2275,8 @@ impl FileIoServer {
             Self::decode_bytes(body, encoding_name)
                 .map_err(|e| e_internal(e, None))?
         };
+        // 返回区间右端：start + BOM + 实际消费的完整字符字节数（保证落在字符边界上）
+        let end_off = start + bom.len() as u64 + consumed as u64;
 
         let display_content = if show_ln {
             // 起始行号：前缀的换行数 + 1（1-based）
@@ -2225,7 +2295,7 @@ impl FileIoServer {
         let trunc_warn = if truncated {
             format!(
                 " ⚠️已截断: 文件共 {}B，仅返回 [{},{})。若要完整编辑请改用 read_text_lines，或用 offset 分页读取剩余部分",
-                file_size, start, start + read_len as u64
+                file_size, start, end_off
             )
         } else {
             String::new()
@@ -2242,15 +2312,16 @@ impl FileIoServer {
         };
 
         Ok(format!(
-            "{}{}{} | {} | {}B | sha256:{} | [{},{}){}```\n{}\n```",
+            "{}{}{}{} | {} | {}B | sha256:{} | [{},{}){}```\n{}\n```",
             params.path,
             trunc_warn,
+            align_note,
             enc_warn,
             encoding_label,
             file_size,
             sha,
             start,
-            start + read_len as u64,
+            end_off,
             if show_ln { " | lines" } else { "" },
             display_content
         ))
@@ -3737,11 +3808,8 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
         };
         let action = params.action.to_lowercase();
 
-        // 与该文件的写操作互斥（进程内锁 + 跨进程文件锁）
-        let lock = self.lock_for(&params.path);
-        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-        let _file_guard = Self::acquire_file_lock(&params.path);
-
+        // list 是只读操作，不加锁，避免在目标目录创建/删除锁文件；
+        // undo/clean 会改动文件或备份，才需要与写操作互斥。
         match action.as_str() {
             "list" => {
                 let records = Self::list_backup_records(&params.path);
@@ -3781,6 +3849,10 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
                 ))
             }
             "undo" => {
+                // 会改文件，需与写操作互斥（进程内锁 + 跨进程文件锁）
+                let lock = self.lock_for(&params.path);
+                let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                let _file_guard = Self::acquire_file_lock(&params.path);
                 let records = Self::list_backup_records(&params.path);
                 let Some((bak, meta)) = records.last() else {
                     return Err(e_param(
@@ -3843,6 +3915,10 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
                 ))
             }
             "clean" => {
+                // 会删备份，需与写操作互斥（进程内锁 + 跨进程文件锁）
+                let lock = self.lock_for(&params.path);
+                let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                let _file_guard = Self::acquire_file_lock(&params.path);
                 let keep = params.keep.unwrap_or(BACKUP_KEEP);
                 let Some(dir) = Self::backup_dir_for(&params.path) else {
                     return Ok(format!("{} | 备份目录无效", params.path));
