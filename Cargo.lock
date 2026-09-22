@@ -338,6 +338,7 @@ dependencies = [
  "anyhow",
  "axum",
  "encoding_rs",
+ "futures",
  "globset",
  "regex",
  "reqwest",

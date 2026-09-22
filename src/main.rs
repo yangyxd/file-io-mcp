@@ -4474,6 +4474,9 @@ expected_old 须逐字符一致、默认全文唯一；多处时可用 occurrenc
         &self,
         Parameters(params): Parameters<FileInfoParams>,
     ) -> Result<String, McpError> {
+        if std::env::var("FILE_IO_TEST_PANIC").is_ok() {
+            panic!("临时验证用 panic：模拟数组越界");
+        }
         let params = {
             let mut p = params;
             p.path = self.resolve_path(&p.path)?;
@@ -5545,7 +5548,81 @@ expected_old 须逐字符一致、默认全文唯一；多处时可用 occurrenc
     }
 }
 
-#[tool_handler]
+/// 包住 ToolRouter：把工具实现里的 panic 兜住，降级成一条普通错误返回。
+///
+/// 背景：edit_file_sections 曾在“中文 + start_line”的分支上数组越界 panic，
+/// 而 release 配了 `panic = "abort"`，一次 panic 就把整个 MCP 服务带走——
+/// stdio 下调用方只看到超时/断连，HTTP 下整个进程退出、所有会话一起没。
+/// 这里在派发处加一层 catch_unwind：某个工具崩了只影响这一次调用，
+/// 服务继续运行、其余工具照常可用。
+///
+/// 覆盖不到的是“工具之外”的 panic（rmcp 协议层、传输层），那仍会让进程退出；
+/// 但绝大多数风险在本文件这几千行手写的下标/切片逻辑里，已被这里兜住。
+struct PanicSafeRouter<'a> {
+    inner: &'a rmcp::handler::server::router::tool::ToolRouter<FileIoServer>,
+}
+
+impl<'a> PanicSafeRouter<'a> {
+    async fn call(
+        self,
+        tcc: rmcp::handler::server::tool::ToolCallContext<'_, FileIoServer>,
+    ) -> Result<rmcp::model::CallToolResult, McpError> {
+        let tool_name = tcc.name().to_string();
+        let fut = self.inner.call(tcc);
+        // AssertUnwindSafe：future 里持有 &self/&params 的共享引用，编译器无法证明
+        // UnwindSafe。panic 后我们立刻丢弃这个 future（不再 poll），不会观察到中间态。
+        match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(fut)).await {
+            Ok(result) => result,
+            Err(payload) => {
+                let msg = Self::panic_message(&payload);
+                // 打一条 stderr：release 虽 strip 掉符号表，但 panic 的 文件:行号 仍在，便于定位
+                eprintln!(
+                    "[file-io-mcp] 工具 {} 内部 panic（已捕获，服务继续运行）: {}",
+                    tool_name, msg
+                );
+                Err(e_internal(
+                    format!(
+                        "E_PANIC 工具 {} 内部错误，已捕获——服务继续运行，可继续调用其他工具: {}。\
+                         这是实现缺陷，请把本消息与本次入参一并反馈",
+                        tool_name, msg
+                    ),
+                    None,
+                ))
+            }
+        }
+    }
+
+    fn list_all(&self) -> Vec<rmcp::model::Tool> {
+        self.inner.list_all()
+    }
+
+    /// 返回值按 'a 而不是跟随 &self：调用方写法是 `self.safe_router().get(name)`，
+    /// 跟 &self 的话会在临时值上借用、语句结束即失效。
+    fn get(&self, name: &str) -> Option<&'a rmcp::model::Tool> {
+        self.inner.get(name)
+    }
+
+    fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+        if let Some(s) = payload.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "未知 panic（无可读信息）".to_string()
+        }
+    }
+}
+
+impl FileIoServer {
+    /// 供 `#[tool_handler(router = ...)]` 使用：派发时套上 panic 兜底层
+    fn safe_router(&self) -> PanicSafeRouter<'_> {
+        PanicSafeRouter {
+            inner: &self.tool_router,
+        }
+    }
+}
+
+#[tool_handler(router = self.safe_router())]
 impl ServerHandler for FileIoServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {

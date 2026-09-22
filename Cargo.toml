@@ -10,12 +10,14 @@ split-debuginfo = "packed"
 
 [profile.release]
 lto = true           # 全量 LTO，跨 crate 内联/裁剪死代码
-panic = "abort"      # 去掉 panic 展开表，显著减小体积
+panic = "unwind"     # 必须保留展开：工具内部 panic 由派发处的 catch_unwind 兜住。
+                     # 用 abort 的话，一个工具的越界就会让整个 MCP 服务进程退出（调用方只看到断连）
 strip = true         # 去掉符号表
 
 [dependencies]
 rmcp = { version = "0.16", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
 tokio = { version = "1", features = ["full"] }
+futures = "0.3"          # 只用 FutureExt::catch_unwind（rmcp 已在依赖树里，不增加编译量）
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "1"
