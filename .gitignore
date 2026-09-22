@@ -12,6 +12,7 @@ stderr.txt
 # 工具自身的备份目录（exe 不在 target 下时会出现）
 .file-io-mcp-backups/
 
-# 本地发布产物（由 deploy.bat 生成）
+# 本地发布产物（由 deploy.bat / 打包脚本生成）
 /dist/*.exe
 /dist/*.7z
+/dist/*.zip

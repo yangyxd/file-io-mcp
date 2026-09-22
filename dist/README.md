@@ -16,7 +16,7 @@
 | `edit_file_lines` | 按行编辑：删/插/替/追，支持锚点定位与 `expected_old` 校验 |
 | `regex_replace` | 正则替换，`max_matches` 必填防误伤，可 dry-run |
 | `read_binary_file` | 读二进制 HEX dump |
-| `write_binary_file` | 按十六进制写二进制（覆盖/追加/插入/替换） |
+| `write_binary_file` | 按十六进制写二进制（覆盖/追加/插入/替换），支持 `expected_hex` 写前校验与 HEX diff dry-run |
 | `text_search` | 文件/目录内容搜索（`regex`/`literal` 双模式，结果按文件分组，带 sha256，可直接接 `edit_file_lines`） |
 | `list_files` | 列目录 / 按文件名搜索（支持 glob） |
 | `file_info` | 文件/目录元信息（大小、mtime、指纹） |
@@ -65,7 +65,7 @@
 |--------|------|----------|
 | `E_NOT_FOUND` | 目标不存在 / 锚点未匹配 / 无备份可回滚 | 确认路径，或先读取 |
 | `E_NOT_UNIQUE` | 锚点命中多处 | 补全 `anchor_text` 或用 `anchor_occurrence` |
-| `E_GUARD_MISMATCH` | `expected_old` 与实际不符 | 重新读取目标行后再改 |
+| `E_GUARD_MISMATCH` | `expected_old` / `expected_hex` 与实际不符 | 重新读取目标行（或目标字节）后再改 |
 | `E_EXTERNAL_CHANGED` | 文件已被他人改动 | 重新读取（拿新 sha256）后重试 |
 | `E_ENCODING` | 编码识别/解码/不一致 | 显式指定 `encoding` |
 | `E_NO_PERMISSION` | 权限不足 | 检查文件占用/权限 |
@@ -332,11 +332,18 @@ src/main.rs | utf-8 | 4096B | 120 lines total | sha256:8f3a1c02d94b7e15 | [10-15
 | `mode` | string | 否 | `overwrite`(默认) / `append` / `insert` / `replace` |
 | `offset` | u64 | 否 | insert 为插入位置，replace 为替换起始位置 |
 | `replace_length` | usize | 否 | replace 模式下被替换的字节数 |
-| `expected_sha256` | string | 否 | 上次读到的指纹 |
+| `expected_hex` | string | 否 | **写前校验待改范围的原始字节**（HEX，可带 `0x` 与空格/冒号分隔，便于从 HEX dump 直接粘贴）。按 mode 取范围：`overwrite`=全文 / `append`=文件末尾 / `insert`=`offset` 起 / `replace`=`[offset, offset+replace_length)`；不符返回 `E_GUARD_MISMATCH` 并回显该范围的实际字节 |
+| `expected_sha256` | string | 否 | 上次读到的指纹（整文件级，防外部改动） |
+| `dry_run` | bool | 否 | true=只返回 HEX diff 预览与预计指纹，不写文件 |
 
 ```json
 { "path": "data/file.bin", "hex_data": "0xFF01", "mode": "replace", "offset": 3, "replace_length": 4 }
+{ "path": "data/file.bin", "mode": "replace", "offset": 3, "replace_length": 4,
+  "hex_data": "0xFF01", "expected_hex": "00 01 02 03", "dry_run": true }
 ```
+
+- **越界不再静默截断**：`replace` 的 `offset + replace_length` 超出文件长度、或 `insert` 的 `offset` 超出文件长度时，直接返回错误（参数类），需先用 `read_binary_file` 确认真实长度与偏移。
+- `dry_run` 输出形如：`[DRY-RUN] path | 4B→4B @4 | 16B→16B | sha256:…→…`，随后给出变更窗口的 `旧/新` HEX（窗口含前后 16 字节上下文，最长显示 256 字节）。
 
 ### text_search
 
@@ -383,7 +390,7 @@ D:\proj\src\b.rs | sha256:9f8e7d6c5b4a3210 | enc:GBK | 1 matches
 ⚠️ 候选文件已达上限 1000，目录可能未完全覆盖（已收集 1000 个，另有 12 个被过滤）。可提高 max_files 或收窄范围后重试
 ````
 
-- 命中数写成 `返回数/实际数`（如 `100/137`）时表示已截断，末尾会附 `⚠️` 说明；`pattern` 为空会被直接拒绝。
+- 命中数写成 `返回数/实际数 matches(truncated)`（如 `100/137 matches(truncated)`）时表示已截断，末尾会附 `⚠️` 说明；未截断时就是 `N matches`。注意实际数只统计**已扫描范围**（达到 `max_results` 后不再继续扫描后续文件），所以它是下限而非全量真值。`pattern` 为空会被直接拒绝。
 - 输出头的 `pruned_dirs` 统计被剪枝的目录数（`exclude` 命中 + 隐藏目录跳过）。
 - 组头的 `sha256` 可直接作为 `edit_file_lines` / `write_text_file` 的 `expected_sha256`（支持前缀匹配），命中行保留原始缩进，可直接作为 `expected_old`。
 - 列号按**字符数**计（不是字节偏移），中文行不会错位。
@@ -528,6 +535,7 @@ file-io-mcp/
 | `mcp_test_anchor_dryrun.py` | 锚点定位、dry-run/diff |
 | `mcp_test_consistency.py` | 指纹口径一致性、空文件、`fetch` 截断 |
 | `mcp_test_sandbox.py` | `FILE_IO_ROOT` 沙箱：大小写/8.3 短名/`..`/junction 的放行与拦截 |
+| `mcp_test_binary.py` | 二进制 `expected_hex` 校验、`dry_run` HEX diff、越界报错、`matches(truncated)` 标注 |
 | `mcp_bench.py` | 大文件性能基准（可选传 exe 路径） |
 | `mcp_tools_size.py` | 统计 tools/list 的 schema 体量 |
 

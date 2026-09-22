@@ -1212,8 +1212,20 @@ impl FileIoServer {
             }
             (cow.into_owned(), false)
         };
-        let crlf_count = content.matches("\r\n").count();
-        let total_lf = content.matches('\n').count();
+        // 单次遍历同时统计 \n 与 \r\n（结果与两次 matches 完全一致），
+        // 避免对大文件做两次全量字符串扫描
+        let mut crlf_count = 0usize;
+        let mut total_lf = 0usize;
+        let mut prev_cr = false;
+        for &b in content.as_bytes() {
+            if b == b'\n' {
+                total_lf += 1;
+                if prev_cr {
+                    crlf_count += 1;
+                }
+            }
+            prev_cr = b == b'\r';
+        }
         let line_ending: &'static str = if crlf_count * 2 > total_lf { "\r\n" } else { "\n" };
         Ok(FileText {
             encoding: encoding_name.to_string(),
@@ -1881,32 +1893,37 @@ impl FileIoServer {
         file_path: &str,
         encoding_raw: Option<&str>,
         encoding_auto: bool,
-    ) -> Result<(String, String), String> {
-        let bytes = fs::read(file_path).map_err(|e| format!("读取失败: {}", e))?;
-        if bytes.len() as u64 > MAX_REGEX_FILE_SIZE {
+    ) -> Result<(String, String, String), String> {
+        // 先看大小再读：超限文件不必整份读进内存（返回文案与过去一致）
+        let size = fs::metadata(file_path)
+            .map_err(|e| format!("读取失败: {}", e))?
+            .len();
+        if size > MAX_REGEX_FILE_SIZE {
             return Err(format!(
                 "文件过大({}B > {}B)，已跳过",
-                bytes.len(),
-                MAX_REGEX_FILE_SIZE
+                size, MAX_REGEX_FILE_SIZE
             ));
         }
+        let bytes = fs::read(file_path).map_err(|e| format!("读取失败: {}", e))?;
+        // 在解码消耗 bytes 之前算好指纹，供调用方直接复用，避免命中文件被二次读盘
+        let fp = Self::fingerprint_short_of_bytes(&bytes);
         if encoding_auto {
             let detected = Self::detect_encoding(&bytes);
             let content = Self::decode_bytes(&bytes, detected)
                 .map_err(|e| format!("按 {} 解码失败({})", detected, e))?;
-            Ok((detected.to_string(), content))
+            Ok((detected.to_string(), content, fp))
         } else {
             let name = encoding_raw.unwrap_or("utf-8");
             if name.eq_ignore_ascii_case("utf-8") {
                 String::from_utf8(bytes)
-                    .map(|s| ("utf-8".to_string(), s))
+                    .map(move |s| ("utf-8".to_string(), s, fp))
                     .map_err(|_| {
                         "不是有效的 UTF-8 文本（可指定 encoding=\"auto\" 或显式编码，如 gbk）".to_string()
                     })
             } else {
                 let content = Self::decode_bytes(&bytes, name)
                     .map_err(|e| format!("按 {} 解码失败({})", name, e))?;
-                Ok((name.to_string(), content))
+                Ok((name.to_string(), content, fp))
             }
         }
     }
@@ -2034,8 +2051,14 @@ impl FileIoServer {
         };
 
         // 版本指纹（供后续写入时作为 expected_sha256 回传，防止并发改动被覆盖）。
-        // 大文件用采样指纹，避免"只读一小段却要把整个大文件再读一遍算 sha"
-        let sha = Self::path_fingerprint_short(&params.path);
+        // 大文件用采样指纹，避免"只读一小段却要把整个大文件再读一遍算 sha"；
+        // 本次已完整读取整个文件时（offset=0 且未截断）可直接复用 buffer，连采样读盘也省掉。
+        // 注意：必须用完整 buffer（含 BOM），不能用剥离 BOM 后的 body，否则指纹与实际文件不符。
+        let sha = if start == 0 && !truncated {
+            Self::fingerprint_short_of_bytes(&buffer)
+        } else {
+            Self::path_fingerprint_short(&params.path)
+        };
 
         Ok(format!(
             "{}{}{} | {} | {}B | sha256:{} | [{},{}){}```\n{}\n```",
@@ -2486,11 +2509,19 @@ impl FileIoServer {
             hex_dump.push_str("|\n");
         }
 
+        // 本次读取覆盖整个文件时（offset=0 且未截断）可直接复用已读 buffer 算指纹，
+        // 省掉 path_fingerprint_short 的重新读盘；部分读取时仍需按路径读盘。
+        let sha = if start == 0 && read_len as u64 == file_size {
+            Self::fingerprint_short_of_bytes(&buffer)
+        } else {
+            Self::path_fingerprint_short(&params.path)
+        };
+
         Ok(format!(
             "{} | {}B | sha256:{} | [{},{})```\n{}```",
             params.path,
             file_size,
-            Self::path_fingerprint_short(&params.path),
+            sha,
             start,
             start + read_len as u64,
             hex_dump
@@ -2850,7 +2881,7 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
             searched_files += 1;
 
             // 读取 + 解码（失败不再静默跳过，统一计入 skipped 以便调用方排查）
-            let (enc_label, content) =
+            let (enc_label, content, fp) =
                 match Self::read_search_content(file_path, encoding_raw, encoding_auto) {
                     Ok(v) => v,
                     Err(reason) => {
@@ -2890,10 +2921,11 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
             stored += stored_in_file;
 
             // 文件块头带上 sha256，可直接回传给 edit_file_lines 的 expected_sha256
+            // （复用读取阶段已算好的指纹，避免命中文件被二次读盘）
             let mut block = format!(
                 "{} | sha256:{} | enc:{} | {} matches",
                 file_path,
-                Self::path_fingerprint_short(file_path),
+                fp,
                 enc_label,
                 stored_in_file
             );
@@ -3664,10 +3696,14 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
         let timeout_secs = params.timeout.unwrap_or(30);
         let response_type = params.response_type.as_deref().unwrap_or("text");
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(timeout_secs))
-            .build()
-            .map_err(|e| e_internal(format!("创建 HTTP 客户端失败: {}", e), None))?;
+        // 进程级共享客户端：复用 TCP/TLS 连接池，避免每次调用重新握手。
+        // 超时改为请求级设置，语义与过去"每次新建带超时的客户端"一致。
+        static HTTP_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+        let client = HTTP_CLIENT.get_or_init(|| {
+            reqwest::Client::builder()
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        });
 
         let mut request = match method.as_str() {
             "GET" => client.get(&params.url),
@@ -3695,6 +3731,7 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
         }
 
         let response = request
+            .timeout(std::time::Duration::from_secs(timeout_secs))
             .send()
             .await
             .map_err(|e| e_internal(format!("请求失败: {}", e), None))?;
