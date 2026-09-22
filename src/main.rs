@@ -17,6 +17,13 @@ use globset::{Glob, GlobMatcher};
 use sha2::{Sha256, Digest};
 
 const MAX_TEXT_READ_SIZE: usize = 10 * 1024 * 1024; // read_text_file 默认最大读取 10MB，超过则在返回头显著标注已截断
+/// read_text_file / read_binary_file 单次读取的硬上限（length 传超大也不越过，防内存/响应失控）
+const MAX_READ_HARD_LIMIT: usize = 64 * 1024 * 1024;
+/// read_binary_file 单次最多 dump 的字节数（HEX dump 体积约为原字节的 4~5 倍）
+const MAX_BINARY_DUMP_LIMIT: usize = 4 * 1024 * 1024;
+/// read_text_lines 允许整份读入内存的文件大小上限（该工具按行工作，无法分页）
+const MAX_TEXT_LINES_FILE_SIZE: u64 = 64 * 1024 * 1024;
+
 const MAX_REGEX_FILE_SIZE: u64 = 64 * 1024 * 1024; // regex_replace 拒绝处理超过 64MB 的文件
 
 /// 文件操作失败后的重试次数（首次执行之外再重试 5 次）
@@ -508,6 +515,11 @@ impl FileIoServer {
         let table = GLOBAL_PATH_LOCKS
             .get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())));
         let mut map = table.lock().unwrap_or_else(|e| e.into_inner());
+        // 长跑的 HTTP 服务里路径会越积越多：表过大时清理掉“没人持有”的锁
+        // （Arc 强引用计数为 1 说明只有本表在引用它，此时可安全移除）
+        if map.len() > 4096 {
+            map.retain(|_, v| std::sync::Arc::strong_count(v) > 1);
+        }
         map.entry(std::path::PathBuf::from(path))
             .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
             .clone()
@@ -616,7 +628,17 @@ impl FileIoServer {
     /// 判断 IO 错误是否为“跨设备/跨卷”（Windows ERROR_NOT_SAME_DEVICE=17，Unix EXDEV=18），
     /// 用于把 move 回退成“复制 + 删除”。
     fn is_cross_device_error(e: &std::io::Error) -> bool {
-        matches!(e.raw_os_error(), Some(17) | Some(18))
+        // 17/18 是两个平台各自的“跨设备”错误码，含义并不互通：
+        // Windows ERROR_NOT_SAME_DEVICE=17；Unix EXDEV=18。
+        // 若在 Windows 上认 18，会把 ERROR_NO_MORE_FILES(18) 误判成跨卷。
+        #[cfg(windows)]
+        {
+            matches!(e.raw_os_error(), Some(17))
+        }
+        #[cfg(not(windows))]
+        {
+            matches!(e.raw_os_error(), Some(18))
+        }
     }
 
     /// 路径是否位于沙箱根目录之下（含根目录自身）。按**路径组件**比较，
@@ -729,8 +751,9 @@ impl FileIoServer {
             .chars()
             .filter(|c| !c.is_ascii_whitespace() && !matches!(c, ':' | ',' | '-' | '_'))
             .collect();
+        // 空内容视为 0 字节（是否允许由调用方决定：write_binary_file 的 replace 用它删除字节）
         if cleaned.is_empty() {
-            return Err("内容为空".to_string());
+            return Ok(Vec::new());
         }
         if !cleaned.len().is_multiple_of(2) {
             return Err(format!(
@@ -886,6 +909,15 @@ impl FileIoServer {
             }
         }
         Ok(())
+    }
+
+    /// 校验并规范化编码名：UTF-32 不在 encoding_rs 里，由内置实现处理，需单独放行。
+    fn canonical_encoding(name: &str) -> Result<&'static str, String> {
+        match name.to_ascii_lowercase().as_str() {
+            "utf-32le" => Ok("utf-32le"),
+            "utf-32be" => Ok("utf-32be"),
+            _ => Ok(Self::get_encoding(name)?.name()),
+        }
     }
 
     /// 根据编码名称获取 encoding_rs 的 Encoding 引用
@@ -1088,26 +1120,14 @@ impl FileIoServer {
             // 不能从"最近的 ASCII 字节"起步：GBK 双字节的第二字节也可能落在 ASCII 范围
             // （0x40-0x7E），会把字符内部误当成边界，从而在字符中间插入、切断多字节字符。
             _ => {
-                // GB18030 有四字节序列（首 0x81-0xFE，次 0x30-0x39，三 0x81-0xFE，四 0x30-0x39）
-                let gb18030 = encoding.eq_ignore_ascii_case("gb18030");
                 let mut pos = 0usize;
                 while pos < off {
-                    let b = bytes[pos];
-                    if b < 0x80 {
-                        pos += 1;
-                    } else if gb18030
-                        && pos + 3 < bytes.len()
-                        && (0x81..=0xFE).contains(&b)
-                        && (0x30..=0x39).contains(&bytes[pos + 1])
-                        && (0x81..=0xFE).contains(&bytes[pos + 2])
-                        && (0x30..=0x39).contains(&bytes[pos + 3])
-                    {
-                        pos += 4;
-                    } else if (0x81..=0xFE).contains(&b) {
-                        pos += 2;
-                    } else {
-                        // 非法/孤立字节，无法可靠判定 → 放行（宁可不拦也不错拦）
-                        return true;
+                    match Self::legacy_char_advance(encoding, bytes, pos) {
+                        Some(next) => pos = next,
+                        None => {
+                            // 非法/孤立字节，无法可靠判定 → 放行（宁可不拦也不错拦）
+                            return true;
+                        }
                     }
                 }
                 pos == off
@@ -1154,8 +1174,65 @@ impl FileIoServer {
                 }
                 off
             }
-            _ => off,
+            _ => {
+                // GBK/Big5/GB18030 等：边界必须从文件头逐字符推进才能判定（O(off)）。
+                // 偏移过大时不值得为此整读前缀，原样返回；否则读 [0, off+4) 后推进，
+                // 找到 <= off 的最近边界（一个字符最多 4 字节，通常只需回退 1~3 字节）。
+                const MAX_WALK: u64 = 4 * 1024 * 1024;
+                if off > MAX_WALK {
+                    return off;
+                }
+                let want = (off + 4) as usize;
+                let f = match File::open(path) {
+                    Ok(f) => f,
+                    Err(_) => return off,
+                };
+                let mut buf: Vec<u8> = Vec::with_capacity(want);
+                if f.take(want as u64).read_to_end(&mut buf).is_err() {
+                    return off;
+                }
+                if buf.len() < off as usize {
+                    return off;
+                }
+                let mut pos = 0usize;
+                let mut boundary = 0usize;
+                while pos < off as usize {
+                    boundary = pos;
+                    match Self::legacy_char_advance(encoding, &buf, pos) {
+                        Some(next) => pos = next,
+                        None => return off,
+                    }
+                }
+                if pos == off as usize {
+                    off
+                } else {
+                    boundary as u64
+                }
+            }
         }
+    }
+
+    /// 单字节 / 双字节（GB18030 含四字节）编码下“推进一个字符”，返回下一个字符的起始位置。
+    /// 遇到非法或孤立字节返回 None（无法可靠判定边界）。
+    fn legacy_char_advance(encoding: &str, bytes: &[u8], pos: usize) -> Option<usize> {
+        let b = *bytes.get(pos)?;
+        if b < 0x80 {
+            return Some(pos + 1);
+        }
+        // GB18030 四字节序列：首 0x81-0xFE，次 0x30-0x39，三 0x81-0xFE，四 0x30-0x39
+        if encoding.eq_ignore_ascii_case("gb18030")
+            && pos + 3 < bytes.len()
+            && (0x81..=0xFE).contains(&b)
+            && (0x30..=0x39).contains(&bytes[pos + 1])
+            && (0x81..=0xFE).contains(&bytes[pos + 2])
+            && (0x30..=0x39).contains(&bytes[pos + 3])
+        {
+            return Some(pos + 4);
+        }
+        if (0x81..=0xFE).contains(&b) {
+            return Some(pos + 2);
+        }
+        None
     }
 
     /// 从文件开头统计到 `upto` 字节为止的换行数（分块读取，避免为大偏移分配整段前缀）。
@@ -1219,6 +1296,13 @@ impl FileIoServer {
         None
     }
 
+    /// encoding 参数是否表示“自动识别”：未传 / 空串 / "auto" 都算。
+    /// 三个读工具此前对空串处理不一致（read_text_file 当 auto、read_text_lines 报错、
+    /// text_search 把文件全部 skip），现在统一走这里。
+    fn encoding_is_auto(enc: Option<&str>) -> bool {
+        enc.map_or(true, |e| e.is_empty() || e.eq_ignore_ascii_case("auto"))
+    }
+
     /// 解析 encoding 参数，返回 (编码, 置信度)：
     /// "auto"/未指定时自动检测并给出置信度；显式指定即视为高置信。校验编码有效性。
     /// 低置信度意味着"GBK/UTF-8 难以区分"，读工具应提示 AI 显式指定 encoding
@@ -1227,11 +1311,10 @@ impl FileIoServer {
         bytes: &[u8],
     ) -> Result<(&'static str, bool), String> {
         match param {
-            Some(name) if name.eq_ignore_ascii_case("auto") => {
-                Ok(Self::detect_encoding_with_confidence(bytes))
+            Some(name) if !Self::encoding_is_auto(Some(name)) => {
+                Ok((Self::canonical_encoding(name)?, true))
             }
-            Some(name) => Ok((Self::get_encoding(name)?.name(), true)),
-            None => Ok(Self::detect_encoding_with_confidence(bytes)),
+            _ => Ok(Self::detect_encoding_with_confidence(bytes)),
         }
     }
 
@@ -1351,6 +1434,9 @@ impl FileIoServer {
         let (content, has_invalid) = if lower == "utf-16le" || lower == "utf-16be" {
             // UTF-16 自行解码，保证与 encode 严格对称
             (Self::decode_utf16(body, lower == "utf-16le")?, false)
+        } else if lower == "utf-32le" || lower == "utf-32be" {
+            // encoding_rs 不支持 UTF-32，这里同样自行解码（与 encode 严格对称）
+            (Self::decode_utf32(body, lower == "utf-32le")?, false)
         } else if lower == "utf-8" {
             match std::str::from_utf8(body) {
                 Ok(s) => (s.to_string(), false),
@@ -1421,11 +1507,47 @@ impl FileIoServer {
         out
     }
 
+    /// UTF-32 解码：按字节序组装 u32 码点（encoding_rs 不支持 UTF-32，故自行实现）
+    fn decode_utf32(body: &[u8], little_endian: bool) -> Result<String, String> {
+        if body.len() % 4 != 0 {
+            return Err("UTF-32 数据字节数不是 4 的倍数，无法解码（文件可能被截断）".to_string());
+        }
+        let mut out = String::with_capacity(body.len() / 4);
+        for c in body.chunks(4) {
+            let v = if little_endian {
+                u32::from_le_bytes([c[0], c[1], c[2], c[3]])
+            } else {
+                u32::from_be_bytes([c[0], c[1], c[2], c[3]])
+            };
+            match char::from_u32(v) {
+                Some(ch) => out.push(ch),
+                None => return Err(format!("UTF-32 解码失败：0x{:08X} 不是有效码点", v)),
+            }
+        }
+        Ok(out)
+    }
+
+    /// UTF-32 编码：按字节序写出 u32 码点（不含 BOM，BOM 由 encode_file 依原文件补回）
+    fn encode_utf32(content: &str, little_endian: bool) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::with_capacity(content.chars().count() * 4);
+        for ch in content.chars() {
+            let b = if little_endian {
+                (ch as u32).to_le_bytes()
+            } else {
+                (ch as u32).to_be_bytes()
+            };
+            out.extend_from_slice(&b);
+        }
+        out
+    }
+
     /// 按编码把字符串编码为字节（不含 BOM）
     fn encode_content(encoding: &str, content: &str) -> Result<Vec<u8>, String> {
         let lower = encoding.to_ascii_lowercase();
         if lower == "utf-16le" || lower == "utf-16be" {
             Ok(Self::encode_utf16(content, lower == "utf-16le"))
+        } else if lower == "utf-32le" || lower == "utf-32be" {
+            Ok(Self::encode_utf32(content, lower == "utf-32le"))
         } else if lower == "utf-8" {
             Ok(content.as_bytes().to_vec())
         } else {
@@ -1581,7 +1703,6 @@ impl FileIoServer {
             "before_sha256": before_sha,
             "after_sha256": serde_json::Value::Null,
             "hardlink": hardlinked,
-            "restored": false,
         });
         let _ = fs::write(&meta, info.to_string());
         // 备份数量上限：超出即清理最旧的（连同 meta）
@@ -1782,8 +1903,15 @@ impl FileIoServer {
             .map_err(|e| e_internal(e, None))?
             .content;
 
-        // CRLF 归一化：read_text_lines 读取时已去除行尾 \r，比较前统一归一避免误拒
-        let norm = |s: &str| s.replace("\r\n", "\n");
+        // CRLF 归一化：read_text_lines 读取时已去除行尾 \r，比较前统一归一避免误拒。
+        // 用 Cow：绝大多数内容不含 \r，此时零分配（旧实现每次比较都复制整份字符串）
+        fn norm(s: &str) -> std::borrow::Cow<'_, str> {
+            if s.contains('\r') {
+                std::borrow::Cow::Owned(s.replace("\r\n", "\n"))
+            } else {
+                std::borrow::Cow::Borrowed(s)
+            }
+        }
 
         // 按模式确定"当前想改范围"并比对
         let (matched, scope, shown): (bool, String, String) = match mode {
@@ -1808,15 +1936,35 @@ impl FileIoServer {
                 (norm(&tail) == norm(exp), "文件末尾(追加点)".to_string(), shown)
             }
             "insert" => {
-                // 匹配插入点 offset 附近内容
+                // offset 是**含 BOM 的文件原始字节偏移**，与写入路径同一基准；
+                // 必须直接在原始字节上取窗口——用解码后 String 的 UTF-8 下标会在
+                // 带 BOM（整体错 3 字节）以及 GBK/UTF-16（下标空间完全不同）时错位。
                 let off = offset.unwrap_or(0) as usize;
-                let char_off = actual_content.floor_char_boundary(off.min(actual_content.len()));
-                let window: String = actual_content[char_off..]
-                    .chars()
-                    .take(exp.chars().count())
-                    .collect();
-                let s = actual_content.floor_char_boundary(char_off.saturating_sub(400));
-                let shown: String = actual_content[s..].chars().take(800).collect();
+                let bom_len = Self::detect_bom(bytes).len();
+                if off < bom_len {
+                    return Err(e_param(
+                        format!(
+                            "插入点 offset={} 落在文件 BOM 内（BOM 占 {} 字节，插入会破坏编码）。请改用 offset>={}",
+                            off, bom_len, bom_len
+                        ),
+                        None,
+                    ));
+                }
+                let off_c = off.min(bytes.len());
+                if !Self::is_char_boundary(encoding_name, bytes, off_c) {
+                    return Err(e_param(
+                        format!(
+                            "插入点 offset={} 不在 {} 的字符边界上（会切断多字节字符）",
+                            off, encoding_name
+                        ),
+                        None,
+                    ));
+                }
+                let tail_text = Self::decode_file(&bytes[off_c..], encoding_name)
+                    .map_err(|e| e_internal(e, None))?
+                    .content;
+                let window: String = tail_text.chars().take(exp.chars().count()).collect();
+                let shown: String = tail_text.chars().take(800).collect();
                 (norm(&window) == norm(exp), format!("插入点 offset={}", off), shown)
             }
             _ => {
@@ -1873,20 +2021,16 @@ impl FileIoServer {
     ) -> Result<&'static str, McpError> {
         let actual = existing_bytes.map(Self::detect_encoding);
         let req = match requested {
-            Some(name) if name.eq_ignore_ascii_case("auto") => None,
+            Some(name) if Self::encoding_is_auto(Some(name)) => None,
             Some(name) => Some(name),
             None => None,
         };
         match (req, actual) {
             (None, Some(act)) => Ok(act),
             (None, None) => Ok("utf-8"),
-            (Some(r), None) => {
-                let enc = Self::get_encoding(r).map_err(|e| e_param(e, None))?;
-                Ok(enc.name())
-            }
+            (Some(r), None) => Self::canonical_encoding(r).map_err(|e| e_param(e, None)),
             (Some(r), Some(act)) => {
-                let enc = Self::get_encoding(r).map_err(|e| e_param(e, None))?;
-                let rn = enc.name();
+                let rn = Self::canonical_encoding(r).map_err(|e| e_param(e, None))?;
                 if rn.eq_ignore_ascii_case(act) {
                     return Ok(rn);
                 }
@@ -2049,12 +2193,13 @@ impl FileIoServer {
         }
     }
 
-    /// 读取待搜索文件并解码，返回 (生效编码名, 内容)；失败时给出可读原因（不再静默跳过）
+    /// 读取待搜索文件并解码，返回 (生效编码名, 内容, 原始字节)；失败时给出可读原因（不再静默跳过）。
+    /// 指纹由调用方在“确有命中”时再算，避免为不命中的候选文件白做一次全量哈希。
     fn read_search_content(
         file_path: &str,
         encoding_raw: Option<&str>,
         encoding_auto: bool,
-    ) -> Result<(String, String, String), String> {
+    ) -> Result<(String, String, Vec<u8>), String> {
         // 先看大小再读：超限文件不必整份读进内存（返回文案与过去一致）
         let size = fs::metadata(file_path)
             .map_err(|e| format!("读取失败: {}", e))?
@@ -2066,8 +2211,6 @@ impl FileIoServer {
             ));
         }
         let bytes = fs::read(file_path).map_err(|e| format!("读取失败: {}", e))?;
-        // 在解码消耗 bytes 之前算好指纹，供调用方直接复用，避免命中文件被二次读盘
-        let fp = Self::fingerprint_short_of_bytes(&bytes);
         if encoding_auto {
             let detected = Self::detect_encoding(&bytes);
             // 自动识别的编码若仍有非法字节，退化为宽松解码（U+FFFD 替换）而不是跳过整个文件，
@@ -2080,19 +2223,21 @@ impl FileIoServer {
                     enc.decode(&bytes).0.into_owned()
                 }
             };
-            Ok((detected.to_string(), content, fp))
+            Ok((detected.to_string(), content, bytes))
         } else {
             let name = encoding_raw.unwrap_or("utf-8");
             if name.eq_ignore_ascii_case("utf-8") {
-                String::from_utf8(bytes)
-                    .map(move |s| ("utf-8".to_string(), s, fp))
-                    .map_err(|_| {
-                        "不是有效的 UTF-8 文本（可指定 encoding=\"auto\" 或显式编码，如 gbk）".to_string()
-                    })
+                match std::str::from_utf8(&bytes) {
+                    Ok(s) => Ok(("utf-8".to_string(), s.to_string(), bytes)),
+                    Err(_) => Err(
+                        "不是有效的 UTF-8 文本（可指定 encoding=\"auto\" 或显式编码，如 gbk）"
+                            .to_string(),
+                    ),
+                }
             } else {
                 let content = Self::decode_bytes(&bytes, name)
                     .map_err(|e| format!("按 {} 解码失败({})", name, e))?;
-                Ok((name.to_string(), content, fp))
+                Ok((name.to_string(), content, bytes))
             }
         }
     }
@@ -2148,11 +2293,21 @@ impl FileIoServer {
         file.seek(SeekFrom::Start(start))
             .map_err(|e| e_internal(format!("Seek 失败: {}", e), None))?;
 
-        let max_len = params.length.unwrap_or(MAX_TEXT_READ_SIZE);
+        // 硬上限：length 传得再大也不一次读入超过 MAX_READ_HARD_LIMIT，避免内存/响应失控
+        let max_len = params
+            .length
+            .unwrap_or(MAX_TEXT_READ_SIZE)
+            .min(MAX_READ_HARD_LIMIT);
         let room = (file_size - start) as usize;
-        // 至少读 4 字节：保证窗口能覆盖一个完整多字节字符，避免 length 过小时分页无法前进
-        let mut read_len = max_len.min(room).max(room.min(4));
-        let mut truncated = read_len < room;
+        // 至少读 4 字节：保证窗口能覆盖一个完整多字节字符，避免 length 过小时分页无法前进；
+        // 但 length=0 是“明确不读内容”，需尊重（否则会被放大成 4 字节并误标截断）
+        let mut read_len = if max_len == 0 {
+            0
+        } else {
+            max_len.min(room).max(room.min(4))
+        };
+        // read_len=0（length=0 或已到文件末尾）不算“被截断”，否则会误报截断告警
+        let mut truncated = read_len < room && read_len > 0;
         let mut buffer = vec![0u8; read_len];
         file.read_exact(&mut buffer)
             .map_err(|e| e_internal(format!("读取失败: {}", e), None))?;
@@ -2160,9 +2315,7 @@ impl FileIoServer {
         // 编码决策：显式指定则直接采用；auto/未指定时始终基于**完整文件**识别编码，
         // 不能用本次读取窗口——窗口可能从多字节字符中间开始/结束，会让 UTF-8 校验失败而误判成 GBK。
         let requested_enc = params.encoding.as_deref();
-        let auto_detect = requested_enc
-            .map(|e| e.is_empty() || e.eq_ignore_ascii_case("auto"))
-            .unwrap_or(true);
+        let auto_detect = Self::encoding_is_auto(requested_enc);
         let (encoding_name, enc_confident) = if auto_detect {
             let probe = Self::encoding_probe_bytes(&params.path, start, truncated, &buffer)
                 .map_err(|e| e_internal(e, None))?;
@@ -2180,8 +2333,12 @@ impl FileIoServer {
             file.seek(SeekFrom::Start(start))
                 .map_err(|e| e_internal(format!("Seek 失败: {}", e), None))?;
             let remaining = (file_size - start) as usize;
-            read_len = max_len.min(remaining).max(remaining.min(4));
-            truncated = read_len < remaining;
+            read_len = if max_len == 0 {
+                0
+            } else {
+                max_len.min(remaining).max(remaining.min(4))
+            };
+            truncated = read_len < remaining && read_len > 0;
             buffer = vec![0u8; read_len];
             file.read_exact(&mut buffer)
                 .map_err(|e| e_internal(format!("读取失败: {}", e), None))?;
@@ -2236,6 +2393,17 @@ impl FileIoServer {
                     ));
                 }
             }
+        } else if encoding_name.eq_ignore_ascii_case("utf-32le")
+            || encoding_name.eq_ignore_ascii_case("utf-32be")
+        {
+            // encoding_rs 不支持 UTF-32：按 4 字节对齐裁掉尾部不完整码元后走内置解码
+            let mut end = body.len();
+            if truncated {
+                end -= end % 4;
+            }
+            consumed = end;
+            Self::decode_utf32(&body[..end], encoding_name.eq_ignore_ascii_case("utf-32le"))
+                .map_err(|e| e_internal(e, None))?
         } else if truncated {
             // 双字节/多字节编码同理：尾部可能截断在字符中间，逐字节回退（最多 4 字节）再试
             let mut end = body.len();
@@ -2285,7 +2453,7 @@ impl FileIoServer {
                 .collect::<Vec<_>>()
                 .join("\n")
         } else {
-            content.clone()
+            content
         };
 
         let trunc_warn = if truncated {
@@ -2376,11 +2544,7 @@ impl FileIoServer {
         // 说明编码识别不可靠（典型：GBK 文件被误判成 UTF-8），此时无论 overwrite/append/insert
         // 继续写都可能把文件毁成另一种编码或混合编码乱码，直接拒绝并要求显式指定 encoding。
         // 显式指定 encoding 时由 resolve_write_encoding 保证与原文件一致，无需重复校验。
-        let enc_explicit = params
-            .encoding
-            .as_deref()
-            .map(|n| !n.eq_ignore_ascii_case("auto"))
-            .unwrap_or(false);
+        let enc_explicit = !Self::encoding_is_auto(params.encoding.as_deref());
         if !enc_explicit {
             if let Some(b) = existing_bytes.as_deref() {
                 // 大文件（> 8MB）只校验头部样本：整份解码对 append/insert 大文件纯属浪费 CPU，
@@ -2460,7 +2624,15 @@ impl FileIoServer {
                     v
                 }
                 "append" => {
-                    let mut v = existing_bytes.clone().unwrap_or_default();
+                    // 与真实写入一致：新建文件要先补默认 BOM，否则 preview 的预计 sha 会与落盘不符
+                    let mut v = if existing_bytes.is_none() {
+                        bom.to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    if let Some(b) = existing_bytes.as_deref() {
+                        v.extend_from_slice(b);
+                    }
                     v.extend_from_slice(&bytes);
                     v
                 }
@@ -2475,6 +2647,17 @@ impl FileIoServer {
                         )
                     })?;
                     let off = (params.offset.unwrap_or(0) as usize).min(original.len());
+                    if off < bom.len() {
+                        return Err(e_param(
+                            format!(
+                                "insert 的 offset={} 落在文件 BOM 内（BOM 占 {} 字节，插入会破坏编码）。请改用 offset>={}",
+                                off,
+                                bom.len(),
+                                bom.len()
+                            ),
+                            None,
+                        ));
+                    }
                     let mut v = Vec::with_capacity(original.len() + bytes.len());
                     v.extend_from_slice(&original[..off]);
                     v.extend_from_slice(&bytes);
@@ -2517,20 +2700,27 @@ impl FileIoServer {
                 Ok(format!("OK {} | {} | {}B | sha256:{}{}", params.path, encoding_label, out.len(), Self::fingerprint_short_of_bytes(&out), tail))
             }
             "append" => {
-                // append 是"就地追加"，硬链接备份会跟着变，因此不做备份（可回滚性由 OCC + 原子写覆盖其他模式）
-                let mut full = existing_bytes.clone().unwrap_or_default();
+                // append 是"就地追加"，硬链接备份会跟着变，因此不做备份（可回滚性由 OCC + 原子写覆盖其他模式）。
+                // 新建文件时（existing 为空）必须先补默认 BOM，否则 UTF-16/32 会写成“无 BOM”而被下次误判成 GBK。
+                let prefix: &[u8] = if existing_bytes.is_none() { bom } else { &[] };
                 retry_io(|| {
                     let mut file = OpenOptions::new()
                         .append(true)
                         .create(true)
                         .open(&params.path)?;
+                    if !prefix.is_empty() {
+                        file.write_all(prefix)?;
+                    }
                     file.write_all(&bytes)?;
                     file.flush()?;
                     Ok(())
                 })
                 .map_err(|e| e_internal(format!("E_WRITE 追加失败: {}", e), None))?;
+                let mut full = existing_bytes.clone().unwrap_or_default();
+                full.extend_from_slice(prefix);
                 full.extend_from_slice(&bytes);
-                Ok(format!("OK {} | {} | +{}B append | sha256:{}", params.path, encoding_label, bytes.len(), Self::fingerprint_short_of_bytes(&full)))
+                let added = prefix.len() + bytes.len();
+                Ok(format!("OK {} | {} | +{}B append | sha256:{}", params.path, encoding_label, added, Self::fingerprint_short_of_bytes(&full)))
             }
             "insert" => {
                 let off = params.offset.unwrap_or(0) as usize;
@@ -2541,6 +2731,18 @@ impl FileIoServer {
                     )
                 })?;
                 let off = off.min(original.len());
+                // offset 是含 BOM 的原始字节偏移：落在 BOM 内会把新内容插到 BOM 之前/中间，直接破坏编码
+                if off < bom.len() {
+                    return Err(e_param(
+                        format!(
+                            "insert 的 offset={} 落在文件 BOM 内（BOM 占 {} 字节，插入会破坏编码）。请改用 offset>={} 或 overwrite 模式",
+                            off,
+                            bom.len(),
+                            bom.len()
+                        ),
+                        None,
+                    ));
+                }
                 // offset 是字节偏移：必须落在字符边界上，否则会把一个多字节字符劈成两半导致乱码
                 if !Self::is_char_boundary(encoding_name, &original, off) {
                     return Err(e_param(
@@ -2595,6 +2797,25 @@ impl FileIoServer {
             p.path = self.resolve_path(&p.path)?;
             p
         };
+        // 整份读入内存 + 解码会带来 2~3 倍内存放大，设上限避免超大文件把内存吃满；
+        // 需要读大文件请改用 read_text_file（支持 offset/length 分页）。
+        // 注意保持与 fs::read 一致的错误码：文件不存在仍是 E_NOT_FOUND，不要退化成 E_READ
+        let size = match fs::metadata(&params.path) {
+            Ok(m) => m.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(e_internal(format!("文件不存在: {}", params.path), None));
+            }
+            Err(e) => return Err(e_internal(format!("无法获取文件信息: {}", e), None)),
+        };
+        if size > MAX_TEXT_LINES_FILE_SIZE {
+            return Err(e_param(
+                format!(
+                    "文件过大({}B > {}B)，read_text_lines 会整份读入内存。请改用 read_text_file 的 offset/length 分页读取",
+                    size, MAX_TEXT_LINES_FILE_SIZE
+                ),
+                None,
+            ));
+        }
         let bytes = fs::read(&params.path).map_err(|e| {
             match e.kind() {
                 std::io::ErrorKind::NotFound => {
@@ -2609,7 +2830,7 @@ impl FileIoServer {
 
         let file_size = bytes.len();
         let (encoding_name, enc_confident) = Self::resolve_encoding_with_confidence(
-            params.encoding.as_deref().or(Some("auto")),
+            params.encoding.as_deref(),
             &bytes,
         )
         .map_err(|e| e_param(e, None))?;
@@ -2734,7 +2955,12 @@ impl FileIoServer {
             .map_err(|e| e_internal(format!("Seek 失败: {}", e), None))?;
 
         let remaining = (file_size - start) as usize;
-        let read_len = params.length.unwrap_or(remaining).min(remaining);
+        // 硬上限：HEX dump 体积约为原字节的 4~5 倍，不加限制会把响应撑爆
+        let read_len = params
+            .length
+            .unwrap_or(remaining)
+            .min(remaining)
+            .min(MAX_BINARY_DUMP_LIMIT);
         let mut buffer = vec![0u8; read_len];
         file.read_exact(&mut buffer)
             .map_err(|e| e_internal(format!("读取失败: {}", e), None))?;
@@ -2814,9 +3040,16 @@ dry_run=true 只返回 HEX diff 预览不落盘",
             ));
         }
         let dry_run = params.dry_run.unwrap_or(false);
-        // 与 expected_hex 使用同一套宽松解析：支持 0x/0X 前缀与空格/冒号等分隔符；空内容直接拒绝
+        // 与 expected_hex 使用同一套宽松解析：支持 0x/0X 前缀与空格/冒号等分隔符。
+        // 空内容 = 0 字节：replace 可用于“删除字节”，但 overwrite 会把文件清空，故要求显式确认。
         let bytes = Self::parse_hex_flexible(&params.hex_data)
             .map_err(|e| e_param(format!("hex_data 解析失败: {}", e), None))?;
+        if bytes.is_empty() && mode == "overwrite" && params.expected_hex.is_none() {
+            return Err(e_param(
+                "hex_data 为空，overwrite 会把文件清空为 0 字节。确需清空请显式传 expected_hex 作为确认；只是要删除部分字节请改用 mode=replace + replace_length",
+                None,
+            ));
+        }
 
         // 自动创建父目录
         Self::ensure_parent_dir(&params.path)
@@ -3054,7 +3287,7 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
         }
         // 默认 auto：与 read_text_file 一致，逐文件自动识别编码（可区分 GBK/UTF-8）
         let encoding_raw = params.encoding.as_deref();
-        let encoding_auto = encoding_raw.is_none_or(|e| e.eq_ignore_ascii_case("auto"));
+        let encoding_auto = Self::encoding_is_auto(encoding_raw);
 
         // literal 模式转义正则元字符：AI 常直接传含 . * [ 的普通文本，避免被当正则误匹配
         let pattern_str = if literal {
@@ -3117,7 +3350,7 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
             searched_files += 1;
 
             // 读取 + 解码（失败不再静默跳过，统一计入 skipped 以便调用方排查）
-            let (enc_label, content, fp) =
+            let (enc_label, content, raw_bytes) =
                 match Self::read_search_content(file_path, encoding_raw, encoding_auto) {
                     Ok(v) => v,
                     Err(reason) => {
@@ -3157,12 +3390,12 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
             let stored_in_file = hits.len();
             stored += stored_in_file;
 
-            // 文件块头带上 sha256，可直接回传给 edit_file_lines 的 expected_sha256
-            // （复用读取阶段已算好的指纹，避免命中文件被二次读盘）
+            // 文件块头带上 sha256，可直接回传给 edit_file_lines 的 expected_sha256。
+            // 指纹只在“确有命中”时才计算：不命中的候选文件不做无谓的全量哈希。
             let mut block = format!(
                 "{} | sha256:{} | enc:{} | {} matches",
                 file_path,
-                fp,
+                Self::fingerprint_short_of_bytes(&raw_bytes),
                 enc_label,
                 stored_in_file
             );
@@ -3232,7 +3465,7 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
         }
         if scan.capped {
             warnings.push(format!(
-                "⚠️ 候选文件已达上限 {}，目录可能未完全覆盖（已收集 {} 个，另有 {} 个被过滤）。可提高 max_files 或收窄范围后重试",
+                "⚠️ 候选文件已达上限 {}，目录可能未完全覆盖（已收集 {} 个；另有 {} 个候选因 include/exclude/后缀/隐藏被过滤，未计入收集上限）。可提高 max_files 或收窄范围后重试",
                 max_files, files.len(), scan.filtered
             ));
         }
@@ -3515,7 +3748,8 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
         };
         let recursive = params.recursive.unwrap_or(false);
         let include_dirs = params.include_dirs.unwrap_or(true);
-        let max_results = params.max_results.unwrap_or(500);
+        // max_results=0 会让工具“立即截断返回空”，这里兜到至少 1，避免空结果难以归因
+        let max_results = params.max_results.unwrap_or(500).max(1);
         let show_size = params.show_size.unwrap_or(true);
         let show_modified = params.show_modified.unwrap_or(false);
 
@@ -3750,7 +3984,7 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
         let _file_guard = Self::acquire_file_lock(&params.path);
 
         if !path.exists() {
-            return Ok(format!("文件不存在: {}", params.path));
+            return Err(e_param(format!("文件不存在: {}", params.path), None));
         }
 
         if !path.is_file() {
@@ -3989,7 +4223,7 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
             request = request.body(body.clone());
         }
 
-        let response = request
+        let mut response = request
             .timeout(std::time::Duration::from_secs(timeout_secs))
             .send()
             .await
@@ -4011,31 +4245,52 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
             format!("\n{}\n---\n", resp_headers.join("\n"))
         };
 
+        // 统一按上限读取响应体：三个分支都不再无限缓冲
+        // （旧实现 text/json/binary 都会先把整份响应读进内存，超大响应会 OOM）
+        const MAX_FETCH_BODY: usize = 8 * 1024 * 1024;
+        let mut body_bytes: Vec<u8> = Vec::new();
+        let mut body_truncated = false;
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    if body_bytes.len() + chunk.len() > MAX_FETCH_BODY {
+                        let room = MAX_FETCH_BODY - body_bytes.len();
+                        body_bytes.extend_from_slice(&chunk[..room]);
+                        body_truncated = true;
+                        break;
+                    }
+                    body_bytes.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(e) => return Err(e_internal(format!("读取响应失败: {}", e), None)),
+            }
+        }
+        let body_note = if body_truncated {
+            format!("\n... 响应体超过 {}B 上限，已截断", MAX_FETCH_BODY)
+        } else {
+            String::new()
+        };
+
         match response_type {
             "json" => {
-                let body = response.text().await.map_err(|e| {
-                    e_internal(format!("读取响应失败: {}", e), None)
-                })?;
+                let body = String::from_utf8_lossy(&body_bytes).into_owned();
                 let formatted = serde_json::from_str::<serde_json::Value>(&body)
-                    .map(|v| serde_json::to_string_pretty(&v).unwrap_or(body.clone()))
+                    .map(|v| serde_json::to_string_pretty(&v).unwrap_or_else(|_| body.clone()))
                     .unwrap_or(body);
 
                 Ok(format!(
-                    "{}{}```\n{}\n```",
-                    status_line, headers_block, formatted
+                    "{}{}```\n{}\n```{}",
+                    status_line, headers_block, formatted, body_note
                 ))
             }
             "binary" => {
-                let bytes = response.bytes().await.map_err(|e| {
-                    e_internal(format!("读取响应失败: {}", e), None)
-                })?;
-                let hex_preview: String = bytes
+                let hex_preview: String = body_bytes
                     .iter()
                     .take(256)
                     .map(|b| format!("{:02X} ", b))
                     .collect();
-                let truncated = if bytes.len() > 256 {
-                    format!("\n... {}B total", bytes.len())
+                let truncated = if body_bytes.len() > 256 || body_truncated {
+                    format!("\n... {}B total{}", body_bytes.len(), body_note)
                 } else {
                     String::new()
                 };
@@ -4047,16 +4302,14 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
             }
             _ => {
                 // text
-                let body = response.text().await.map_err(|e| {
-                    e_internal(format!("读取响应失败: {}", e), None)
-                })?;
+                let body = String::from_utf8_lossy(&body_bytes).into_owned();
 
                 let preview = if body.len() > 100_000 {
                     // 按字符边界截断：第 10 万字节可能落在多字节字符中间，直接切片会 panic
                     let cut = body.floor_char_boundary(100_000);
-                    format!("{}\n... {}B total", &body[..cut], body.len())
+                    format!("{}\n... {}B total{}", &body[..cut], body.len(), body_note)
                 } else {
-                    body
+                    format!("{}{}", body, body_note)
                 };
 
                 Ok(format!(
@@ -4133,6 +4386,14 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
                 target_path.to_path_buf()
             };
 
+            let dest_str = dest.to_string_lossy().to_string();
+            // 源与目标相同（复制到自身）：直接跳过，否则 overwrite=true 时 fs::copy 会报“文件被占用”
+            if src.as_str() == dest_str {
+                results.push(format!("跳过 {} (源与目标相同)", dest.display()));
+                skipped += 1;
+                continue;
+            }
+
             if dest.exists() && !overwrite {
                 results.push(format!("跳过 {} (已存在)", dest.display()));
                 skipped += 1;
@@ -4144,7 +4405,6 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
                 .len();
 
             // 与目标文件的其他写操作互斥（进程内锁 + 跨进程文件锁）
-            let dest_str = dest.to_string_lossy().to_string();
             let lock = self.lock_for(&dest_str);
             let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
             let _file_guard = Self::acquire_file_lock(&dest_str);
@@ -4366,6 +4626,12 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
                 .map(|s| s.trim_end_matches('\r').to_string())
                 .collect();
             // 逐行比较，兼容 \r\n
+            // 容忍 expected_old 尾随的单个换行（AI 常把整行连同换行一起复制过来）：
+            // 否则 split 会多出一个空元素导致长度不等而误拒。
+            let expected = expected
+                .strip_suffix("\r\n")
+                .or_else(|| expected.strip_suffix('\n'))
+                .unwrap_or(expected);
             let expected_lines: Vec<&str> = expected.split('\n').collect();
             let matches = expected_lines.len() == actual_lines.len()
                 && expected_lines.iter().zip(actual_lines.iter()).all(|(e, a)| e.trim_end_matches('\r') == a.as_str());
@@ -4406,6 +4672,12 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
 
         // 锚点定位：把 anchor_text / anchor_regex 换算成行号（默认要求全文唯一命中，避免改错位置）
         let used_anchor = params.anchor_text.is_some() || params.anchor_regex.is_some();
+        if params.anchor_text.is_some() && params.anchor_regex.is_some() {
+            return Err(e_param(
+                "anchor_text 与 anchor_regex 不能同时使用，请二选一",
+                None,
+            ));
+        }
         let mut start_line = params.start_line;
         let mut end_line = params.end_line;
         if used_anchor {
@@ -4543,6 +4815,15 @@ extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件�
                     .map(|s| s.trim_end_matches('\r').to_string())
                     .collect();
                 let idx = start - 1;
+                // 插入点在文件末尾且文件以换行结尾时，split 产生的末尾空串只是“结尾换行标记”，
+                // 应插到它之前，否则会凭空多出一个空行（与 append_lines 保持一致）
+                let idx = if idx == modified.len()
+                    && modified.last().map(|s| s.is_empty()).unwrap_or(false)
+                {
+                    idx - 1
+                } else {
+                    idx
+                };
                 let mut new = Vec::with_capacity(total_lines + insert_lines.len());
                 new.extend(modified.drain(..idx));
                 new.extend(insert_lines);
