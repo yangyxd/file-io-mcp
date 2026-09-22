@@ -11,7 +11,7 @@ use rmcp::transport::streamable_http_server::{
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use regex::Regex;
 use globset::{Glob, GlobMatcher};
 use sha2::{Sha256, Digest};
@@ -263,18 +263,32 @@ struct RegexReplaceParams {
 struct TextSearchParams {
     /// 文件或目录（目录则搜索其下文件）
     path: String,
-    /// 搜索用正则
+    /// 搜索内容：mode=literal 时按普通文本；mode=regex 时按正则
     pattern: String,
+    /// 匹配模式：regex(默认，正则) / literal(普通文本，pattern 里的 . * [ 等一律当字面量，不用转义)
+    mode: Option<String>,
     /// 区分大小写，默认 true
     case_sensitive: Option<bool>,
     /// 最多返回条数，默认 100
     max_results: Option<usize>,
-    /// 后缀过滤，如 "pas"（仅目录模式）
+    /// 后缀过滤(单个)，如 "pas"；等价于 extensions 只写一项（仅目录模式）
     extension: Option<String>,
+    /// 后缀过滤(多个)，如 ["pas","pp"]，命中任一即可（仅目录模式）
+    extensions: Option<Vec<String>>,
     /// 递归子目录，默认 true（仅目录模式）
     recursive: Option<bool>,
-    /// 编码，默认 utf-8（多编码文件建议显式指定）
+    /// 编码，默认 auto（逐文件自动识别，可区分 GBK/UTF-8）；显式指定则只按该编码解码
     encoding: Option<String>,
+    /// 跳过隐藏文件与隐藏目录（以 . 开头，如 .git/.env），默认 true；false=全都搜（仅目录模式）
+    skip_hidden: Option<bool>,
+    /// 仅搜索匹配这些 glob 的文件，如 ["*.rs","src/**/*.ts"]；任一命中即可（仅目录模式）
+    include: Option<Vec<String>>,
+    /// 跳过匹配这些 glob 的文件/目录，如 ["*.min.js","node_modules/**"]；目录命中即整棵剪枝（仅目录模式）
+    exclude: Option<Vec<String>>,
+    /// 目录模式下最多收集多少个文件，默认 max_results*10；达到上限会在结果中告警
+    max_files: Option<usize>,
+    /// 命中行前后各显示多少行上下文，默认 0（>0 时同一文件的相邻命中会合并显示）
+    context_lines: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -301,6 +315,8 @@ struct ListFilesParams {
 struct DeleteFileParams {
     /// 文件路径
     path: String,
+    /// 删前确认：必须显式传 true 才会真正删除；未传(false)时返回提示不删，防止误删
+    confirm: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -325,7 +341,7 @@ struct EditFileLinesParams {
     operation: String,
     /// 文件路径
     path: Option<String>,
-    /// 同 path（兼容字段）
+    /// 【已废弃，仅为兼容旧调用保留】同 path，请改用 path
     file_path: Option<String>,
     /// 起始行号(1-based)：delete/insert/replace
     start_line: Option<usize>,
@@ -452,6 +468,17 @@ fn normalize_path(p: &std::path::Path) -> std::path::PathBuf {
         }
     }
     parts.into_iter().collect()
+}
+
+/// 目录扫描统计：用于向调用方解释"搜到了什么、为什么可能没搜全"
+#[derive(Default)]
+struct SearchScanStat {
+    /// 被 include/exclude/extension 过滤掉的文件数
+    filtered: usize,
+    /// 因 exclude 被整棵剪枝的目录数
+    pruned_dirs: usize,
+    /// 是否因达到 max_files 上限而提前停止（目录可能未完全覆盖）
+    capped: bool,
 }
 
 impl FileIoServer {
@@ -1432,7 +1459,12 @@ impl FileIoServer {
                 (norm(&window) == norm(exp), format!("插入点 offset={}", off), shown)
             }
             _ => {
-                (norm(&actual_content) == norm(exp), "整个文件".to_string(), actual_content.clone())
+                // 大文件只回头尾摘要，避免把整份（可能含敏感信息）内容回显出去
+                (
+                    norm(&actual_content) == norm(exp),
+                    "整个文件".to_string(),
+                    Self::clip_guard_preview(&actual_content),
+                )
             }
         };
 
@@ -1446,6 +1478,27 @@ impl FileIoServer {
             ),
             None,
         ))
+    }
+
+    /// 守卫校验失败时回显的"当前内容"预览：
+    /// 内容不长则原样返回；过长只保留头尾并附长度与指纹，避免整份文件被回显（大文件刷屏 / 敏感内容外泄）
+    fn clip_guard_preview(content: &str) -> String {
+        const PREVIEW_HEAD: usize = 2000;
+        const PREVIEW_TAIL: usize = 500;
+        let chars: Vec<char> = content.chars().collect();
+        if chars.len() <= PREVIEW_HEAD + PREVIEW_TAIL {
+            return content.to_string();
+        }
+        let head: String = chars[..PREVIEW_HEAD].iter().collect();
+        let tail: String = chars[chars.len() - PREVIEW_TAIL..].iter().collect();
+        format!(
+            "{}\n…（中间省略 {} 字符；全文共 {} 字符，解码后文本 sha256:{})…\n{}",
+            head,
+            chars.len() - PREVIEW_HEAD - PREVIEW_TAIL,
+            chars.len(),
+            Self::fingerprint_short_of_bytes(content.as_bytes()),
+            tail
+        )
     }
 
     /// 写入类操作的编码决策：
@@ -1488,13 +1541,21 @@ impl FileIoServer {
         }
     }
 
-    /// 递归收集目录下符合后缀过滤的文件路径
+    /// 递归收集目录下待搜索的文件路径
+    /// - include：任一 glob 命中才收录（同时按文件名与相对根路径匹配）
+    /// - exclude：任一 glob 命中则跳过；命中目录时整棵剪枝
+    /// - stat：记录过滤/剪枝/截断情况，供输出向调用方解释"搜到了什么、为什么没搜全"
     fn collect_files(
         dir: &std::path::Path,
-        ext_filter: &Option<String>,
+        root: &std::path::Path,
+        ext_filter: &[String],
+        include: &Option<Vec<GlobMatcher>>,
+        exclude: &Option<Vec<GlobMatcher>>,
         recursive: bool,
-        max_results: usize,
+        skip_hidden: bool,
+        max_files: usize,
         files: &mut Vec<String>,
+        stat: &mut SearchScanStat,
     ) -> Result<(), String> {
         let entries = fs::read_dir(dir)
             .map_err(|e| format!("无法读取目录 {}: {}", dir.display(), e))?;
@@ -1503,46 +1564,175 @@ impl FileIoServer {
         sorted.sort_by_key(|e| e.file_name());
 
         for entry in sorted {
-            if files.len() >= max_results {
+            if files.len() >= max_files {
+                stat.capped = true;
                 return Ok(());
             }
 
             // 跳过本工具自己产生的备份目录 / 临时文件 / 锁文件
-            if is_internal_file(&entry.file_name().to_string_lossy()) {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if is_internal_file(&name) {
                 continue;
             }
+
+            let entry_path = entry.path();
+            // 相对搜索根的路径（统一 / 分隔），供 "src/**/*.rs" 这类 glob 匹配
+            let rel = entry_path
+                .strip_prefix(root)
+                .unwrap_or(entry_path.as_path())
+                .to_string_lossy()
+                .replace('\\', "/");
 
             let file_type = entry.file_type().ok();
             let is_dir = file_type.as_ref().map(|ft| ft.is_dir()).unwrap_or(false);
             let is_file = file_type.as_ref().map(|ft| ft.is_file()).unwrap_or(false);
 
-            if is_dir && recursive {
-                Self::collect_files(
-                    &entry.path(),
-                    ext_filter,
-                    recursive,
-                    max_results,
-                    files,
-                )?;
+            // 隐藏项（以 . 开头，如 .git/.env）默认跳过；若 include 显式点名则放行
+            let hidden = skip_hidden
+                && name.starts_with('.')
+                && !Self::glob_match_any(&name, &rel, include);
+
+            if is_dir {
+                // exclude 命中目录时整棵剪枝，不再递归进去（如 "node_modules/**"）
+                if Self::dir_excluded(&name, &rel, exclude) {
+                    stat.pruned_dirs += 1;
+                    continue;
+                }
+                if hidden {
+                    stat.pruned_dirs += 1;
+                    continue;
+                }
+                if recursive {
+                    Self::collect_files(
+                        &entry_path, root, ext_filter, include, exclude, recursive, skip_hidden,
+                        max_files, files, stat,
+                    )?;
+                }
                 continue;
             }
 
             if is_file {
-                if let Some(ref ext) = ext_filter {
-                    let file_ext = entry
-                        .path()
+                if hidden {
+                    stat.filtered += 1;
+                    continue;
+                }
+                if Self::glob_match_any(&name, &rel, exclude) {
+                    stat.filtered += 1;
+                    continue;
+                }
+                if include.is_some() && !Self::glob_match_any(&name, &rel, include) {
+                    stat.filtered += 1;
+                    continue;
+                }
+                if !ext_filter.is_empty() {
+                    let file_ext = entry_path
                         .extension()
                         .and_then(|e| e.to_str())
                         .map(|e| e.to_lowercase())
                         .unwrap_or_default();
-                    if file_ext != *ext {
+                    if !ext_filter.iter().any(|e| *e == file_ext) {
+                        stat.filtered += 1;
                         continue;
                     }
                 }
-                files.push(entry.path().to_string_lossy().to_string());
+                files.push(entry_path.to_string_lossy().to_string());
             }
         }
         Ok(())
+    }
+
+    /// glob 命中判断：同时按文件名与相对路径匹配
+    /// （"*.rs" 命中文件名，"src/**/*.rs" 命中相对路径）
+    fn glob_match_any(name: &str, rel: &str, matchers: &Option<Vec<GlobMatcher>>) -> bool {
+        match matchers {
+            None => false,
+            Some(ms) => ms.iter().any(|m| m.is_match(name) || m.is_match(rel)),
+        }
+    }
+
+    /// 目录是否被 exclude 命中：额外按 "{rel}/子项" 再试一次，
+    /// 使 "node_modules/**"、"**/dist/**" 这类写法也能剪掉目录本身
+    fn dir_excluded(name: &str, rel: &str, exclude: &Option<Vec<GlobMatcher>>) -> bool {
+        if Self::glob_match_any(name, rel, exclude) {
+            return true;
+        }
+        match exclude {
+            None => false,
+            Some(ms) => {
+                let child = format!("{}/__x__", rel);
+                ms.iter().any(|m| m.is_match(&child))
+            }
+        }
+    }
+
+    /// 编译 glob 列表；空列表等同于未设置
+    fn compile_globs(
+        list: &Option<Vec<String>>,
+        field: &str,
+    ) -> Result<Option<Vec<GlobMatcher>>, McpError> {
+        match list {
+            None => Ok(None),
+            Some(items) => {
+                if items.is_empty() {
+                    return Ok(None);
+                }
+                let mut out = Vec::with_capacity(items.len());
+                for it in items {
+                    let g = Glob::new(it).map_err(|e| {
+                        e_param(format!("{} 的 glob 表达式 '{}' 非法: {}", field, it, e), None)
+                    })?;
+                    out.push(g.compile_matcher());
+                }
+                Ok(Some(out))
+            }
+        }
+    }
+
+    /// 读取待搜索文件并解码，返回 (生效编码名, 内容)；失败时给出可读原因（不再静默跳过）
+    fn read_search_content(
+        file_path: &str,
+        encoding_raw: Option<&str>,
+        encoding_auto: bool,
+    ) -> Result<(String, String), String> {
+        let bytes = fs::read(file_path).map_err(|e| format!("读取失败: {}", e))?;
+        if bytes.len() as u64 > MAX_REGEX_FILE_SIZE {
+            return Err(format!(
+                "文件过大({}B > {}B)，已跳过",
+                bytes.len(),
+                MAX_REGEX_FILE_SIZE
+            ));
+        }
+        if encoding_auto {
+            let detected = Self::detect_encoding(&bytes);
+            let content = Self::decode_bytes(&bytes, detected)
+                .map_err(|e| format!("按 {} 解码失败({})", detected, e))?;
+            Ok((detected.to_string(), content))
+        } else {
+            let name = encoding_raw.unwrap_or("utf-8");
+            if name.eq_ignore_ascii_case("utf-8") {
+                String::from_utf8(bytes)
+                    .map(|s| ("utf-8".to_string(), s))
+                    .map_err(|_| {
+                        "不是有效的 UTF-8 文本（可指定 encoding=\"auto\" 或显式编码，如 gbk）".to_string()
+                    })
+            } else {
+                let content = Self::decode_bytes(&bytes, name)
+                    .map_err(|e| format!("按 {} 解码失败({})", name, e))?;
+                Ok((name.to_string(), content))
+            }
+        }
+    }
+
+    /// 搜索结果里展示的单行文本：超长时截断，避免一行刷屏（保留原文缩进，可直接作为 expected_old）
+    fn clip_line(line: &str) -> String {
+        const MAX_SEARCH_LINE_LEN: usize = 300;
+        let chars: Vec<char> = line.chars().collect();
+        if chars.len() <= MAX_SEARCH_LINE_LEN {
+            line.to_string()
+        } else {
+            let head: String = chars[..MAX_SEARCH_LINE_LEN].iter().collect();
+            format!("{}…(该行共 {} 字符，已截断)", head, chars.len())
+        }
     }
 }
 
@@ -2252,7 +2442,10 @@ impl FileIoServer {
     /// 搜索文件/目录中的文本内容(正则)
     #[tool(
         name = "text_search",
-        description = "在文件/目录中正则搜索，返回 文件:行号:内容(带命中数)。目录默认递归，可 extension 过滤",
+        description = "在文件/目录中搜索文本。mode=regex(默认，正则)/literal(普通文本，pattern 无需转义)。\
+结果按文件分组(含 sha256，可直接用于 edit_file_lines 的 expected_sha256)，每条 行号:列:[命中片段] \"整行原文\"。\
+目录默认递归并自动跳过隐藏文件/目录(.git/.env 等，skip_hidden=false 可关)，可用 include/exclude(glob)、\
+extension/extensions、max_files 控制范围；encoding 默认 auto(逐文件识别，可区分 GBK/UTF-8)；context_lines>0 附带上下文行",
         annotations(title = "文本搜索", read_only_hint = true)
     )]
     fn text_search(
@@ -2265,171 +2458,280 @@ impl FileIoServer {
             p
         };
         let case_sensitive = params.case_sensitive.unwrap_or(true);
-        let max_results = params.max_results.unwrap_or(100);
+        let max_results = params.max_results.unwrap_or(100).max(1);
         let recursive = params.recursive.unwrap_or(true);
+        let context_lines = params.context_lines.unwrap_or(0);
+        let skip_hidden = params.skip_hidden.unwrap_or(true);
+        // 默认 regex（保持既有行为）；literal 时把 pattern 当普通文本
+        let literal = match params.mode.as_deref() {
+            None => false,
+            Some(m) if m.eq_ignore_ascii_case("literal") => true,
+            Some(m) if m.eq_ignore_ascii_case("regex") => false,
+            Some(m) => {
+                return Err(e_param(
+                    format!("不支持的 mode: {}，可选: regex(默认), literal", m),
+                    None,
+                ))
+            }
+        };
+        // 默认 auto：与 read_text_file 一致，逐文件自动识别编码（可区分 GBK/UTF-8）
         let encoding_raw = params.encoding.as_deref();
-        let encoding_auto = encoding_raw.map_or(false, |e| e.eq_ignore_ascii_case("auto"));
+        let encoding_auto = encoding_raw.map_or(true, |e| e.eq_ignore_ascii_case("auto"));
 
-        let pattern_str = if case_sensitive {
-            params.pattern.clone()
+        // literal 模式转义正则元字符：AI 常直接传含 . * [ 的普通文本，避免被当正则误匹配
+        let pattern_str = if literal {
+            regex::escape(&params.pattern)
         } else {
-            format!("(?i){}", params.pattern)
+            params.pattern.clone()
+        };
+        let pattern_str = if case_sensitive {
+            pattern_str
+        } else {
+            format!("(?i){}", pattern_str)
         };
 
         let re = Regex::new(&pattern_str).map_err(|e| {
             e_param(format!("正则表达式错误: {}", e), None)
         })?;
 
-        // 解析后缀过滤（去掉可能的 . 前缀）
-        let ext_filter: Option<String> = params.extension.as_ref().map(|e| {
-            e.trim_start_matches('.').to_lowercase()
-        });
+        // 后缀过滤（去掉可能的 . 前缀；extension 与 extensions 可混用，取并集）
+        let mut ext_list: Vec<String> = Vec::new();
+        for e in params.extension.iter().chain(
+            params.extensions.iter().flatten(),
+        ) {
+            let e = e.trim_start_matches('.').to_lowercase();
+            if !e.is_empty() && !ext_list.contains(&e) {
+                ext_list.push(e);
+            }
+        }
+        // 目录模式下的范围过滤：include(白名单) / exclude(黑名单)，均为 glob
+        let include = Self::compile_globs(&params.include, "include")?;
+        let exclude = Self::compile_globs(&params.exclude, "exclude")?;
 
         let path = std::path::Path::new(&params.path);
         let is_dir = path.is_dir();
 
-        // 收集需要搜索的文件列表（使用更大的文件收集上限，避免限制搜索结果）
-        let files: Vec<String> = if is_dir {
-            let mut files = Vec::new();
-            let max_files = max_results * 10; // 收集最多 10 倍于结果数量的文件
-            Self::collect_files(path, &ext_filter, recursive, max_files, &mut files)
-                .map_err(|e| e_internal(e, None))?;
-            files
+        // 收集需要搜索的文件列表（文件数上限独立控制，达到上限会被明确告警而不是静默吞掉）
+        let max_files = params.max_files.unwrap_or(max_results * 10).max(1);
+        let mut files: Vec<String> = Vec::new();
+        let mut scan = SearchScanStat::default();
+        if is_dir {
+            Self::collect_files(
+                path, path, &ext_list, &include, &exclude, recursive, skip_hidden, max_files,
+                &mut files, &mut scan,
+            )
+            .map_err(|e| e_internal(e, None))?;
         } else {
-            vec![params.path.clone()]
-        };
-
-        let mut results = Vec::new();
-        let mut total_matches = 0usize;
-        let mut searched_files = 0usize;
-        let mut matched_files = 0usize;
-
-        for file_path in &files {
-            if results.len() >= max_results {
-                break;
-            }
-
-            searched_files += 1;
-            let mut file_has_match = false;
-
-            if encoding_auto {
-                // auto 模式：读取字节 → 检测编码 → 解码 → 搜索
-                let bytes = match fs::read(file_path) {
-                    Ok(b) => b,
-                    Err(_) => continue,
-                };
-                let detected = Self::detect_encoding(&bytes);
-                let content = match Self::decode_bytes(&bytes, detected) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                for (line_idx, line) in content.lines().enumerate() {
-                    if results.len() >= max_results { break; }
-                    for mat in re.find_iter(line) {
-                        if results.len() >= max_results { break; }
-                        total_matches += 1;
-                        file_has_match = true;
-                        results.push(format!(
-                            "  {}:{}:{}  [{}] \"{}\"",
-                            file_path,
-                            line_idx + 1,
-                            mat.start() + 1,
-                            mat.as_str(),
-                            line.trim()
-                        ));
-                    }
-                }
-            } else {
-                let encoding_name = encoding_raw.unwrap_or("utf-8");
-                let is_utf8 = encoding_name.eq_ignore_ascii_case("utf-8");
-                if is_utf8 {
-                    // UTF-8 用 BufReader 逐行读取，避免加载整个文件到内存
-                    let file = match File::open(file_path) {
-                        Ok(f) => f,
-                        Err(_) => continue,
-                    };
-                    let reader = BufReader::new(file);
-                    for (line_idx, line_result) in reader.lines().enumerate() {
-                        if results.len() >= max_results { break; }
-                        let line = match line_result {
-                            Ok(l) => l,
-                            Err(_) => continue,
-                        };
-                        for mat in re.find_iter(&line) {
-                            if results.len() >= max_results { break; }
-                            total_matches += 1;
-                            file_has_match = true;
-                            results.push(format!(
-                                "  {}:{}:{}  [{}] \"{}\"",
-                                file_path,
-                                line_idx + 1,
-                                mat.start() + 1,
-                                mat.as_str(),
-                                line.trim()
-                            ));
-                        }
-                    }
-                } else {
-                    let bytes = match fs::read(file_path) {
-                        Ok(b) => b,
-                        Err(_) => continue,
-                    };
-                    let content = match Self::decode_bytes(&bytes, encoding_name) {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-                    for (line_idx, line) in content.lines().enumerate() {
-                        if results.len() >= max_results { break; }
-                        for mat in re.find_iter(line) {
-                            if results.len() >= max_results { break; }
-                            total_matches += 1;
-                            file_has_match = true;
-                            results.push(format!(
-                                "  {}:{}:{}  [{}] \"{}\"",
-                                file_path,
-                                line_idx + 1,
-                                mat.start() + 1,
-                                mat.as_str(),
-                                line.trim()
-                            ));
-                        }
-                    }
-                }
-            }
-
-            if file_has_match {
-                matched_files += 1;
-            }
+            files.push(params.path.clone());
         }
 
-        let truncated = if total_matches > max_results {
-            format!("\n... 结果已截断，仅显示前 {} 条（共 {} 个匹配）", max_results, total_matches)
+        let mut blocks: Vec<String> = Vec::new();   // 每个命中文件一个输出块
+        let mut stored = 0usize;                    // 已返回的命中条数
+        let mut found = 0usize;                     // 已读取文件内的全部命中数（可能多于 stored）
+        let mut searched_files = 0usize;
+        let mut matched_files = 0usize;
+        let mut skipped: Vec<String> = Vec::new();  // 读/解码失败的文件及原因
+
+        for file_path in &files {
+            if stored >= max_results {
+                break;
+            }
+            searched_files += 1;
+
+            // 读取 + 解码（失败不再静默跳过，统一计入 skipped 以便调用方排查）
+            let (enc_label, content) =
+                match Self::read_search_content(file_path, encoding_raw, encoding_auto) {
+                    Ok(v) => v,
+                    Err(reason) => {
+                        skipped.push(format!("{} ({})", file_path, reason));
+                        continue;
+                    }
+                };
+            let lines: Vec<&str> = content.lines().collect();
+
+            struct Hit {
+                line_idx: usize,
+                col: usize,
+                text: String,
+            }
+            // 达到 max_results 后不再存储，但继续计数，便于给出真实命中总量
+            let mut hits: Vec<Hit> = Vec::new();
+            for (line_idx, line) in lines.iter().enumerate() {
+                for mat in re.find_iter(line) {
+                    found += 1;
+                    if stored + hits.len() >= max_results {
+                        continue;
+                    }
+                    // 列号按字符数计（原按字节偏移，中文行会错位）
+                    let col = line[..mat.start()].chars().count() + 1;
+                    hits.push(Hit {
+                        line_idx,
+                        col,
+                        text: mat.as_str().to_string(),
+                    });
+                }
+            }
+            if hits.is_empty() {
+                continue;
+            }
+            matched_files += 1;
+            let stored_in_file = hits.len();
+            stored += stored_in_file;
+
+            // 文件块头带上 sha256，可直接回传给 edit_file_lines 的 expected_sha256
+            let mut block = format!(
+                "{} | sha256:{} | enc:{} | {} matches",
+                file_path,
+                Self::path_fingerprint_short(file_path),
+                enc_label,
+                stored_in_file
+            );
+
+            if context_lines == 0 {
+                for h in &hits {
+                    block.push_str(&format!(
+                        "\n  {}:{}  [{}] \"{}\"",
+                        h.line_idx + 1,
+                        h.col,
+                        h.text,
+                        Self::clip_line(lines[h.line_idx])
+                    ));
+                }
+            } else {
+                // 合并相邻的上下文区间，同一行只输出一次
+                let mut ranges: Vec<(usize, usize)> = Vec::new();
+                for h in &hits {
+                    let s = h.line_idx.saturating_sub(context_lines);
+                    let e = (h.line_idx + context_lines).min(lines.len().saturating_sub(1));
+                    let mut merged = false;
+                    if let Some(last) = ranges.last_mut() {
+                        if s <= last.1 + 1 {
+                            if e > last.1 {
+                                last.1 = e;
+                            }
+                            merged = true;
+                        }
+                    }
+                    if !merged {
+                        ranges.push((s, e));
+                    }
+                }
+                for (s, e) in ranges {
+                    block.push_str("\n  --");
+                    for idx in s..=e {
+                        let marks: Vec<String> = hits
+                            .iter()
+                            .filter(|h| h.line_idx == idx)
+                            .map(|h| format!("[{}]@{}", h.text, h.col))
+                            .collect();
+                        let line_text = Self::clip_line(lines[idx]);
+                        if marks.is_empty() {
+                            block.push_str(&format!("\n   {:>5}| {}", idx + 1, line_text));
+                        } else {
+                            block.push_str(&format!(
+                                "\n > {:>5}| {}  {}",
+                                idx + 1,
+                                line_text,
+                                marks.join(" ")
+                            ));
+                        }
+                    }
+                }
+            }
+            blocks.push(block);
+        }
+
+        let mut warnings: Vec<String> = Vec::new();
+        if found > stored {
+            warnings.push(format!(
+                "⚠️ 命中过多：仅返回前 {} 条（已扫描范围内共 {} 处匹配）。可提高 max_results，或收窄 include/exclude/extension 后重试",
+                stored, found
+            ));
+        }
+        if scan.capped {
+            warnings.push(format!(
+                "⚠️ 候选文件已达上限 {}，目录可能未完全覆盖（已收集 {} 个，另有 {} 个被过滤）。可提高 max_files 或收窄范围后重试",
+                max_files, files.len(), scan.filtered
+            ));
+        }
+        if !skipped.is_empty() {
+            let shown: Vec<String> = skipped.iter().take(5).cloned().collect();
+            warnings.push(format!(
+                "⚠️ {} 个文件未能搜索：{}\n   （常见原因：二进制/非文本内容、文件过大，或与显式指定的 encoding 不匹配；可换用正确的 encoding 重试）",
+                skipped.len(),
+                shown.join("\n   ")
+            ));
+        }
+
+        let mut extras: Vec<String> = Vec::new();
+        if !ext_list.is_empty() {
+            extras.push(format!(
+                "ext:{}",
+                ext_list
+                    .iter()
+                    .map(|e| format!(".{}", e))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+        if literal {
+            extras.push("mode:literal".to_string());
+        }
+        if is_dir && !skip_hidden {
+            extras.push("hidden:included".to_string());
+        }
+        if let Some(ref inc) = params.include {
+            if !inc.is_empty() {
+                extras.push(format!("include:{}", inc.join(",")));
+            }
+        }
+        if let Some(ref exc) = params.exclude {
+            if !exc.is_empty() {
+                extras.push(format!("exclude:{}", exc.join(",")));
+            }
+        }
+        if scan.pruned_dirs > 0 {
+            extras.push(format!("pruned_dirs:{}", scan.pruned_dirs));
+        }
+        if context_lines > 0 {
+            extras.push(format!("ctx:{}", context_lines));
+        }
+        if !skipped.is_empty() {
+            extras.push(format!("skipped:{}", skipped.len()));
+        }
+
+        let matches_label = if found > stored {
+            format!("{}/{}", stored, found)
         } else {
-            String::new()
+            format!("{}", found)
         };
 
-        let ext_info = ext_filter.as_ref()
-            .map(|e| format!(".{}", e))
-            .unwrap_or_default();
-
-        let scope = if is_dir {
-            format!("{}", params.path)
-        } else {
-            format!("{}", params.path)
-        };
-
-        Ok(format!(
-            "{} | {} | {} | {}/{} files | {} matches{}```\n{}{}```",
-            scope,
+        let mut out = format!(
+            "{} | {} | {} | {}/{} files | {} matches{}```",
+            params.path,
             params.pattern,
             if case_sensitive { "cs" } else { "ci" },
             matched_files,
             searched_files,
-            total_matches,
-            if ext_info.is_empty() { String::new() } else { format!(" ext:{} ", ext_info) },
-            results.join("\n"),
-            truncated
-        ))
+            matches_label,
+            if extras.is_empty() {
+                String::new()
+            } else {
+                format!(" | {}", extras.join(" | "))
+            }
+        );
+        if blocks.is_empty() {
+            out.push_str("\n（无匹配）");
+        } else {
+            out.push('\n');
+            out.push_str(&blocks.join("\n"));
+        }
+        for w in &warnings {
+            out.push('\n');
+            out.push_str(w);
+        }
+        out.push_str("\n```");
+        Ok(out)
     }
 
     /// 正则替换文件文本
@@ -2836,7 +3138,7 @@ impl FileIoServer {
     /// 删除文件(需用户确认)
     #[tool(
         name = "delete_file",
-        description = "删除单个文件(不可删目录)。删除前自动备份，可用 manage_backups undo 恢复",
+        description = "删除单个文件(不可删目录)。必须显式传 confirm=true 才会真正删除，否则只回报文件信息；删除前自动备份，可用 manage_backups undo 恢复",
         annotations(title = "删除文件", destructive_hint = true)
     )]
     fn delete_file(
@@ -2849,6 +3151,22 @@ impl FileIoServer {
             p
         };
         let path = std::path::Path::new(&params.path);
+
+        // 删除不可逆：必须显式确认，未传 confirm=true 时只回报信息（含大小与指纹）供调用方判断
+        if params.confirm != Some(true) {
+            let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            let fp = Self::file_fingerprint(&params.path, size, None)
+                .map(|h| format!("sha256:{}", h))
+                .unwrap_or_else(|| "sha256:不可用".to_string());
+            return Err(e_param(
+                format!(
+                    "delete_file 需要显式确认：{} 将被删除（{}B，{}）。\
+                     确认无误后请带 confirm=true 重新调用（删除前会自动备份，可用 manage_backups action=undo 恢复）",
+                    params.path, size, fp
+                ),
+                None,
+            ));
+        }
 
         // 与该文件的写操作互斥，避免"边写边删"
         let lock = self.lock_for(&params.path);

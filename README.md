@@ -17,11 +17,11 @@
 | `regex_replace` | 正则替换，`max_matches` 必填防误伤，可 dry-run |
 | `read_binary_file` | 读二进制 HEX dump |
 | `write_binary_file` | 按十六进制写二进制（覆盖/追加/插入/替换） |
-| `text_search` | 文件/目录内容正则搜索 |
+| `text_search` | 文件/目录内容搜索（`regex`/`literal` 双模式，结果按文件分组，带 sha256，可直接接 `edit_file_lines`） |
 | `list_files` | 列目录 / 按文件名搜索（支持 glob） |
 | `file_info` | 文件/目录元信息（大小、mtime、指纹） |
 | `manage_backups` | 备份管理：列出 / 回滚 / 清理 |
-| `delete_file` | 删除文件（自动备份，可回滚） |
+| `delete_file` | 删除文件（需 `confirm=true`，自动备份，可回滚） |
 | `copy_files` | 复制文件 |
 | `move_files` | 移动 / 重命名文件 |
 | `fetch` | HTTP 请求 |
@@ -232,7 +232,7 @@ src/main.rs | utf-8 | 4096B | 120 lines total | sha256:8f3a1c02d94b7e15 | [10-15
 |------|------|------|------|
 | `operation` | string | 是 | `delete_lines` / `insert_lines` / `replace_lines` / `append_lines` |
 | `path` | string | 是（二选一） | 文件路径 |
-| `file_path` | string | 是（二选一） | 文件路径（兼容别名） |
+| `file_path` | string | 否 | **已废弃**，仅为兼容旧调用保留，请改用 `path` |
 | `start_line` | usize | 视操作 | 起始行号；与锚点参数二选一 |
 | `end_line` | usize | 视操作 | 结束行号（含）；用锚点定位时可省（默认单行） |
 | `content` | string | 视操作 | 插入/替换/追加的内容，多行用 `\n` 分隔 |
@@ -332,17 +332,46 @@ src/main.rs | utf-8 | 4096B | 120 lines total | sha256:8f3a1c02d94b7e15 | [10-15
 
 ### text_search
 
-在文件或目录中正则搜索，返回 `文件:行号:列:内容` 与命中统计。
+在文件或目录中搜索文本（`mode=regex` 正则 / `mode=literal` 普通文本），结果**按文件分组**，每组给出 `sha256 / 编码 / 命中数`，命中行为 `行号:列 [命中片段] "整行原文"`。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `path` | string | 是 | 文件或目录（目录则搜索其下文件） |
-| `pattern` | string | 是 | 正则表达式 |
+| `pattern` | string | 是 | 搜索内容：`mode=regex` 时为正则，`mode=literal` 时为普通文本 |
+| `mode` | string | 否 | `regex`(默认，正则) / `literal`(普通文本，pattern 里的 `. * [ ` 等一律当字面量) |
 | `case_sensitive` | bool | 否 | 区分大小写，默认 true |
 | `max_results` | usize | 否 | 最多返回条数，默认 100 |
 | `extension` | string | 否 | 后缀过滤（如 `"pas"`），仅目录模式 |
+| `extensions` | string[] | 否 | 多后缀过滤（如 `["pas","pp"]`），命中任一即可；与 `extension` 取并集 |
 | `recursive` | bool | 否 | 递归子目录，默认 true（仅目录模式） |
-| `encoding` | string | 否 | 默认 utf-8（此时逐行流式读取）；`"auto"` 时按文件自动检测后整体解码 |
+| `encoding` | string | 否 | 默认 `auto`（逐文件自动识别，可区分 GBK/UTF-8）；显式指定则只按该编码解码，失败的文件会列入 `skipped` 而不是静默跳过 |
+| `skip_hidden` | bool | 否 | 跳过隐藏文件/目录（以 `.` 开头，如 `.git`、`.env`），默认 true；`false` 则全都搜（仅目录模式） |
+| `include` | string[] | 否 | glob 白名单，如 `["*.rs","src/**/*.ts"]`，任一命中才搜索（仅目录模式） |
+| `exclude` | string[] | 否 | glob 黑名单，如 `["*.min.js","node_modules/**"]`；命中目录时整棵剪枝（仅目录模式） |
+| `max_files` | usize | 否 | 目录模式最多收集多少文件，默认 `max_results*10` |
+| `context_lines` | usize | 否 | 命中行前后各显示多少行，默认 0；>0 时相邻命中合并为一个上下文块 |
+
+> 搜普通文本（含 `.`、`*`、`[` 等字符，或配置项、错误信息原文）时用 `mode: "literal"`，不用自己转义。
+> 被隐藏规则挡掉的文件，可用 `include` 显式点名放行（如 `include: [".env"]`）。
+
+glob 同时按**文件名**与**相对搜索根的路径**匹配：`"*.rs"` 匹配文件名，`"src/**/*.rs"` 匹配路径；目录剪枝额外按 `"{dir}/子项"` 试一次，所以 `"node_modules/**"` 也能剪掉 `node_modules` 目录本身。
+
+返回示例：
+
+````
+D:\proj\src | fn\s+foo | cs | 2/5 files | 3 matches | include:*.rs | pruned_dirs:1```
+D:\proj\src\a.rs | sha256:1a2b3c4d5e6f7890 | enc:utf-8 | 2 matches
+  12:5  [fn foo] "    fn foo(a: i32) -> i32 {"
+  40:1  [fn foo] "fn foo() {}"
+D:\proj\src\b.rs | sha256:9f8e7d6c5b4a3210 | enc:GBK | 1 matches
+  7:3  [fn foo] "  fn foo() {"
+⚠️ 候选文件已达上限 1000，目录可能未完全覆盖（已收集 1000 个，另有 12 个被过滤）。可提高 max_files 或收窄范围后重试
+````
+
+- 命中数写成 `返回数/实际数`（如 `100/137`）时表示已截断，末尾会附 `⚠️` 说明。
+- 组头的 `sha256` 可直接作为 `edit_file_lines` / `write_text_file` 的 `expected_sha256`（支持前缀匹配），命中行保留原始缩进，可直接作为 `expected_old`。
+- 列号按**字符数**计（不是字节偏移），中文行不会错位。
+- 单行超过 300 字符会截断显示并标注总长度。
 
 > 工具的备份目录与临时文件会自动从搜索结果中排除。
 
@@ -390,11 +419,16 @@ src/main.rs | utf-8 | 4096B | 120 lines total | sha256:8f3a1c02d94b7e15 | [10-15
 
 ### delete_file
 
-删除单个文件（不可删目录）。删除前会自动备份，可用 `manage_backups` 的 `undo` 恢复。
+删除单个文件（不可删目录）。**必须显式传 `confirm=true`** 才会真正删除；删除前会自动备份，可用 `manage_backups` 的 `undo` 恢复。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `path` | string | 是 | 文件路径 |
+| `confirm` | bool | 是 | 必须为 `true` 才执行删除；未传/false 时只返回文件大小与 sha256，不删任何东西 |
+
+```json
+{ "path": "src/old.pas", "confirm": true }
+```
 
 ### copy_files
 
