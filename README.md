@@ -324,6 +324,7 @@ src/main.rs | utf-8 | 4096B | 120 lines total | sha256:8f3a1c02d94b7e15 | [10-15
 
 - **行号 + 文本双约束**：片段在文件里出现多次时，除了写更长的上下文，也可以给 `start_line`（如 `{ "expected_old": "dup = 1", "content": "DUP", "start_line": 3 }`）；行号写错时会直接告诉你它实际在第几行。
 - `all_or_nothing=false` 时被跳过的条目会列在结果里；`dry_run=true` 时**同样会列出**，方便“先预览再决定”。
+- **dry-run 预览按片段独立成块**：每处命中片段单独输出一个带 `=== edits[k] 第 X~Y 行 ===` 标签的小 hunk（含少量上下文），不会像整文件 diff 那样把相距较远的多处改动合并成一个“跨文件大差异”。落点行号（改动前）与各 `edits` 下标一一对应，逐块核对即可。
 
 - 失败时：未命中给 `E_GUARD_MISMATCH`，命中多处给 `E_NOT_UNIQUE`（会列出各处行号），并明确告知“本次一处未改”。
 

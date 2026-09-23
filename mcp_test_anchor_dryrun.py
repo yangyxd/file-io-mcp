@@ -128,4 +128,31 @@ r = call("write_text_file", {"path": f3, "content": "\n".join(f"X{i}" for i in r
                              "dry_run": True})
 print("D5 large diff folded:", ok("省略" in r))
 
+# ---------- E1: edit_file_sections 多处 dry_run 按片段独立成块 ----------
+ESEC = ("program demo;\r\n  A := 1;\r\n  B := 2;\r\n  C := 3;\r\n  D := 4;\r\n"
+        "  E := 5;\r\n  F := 6;\r\n  G := 7;\r\n  H := 8;\r\n  I := 9;\r\nend.\r\n")
+fe = P("esec.pas")
+call("write_text_file", {"path": fe, "content": ESEC})
+r = call("edit_file_sections", {"path": fe, "edits": [
+    {"expected_old": "  A := 1;", "content": "  A := 100;"},
+    {"expected_old": "  I := 9;", "content": "  I := 900;"},
+    {"expected_old": "  E := 5;", "content": "  E := 500;"},
+], "dry_run": True})
+# 三处相距较远，确认被拆成三个独立带标签 hunk，而非一个跨文件大差异
+n_blocks = r.count("=== edits[")
+print("E1 sections dry_run 分段:", ok("DRY-RUN" in r and n_blocks == 3
+                                      and "edits[0] 第 2 行" in r
+                                      and "edits[2] 第 6 行" in r
+                                      and "edits[1] 第 10 行" in r
+                                      and "未写入文件" in r))
+print("   file unchanged:", ok(open(fe, "rb").read() == ESEC.encode("utf-8")))
+
+# ---------- E2: edit_file_sections 单处多行 dry_run ----------
+r = call("edit_file_sections", {"path": fe, "edits": [
+    {"expected_old": "  C := 3;", "content": "  C := 333;\n  C2 := 334;"},
+], "dry_run": True})
+print("E2 single section dry_run:", ok("=== edits[0]" in r and "+   C := 333;" in r
+                                       and "+   C2 := 334;" in r))
+print("   file unchanged:", ok(open(fe, "rb").read() == ESEC.encode("utf-8")))
+
 proc.kill()

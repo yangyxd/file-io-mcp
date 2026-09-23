@@ -1792,6 +1792,72 @@ impl FileIoServer {
         out
     }
 
+    /// 批量片段编辑的 dry-run 预览：把每处命中的片段**独立**展示为一个带标签的小 hunk，
+    /// 而不是像 unified_diff 那样把整份 old/new 合成一个从首改动到末改动的“大跨文件”差异
+    /// （多处相距较远时，中间所有未改动行都会被夹带进来，阅读与确认成本高）。
+    ///
+    /// 每处片段只带 `ctx` 行上下文（前后各至多 ctx 行），落点用改动前行号标注，
+    /// 相邻片段的上下文不会重复输出（planned 已按位置排序且不重叠）。
+    /// `content` 为原文件解码文本（可为 \r\n）；此处统一按 LF 展示以便与 `line_from/line_to`
+    /// （基于 LF 归一后的 hay 计算）对齐行号。
+    fn sections_diff(content: &str, planned: &[PlannedSection], ctx: usize) -> String {
+        if planned.is_empty() {
+            return "  (无命中片段)".to_string();
+        }
+        let disp = content.replace("\r\n", "\n");
+        let lines: Vec<&str> = disp.split('\n').collect();
+        let n = lines.len();
+        let mut out = String::new();
+        // 上一段已输出到的原文行（不含），用于避免相邻片段把同一行既当“后上下文”又当“前上下文”。
+        let mut last_ctx_end = 0usize;
+        for p in planned {
+            let old_from = p.line_from.saturating_sub(1); // 0-based 起始（第 line_from 行）
+            let old_to = p.line_to.min(n); // 0-based 结束（不含），第 line_to 行（含）
+            if old_from >= old_to {
+                // 极端情况（line 区间退化）：仍给出标签，避免遗漏
+                out.push_str(&format!(
+                    "=== edits[{}] 第 {} 行（区间无效，请检查） ===\n",
+                    p.idx, p.line_from
+                ));
+                last_ctx_end = old_to;
+                out.push('\n');
+                continue;
+            }
+            // 前上下文：不越过上一段已覆盖的末尾，也不超过 ctx 行
+            let gap = old_from.saturating_sub(last_ctx_end);
+            let take_before = gap.min(ctx);
+            let before_start = old_from.saturating_sub(take_before);
+            // 后上下文
+            let after_end = (old_to + ctx).min(n);
+
+            out.push_str(&format!(
+                "=== edits[{}] 第 {}{} 行 ===\n",
+                p.idx,
+                p.line_from,
+                if p.line_from == p.line_to {
+                    String::new()
+                } else {
+                    format!("~{}", p.line_to)
+                }
+            ));
+            for i in before_start..old_from {
+                out.push_str(&format!("  {}\n", lines[i]));
+            }
+            for i in old_from..old_to {
+                out.push_str(&format!("- {}\n", lines[i]));
+            }
+            for nl in p.repl.split('\n') {
+                out.push_str(&format!("+ {}\n", nl));
+            }
+            for i in old_to..after_end {
+                out.push_str(&format!("  {}\n", lines[i]));
+            }
+            last_ctx_end = after_end;
+            out.push('\n');
+        }
+        out
+    }
+
     /// 临时文件序号，保证并发写入时临时文件名唯一
     fn tmp_seq() -> u64 {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -4055,7 +4121,7 @@ expected_old 须逐字符一致、默认全文唯一；多处时可用 occurrenc
                     bytes.len(),
                     new_bytes.len(),
                     Self::format_section_positions(&planned),
-                    Self::unified_diff(&ft.content, &new_content, 200),
+                    Self::sections_diff(&ft.content, &planned, 1),
                     Self::fingerprint_short_of_bytes(&new_bytes),
                     skip_note
                 ));
