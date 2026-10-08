@@ -1,9 +1,13 @@
 use rmcp::{
     handler::server::wrapper::Parameters,
-    model::{ServerCapabilities, ServerInfo},
+    model::{
+        PaginatedRequestParams, ReadResourceRequestParams, RawResource, Resource, ResourceContents,
+        ListResourcesResult, ReadResourceResult, ServerCapabilities, ServerInfo,
+    },
     schemars, tool, tool_router, tool_handler,
-    ErrorData as McpError, ServerHandler, ServiceExt, transport::stdio,
+    ErrorData as McpError, RoleServer, ServerHandler, ServiceExt, transport::stdio,
 };
+use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpService, StreamableHttpServerConfig,
     session::local::LocalSessionManager,
@@ -15,6 +19,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use regex::Regex;
 use globset::{Glob, GlobMatcher};
 use sha2::{Sha256, Digest};
+use include_dir::{include_dir, Dir};
 
 const MAX_TEXT_READ_SIZE: usize = 10 * 1024 * 1024; // read_text_file 默认最大读取 10MB，超过则在返回头显著标注已截断
 /// read_text_file / read_binary_file 单次读取的硬上限（length 传超大也不越过，防内存/响应失控）
@@ -30,6 +35,14 @@ const MAX_REGEX_FILE_SIZE: u64 = 64 * 1024 * 1024; // regex_replace 拒绝处理
 const IO_RETRY_TIMES: usize = 5;
 /// 每次重试前的等待时间(毫秒)
 const IO_RETRY_DELAY_MS: u64 = 120;
+
+// ==================== 自带 Skill（编译进二进制，作为 MCP Resource 暴露） ====================
+
+/// 把项目自带的 `skills/file-io-mcp/SKILL.md` 在编译期嵌入二进制。
+/// 本 skill 是 file-io-mcp 项目的一部分，与具体 agent 无关；按 MCP 标准协议，
+/// 它作为 resource `file-io-mcp://skill/guide` 暴露（见下方 `list_resources`/`read_resource`），
+/// 由客户端通过 `resources/list` 发现、`resources/read` 读取，无需任何非标准安装步骤。
+const SKILL_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/skills/file-io-mcp");
 
 // ==================== 统一错误码 ====================
 
@@ -5727,19 +5740,57 @@ impl ServerHandler for FileIoServer {
             protocol_version: rmcp::model::ProtocolVersion::V_2024_11_05,
             capabilities: ServerCapabilities::builder()
                 .enable_tools()
+                .enable_resources()
                 .build(),
             server_info: rmcp::model::Implementation::from_build_env(),
             instructions: Some(
-                "文件读写服务器（可用 FILE_IO_ROOT 限制可访问目录）。通用约定：\
-                 ① 读写保持原编码+BOM+主换行风格；编码自动识别（可区分 GBK/UTF-8），识别不确定时返回头会提示；\
-                 ② 覆盖类写入是原子的（临时文件+rename），写前自动备份到工具自身目录，可用 manage_backups 回滚；\
-                 ③ 读工具返回头带 sha256（文件指纹）；写入时把上次读到的值传给 expected_sha256，\
-                    若文件已被他人改动会返回 E_EXTERNAL_CHANGED，此时请重新读取后再改，不要盲目覆盖；\
-                 ④ 改文件前先 read_text_lines 取内容与 sha256；不确定改法时先传 dry_run=true 看 diff 再实写。\
-                 错误码：E_NOT_FOUND/E_NOT_UNIQUE/E_GUARD_MISMATCH/E_EXTERNAL_CHANGED/E_ENCODING/\
-                 E_NO_PERMISSION/E_READ/E_WRITE/E_TOO_LARGE/E_TOO_MANY_MATCHES/E_INVALID_PARAM/E_PANIC。\
-                 fetch 会访问外部网络。".into(),
+                "file-io-mcp 文件读写服务器（可用 FILE_IO_ROOT 限制目录）。agent 务必遵守的安全要点：\
+                 ① 读写保持原编码+BOM+主换行；编码可区分 GBK/UTF-8，不确定时返回头会提示，显式指定 encoding 最稳；\
+                 ② 覆盖写入是原子的（临时文件+rename）且写前自动备份，可用 manage_backups 回滚；删除须 confirm=true；\
+                 ③ 编辑前必先 read_text_lines 取 sha256，写入时回传 expected_sha256——若他人已改会报 E_EXTERNAL_CHANGED，须重读再改，勿盲目覆盖；\
+                 ④ 多处或不知行号改动用 edit_file_sections；正则替换 regex_replace 的 max_matches 必填；不确定先 dry_run=true 看 diff；\
+                 ⑤ 返回 E_XXX 错误时按消息修正入参后重试，勿忽略错误强写。\
+                 完整工具选型与安全编辑闭环见 resource：file-io-mcp://skill/guide（需要时 resources/read 读取）。fetch 会访问外部网络。".into(),
             ),
+        }
+    }
+
+    /// 把自带 skill（使用指引）作为 MCP resource 暴露，供 client 通过 resources/list 自动发现、
+    /// 需要时 resources/read 读取，无需用户手动安装 skill 文件。
+    fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
+        let mut raw = RawResource::new("file-io-mcp://skill/guide", "file-io-mcp 使用指引");
+        raw.description = Some(
+            "file-io-mcp 工具的安全使用指引：工具选型、安全编辑闭环、关键必填参数、错误码分流。".into(),
+        );
+        raw.mime_type = Some("text/markdown".into());
+        std::future::ready(Ok(ListResourcesResult {
+            resources: vec![Resource { raw, annotations: None }],
+            ..Default::default()
+        }))
+    }
+
+    fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ReadResourceResult, McpError>> + Send + '_ {
+        if request.uri == "file-io-mcp://skill/guide" {
+            let text = SKILL_DIR
+                .get_file("SKILL.md")
+                .map(|f| String::from_utf8_lossy(f.contents()).into_owned())
+                .unwrap_or_default();
+            std::future::ready(Ok(ReadResourceResult {
+                contents: vec![ResourceContents::text(text, request.uri)],
+            }))
+        } else {
+            std::future::ready(Err(McpError::invalid_params(
+                format!("未知资源: {}", request.uri),
+                None,
+            )))
         }
     }
 }
@@ -5774,6 +5825,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 命令行参数解析：默认 stdio，--http 启动为 HTTP 模式
     let args: Vec<String> = std::env::args().collect();
+
     if args.iter().any(|a| a == "--http") {
         run_http(root).await?;
     } else {

@@ -182,6 +182,19 @@ cargo run -- --http --addr 127.0.0.1:8080            # 自定义地址
 - **JSON 单次响应**：`Accept: application/json` 时返回普通 JSON
 - **Keep-Alive**：每 15 秒 ping
 
+## 自带 Skill（file-io-mcp skill，按 MCP 标准协议暴露）
+
+本工具随附一份**使用指引（skill）**，把 15 个工具的安全编辑闭环、工具选型、编码保持与错误码（`E_XXX`）分流等程序性知识内置进去，帮助 **任何接入该 MCP 的 agent**（CodeBuddy、Claude Desktop、Cursor 等）正确、安全地使用这些工具。skill 是 file-io-mcp 项目的一部分，与具体 agent 无关；源文件在仓库 `skills/file-io-mcp/`，并在编译期嵌入二进制。
+
+**怎么"声明"这份指引？** MCP 协议没有 "skill" 原语，标准做法是用两个原生机制（都不出现在 `tools/list` 里）：
+
+1. **MCP Resource（标准：声明一份文档）**：服务器在 `initialize` 时声明 `resources` 能力，把 `SKILL.md` 作为 resource `file-io-mcp://skill/guide`（`text/markdown`）暴露。client 一连上就通过 `resources/list` 发现它，`resources/read` 读取。这正是 MCP 规范里"服务器对外提供知识/上下文"的标准原语。
+2. **`instructions`（标准：注入要点）**：`initialize` 返回的 `instructions` 字段是协议定义的服务器级说明，规范上客户端应注入 agent 上下文。服务器已把**最核心安全要点**（编辑前取 sha256、回传 `expected_sha256` 防并发覆盖、写前备份可回滚、正则替换 `max_matches` 必填、错误按 `E_XXX` 修正重试）写进这里，`instructions` 末尾再指向上面的 resource 取完整指引。
+
+> 说明：resource 是"声明"对了，但**是否把 resource 内容喂给 agent，由 client 决定**——多数 client 不会自动读取，需 client/agent 主动 `resources/read`；而 `instructions` 会被自动注入。两者互补，均属标准协议，无任何非标准机制。
+
+**想把它变成某个 agent 的正式 skill？** 这是 agent 自身的功能（不在 MCP 协议内）。直接把仓库 `skills/file-io-mcp/` 整个文件夹复制到该 agent 的 skills 目录即可（例如 CodeBuddy 用户级 `~/.codebuddy/skills-marketplace/skills/file-io-mcp`），重启 agent 后在 skills 中启用。该文件夹随仓库分发，无需编译、与本项目 exe 无关。
+
 ## 工具详细说明
 
 > 通用约定见上文"核心机制"：编码保持、`sha256` 指纹、`expected_sha256`、原子写入与备份，各工具不再重复说明。
