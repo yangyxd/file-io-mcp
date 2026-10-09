@@ -1,6 +1,6 @@
 # file-io-mcp
 
-基于 Rust 实现的 MCP (Model Context Protocol) 文件 I/O 工具服务器，支持 **stdio**（默认）和 **Streamable HTTP** 两种传输模式，为 AI 客户端提供文件读写、编辑、搜索、备份回滚和 HTTP 请求能力。
+基于 Rust 实现的 MCP (Model Context Protocol) 文件 I/O 工具服务器，支持 **stdio**（默认）和 **Streamable HTTP** 两种传输模式，为 AI 客户端提供文件读写、编辑、搜索、备份回滚能力。
 
 设计目标：**编码不乱、改动可校验、写入可回滚、并发不互相覆盖**。
 
@@ -25,7 +25,6 @@
 | `delete_file` | 删除文件（需 `confirm=true`，自动备份，可回滚） |
 | `copy_files` | 复制文件 |
 | `move_files` | 移动 / 重命名文件 |
-| `fetch` | HTTP 请求 |
 
 > **关于"必填"**：下文参数表中的"是"表示**运行时必填**（服务端会校验并返回明确错误码）。其中 `delete_file.confirm`、`regex_replace.max_matches`、`edit_file_lines.expected_old`、`edit_file_lines.path` 在 `tools/list` 的 schema 里是可省略字段（`Option`），省略即触发校验错误，属于有意设计（便于给出可读的错误提示）。
 
@@ -39,7 +38,7 @@
 - **换行风格**：写入按文件的主换行风格（CRLF/LF 多数派）统一，避免出现混合换行。
 - **非法字节保护**：解码时出现 `U+FFFD` 替换（内容已损坏）时**拒绝写回**，避免原字节被永久破坏。
 - **支持的编码**：`utf-8`、`gbk`/`gb18030`、`big5`、`shift_jis`、`euc-jp`、`euc-kr`、`utf-16le`、`utf-16be`、`utf-32le`、`utf-32be`、`iso-8859-1`（含 `windows-125x`）等；UTF-16/UTF-32 由内置编解码实现（`encoding_rs` 不支持 UTF-32），读取、写入与搜索均已支持。
-- **单次读取上限**：`read_text_file` 与 `read_text_lines` 最多 64MB（更大文件请用 `read_text_file` 的 offset/length 分页）、`read_binary_file` 单次最多 dump 4MB、`fetch` 响应体最多 8MB；被上限截断时返回头会标注 `⚠️已截断`。
+- **单次读取上限**：`read_text_file` 与 `read_text_lines` 最多 64MB（更大文件请用 `read_text_file` 的 offset/length 分页）、`read_binary_file` 单次最多 dump 4MB；被上限截断时返回头会标注 `⚠️已截断`。
 - **路径回显**：路径回显为**相对服务进程当前目录**的写法（如 `src\main.rs`，不再出现 Windows 的 `\\?\` 前缀）；在当前目录之外时回显普通绝对路径（如 `F:\data\x.txt`）。相对入参也以当前目录为基准解析，故回显的路径可直接回传。备份与锁按绝对路径归一，同一文件的相对/绝对/大小写写法不会分裂成两份。想让回显更简短，就把启动时的当前目录设为实际要操作的项目目录。
 
 ### 2. 文件指纹（`sha256`）与并发写入
@@ -95,7 +94,6 @@
 - **globset** — Glob 通配符匹配（支持 `**`、`*`、`?`）
 - **encoding_rs** — 字符编码转换（UTF-16 由工具自身实现，保证编码/解码严格对称）
 - **sha2** — 文件指纹
-- **reqwest** — HTTP 客户端
 
 ## 编译
 
@@ -526,29 +524,6 @@ D:\proj\src\b.rs | sha256:9f8e7d6c5b4a3210 | enc:GBK | 1 matches
 { "sources": ["/old.txt"], "target": "/new.txt" }
 ```
 
-### fetch
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `url` | string | 是 | 请求 URL |
-| `method` | string | 否 | GET(默认) / POST / PUT / DELETE / PATCH / HEAD |
-| `headers` | object | 否 | 请求头 |
-| `body` | string | 否 | 请求体（POST/PUT/PATCH） |
-| `response_type` | string | 否 | `text`(默认) / `json`(格式化) / `binary`(HEX) |
-| `timeout` | u64 | 否 | 超时秒数，默认 15（传 0 也按 15 处理） |
-
-> 文本响应超过 100KB 会按**字符边界**截断并标注总大小。
-
-```json
-{
-  "url": "https://api.example.com/data",
-  "method": "POST",
-  "headers": { "Content-Type": "application/json" },
-  "body": "{\"key\": \"value\"}",
-  "response_type": "json"
-}
-```
-
 ## 典型工作流
 
 **安全地改一个 Delphi 单元（GBK 编码、有并发）**
@@ -580,7 +555,7 @@ file-io-mcp/
 | `mcp_test_backup.py` | 备份、回滚、清理、项目零污染 |
 | `mcp_test_errcodes.py` | 各类失败的错误码 |
 | `mcp_test_anchor_dryrun.py` | 锚点定位、dry-run/diff |
-| `mcp_test_consistency.py` | 指纹口径一致性、空文件、`fetch` 截断 |
+| `mcp_test_consistency.py` | 指纹口径一致性、空文件 |
 | `mcp_test_sandbox.py` | `FILE_IO_ROOT` 沙箱：大小写/8.3 短名/`..`/junction 的放行与拦截 |
 | `mcp_test_binary.py` | 二进制 `expected_hex` 校验、`dry_run` HEX diff、越界报错、`matches(truncated)` 标注 |
 | `mcp_bench.py` | 大文件性能基准（可选传 exe 路径） |

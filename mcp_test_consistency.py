@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
-"""一致性/边界验证：指纹口径统一、空文件语义、锚点提示、fetch 多字节截断"""
-import subprocess, json, os, time, sys, threading, functools
-import http.server, socketserver
+"""一致性/边界验证：指纹口径统一、空文件语义、锚点提示"""
+import subprocess, json, os, time, sys
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -12,15 +11,6 @@ EXE = sys.argv[1] if len(sys.argv) > 1 else r"F:\Projects\Web\file-io-mcp\target
 TEST_DIR = r"F:\Projects\Web\file-io-mcp\mcp_test_consist_data"
 os.makedirs(TEST_DIR, exist_ok=True)
 ok = lambda b: "PASS" if b else "**FAIL**"
-
-# ---------- 本地 HTTP 服务（用于测 fetch 的多字节截断） ----------
-big = ("中文内容测试行，用于验证按字符边界截断不会 panic。\n" * 4000)  # > 100KB
-open(os.path.join(TEST_DIR, "big_cn.txt"), "w", encoding="utf-8").write(big)
-
-handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=TEST_DIR)
-httpd = socketserver.TCPServer(("127.0.0.1", 8899), handler)
-httpd.allow_reuse_address = True
-threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
 proc = subprocess.Popen([EXE], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE, bufsize=0)
@@ -122,10 +112,4 @@ print("C5 anchor miss suggests similar lines:",
       ok("E_NOT_FOUND" in r and "可能想改的行" in r and "第 3 行" in r))
 print("   ", r.replace("\n", " ")[:150])
 
-# ---------- C6: fetch 多字节截断不 panic ----------
-r = call("fetch", {"url": "http://127.0.0.1:8899/big_cn.txt", "timeout": 20})
-print("C6 fetch large UTF-8 response:", ok(not r.startswith("[ERROR]") and "B total" in r))
-print("   tail marker:", r.strip().split("\n")[-2][-40:] if "\n" in r else r[-40:])
-
 proc.kill()
-httpd.shutdown()

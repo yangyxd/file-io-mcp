@@ -1,39 +1,42 @@
 ---
 name: file-io-mcp
-description: 当 file-io-mcp 的 MCP 工具可用，或任何涉及用这些工具读/写/编辑/搜索文件、发 HTTP 时启用。编码安全编辑闭环、工具选型、关键必填参数。
+description: Enable when the file-io-mcp MCP tools are available, or for any task involving reading/writing/editing/searching files or making HTTP requests with these tools. Covers the encoding-safe edit loop, tool selection, and required key parameters.
 ---
 
-# file-io-mcp 使用要点
+# file-io-mcp usage notes
 
-15 个工具：文本/二进制读写、精确编辑、搜索、备份回滚、HTTP。核心目标：**编码不乱、改动可校验、可回滚、并发不互相覆盖**。各工具完整参数见其 `tools/list` schema（本 skill 不重复）。
+15 tools: text/binary read-write, precise editing, search, backup/rollback, HTTP. Core goals: **encoding stays intact, changes are verifiable, reversible, and never overwrite each other under concurrency**. Full parameter lists are in each tool's `tools/list` schema (not repeated here).
 
-## 选型（任务 → 工具）
+## Selection (task -> tool)
 
-- 按行读 / 准备编辑 → `read_text_lines`（返回带 `sha256`）
-- 按字节 / 偏移读 → `read_text_file`（`strict=true` 取精确字节）
-- 一次改多处（按原文片段，不知行号）→ `edit_file_sections`（默认全成或全不成）
-- 按行号 / 锚点改 → `edit_file_lines`
-- 模式替换（含 `$1`；纯文本用 `literal=true`）→ `regex_replace`（**`max_matches` 必填**）
-- 二进制 → `read_binary_file` / `write_binary_file`（`expected_hex` 校验 + HEX diff dry-run）
-- 搜内容（拿行号 + `sha256`，可直接喂编辑）→ `text_search`（`mode=regex|literal`）
-- 列目录 / 找文件 → `list_files`；元信息 / 指纹 → `file_info`
-- 备份 / 回滚 → `manage_backups`；删文件 → `delete_file`（**`confirm=true` 必填**）
-- 复制 / 移动 → `copy_files` / `move_files`；HTTP → `fetch`
+- Read by line / prepare to edit -> `read_text_lines` (returns `sha256`)
+- Read by byte / offset -> `read_text_file` (`strict=true` for exact bytes)
+- Change many places at once (by original fragment, no line numbers known) -> `edit_file_sections` (all-or-nothing by default)
+- By line number / anchor / context block -> `edit_file_lines` (context-block mode is mutually exclusive with `expected_old`, and **`expected_sha256` is required**)
+- Read-only multi-file preview -> `preview_edits` (aggregates per-file diffs, no write)
+- Pattern replace (supports `$1`; plain text uses `literal=true`) -> `regex_replace` (**`max_matches` is required**)
+- Binary -> `read_binary_file` / `write_binary_file` (`expected_hex` check + HEX diff dry-run)
+- Search content (get line numbers + `sha256`, directly feed edits) -> `text_search` (`mode=regex|literal`)
+- List directory / find files -> `list_files`; metadata / fingerprint -> `file_info`
+- Backup / rollback -> `manage_backups`; delete file -> `delete_file` (**`confirm=true` required**)
+- Copy / move -> `copy_files` / `move_files`
 
-## 安全编辑闭环（必守）
+## Safe-edit loop (must follow)
 
-1. `read_text_lines` 读目标 → 拿内容、`sha256`。
-2. `edit_file_lines`（`anchor_text` 锚定 + `expected_old` 校验 + `expected_sha256`）+ **先 `dry_run=true`** 看 diff。
-3. 实写后按错误码处理：
-   - `E_EXTERNAL_CHANGED` → 重读（拿新 `sha256`）重试；
-   - `E_GUARD_MISMATCH` / `E_NOT_FOUND` / `E_NOT_UNIQUE` → 重读目标，修正 `expected_old` / 锚点 / `anchor_occurrence`；
-4. 改错 → `manage_backups` `action=undo`。
+1. `read_text_lines` reads the target -> get content and `sha256`.
+2. `edit_file_lines` (`anchor_text` anchor + `expected_old` check + `expected_sha256`) + **`dry_run=true` first** to see the diff.
+3. After writing, handle by error code:
+   - `E_EXTERNAL_CHANGED` -> re-read (get new `sha256`) and retry;
+   - `E_GUARD_MISMATCH` / `E_NOT_FOUND` / `E_NOT_UNIQUE` -> re-read the target, fix `expected_old` / anchor / `anchor_occurrence`;
+4. On a wrong change -> `manage_backups` with `action=undo`.
 
-多处不相邻小改动优先 `edit_file_sections`（一次调用、同快照、省行号）。
+For several non-adjacent small changes, prefer `edit_file_sections` (one call, single snapshot, no line numbers).
 
-## 关键守则
+## Key rules
 
-- **传 `expected_sha256`（上次读到的）防并发覆盖**；行 / 片段编辑传 `expected_old` 防漂移。
-- 破坏性改动先 `dry_run=true`。
-- **保持原编码，别强行指定 `encoding`**；仅 GBK/UTF-8 难分时显式指定。
-- 锚点 `anchor_text` 须与整行完全一致（含缩进）；多处命中用 `anchor_occurrence`。
+- **Pass `expected_sha256` (from the last read) to prevent concurrent overwrites**; for line/fragment edits also pass `expected_old` to prevent drift.
+- Do `dry_run=true` before destructive changes.
+- **Keep the original encoding; don't force an `encoding`**; specify it explicitly only when GBK/UTF-8 are hard to tell apart.
+- `anchor_text` must match the whole line exactly (indentation included); use `anchor_occurrence` for multiple hits.
+- **"Context block" small-range edit**: give `context_before` + `context_after` (two small context snippets) to locate the change point (the tool computes the implied old text and verifies it precisely), without repeating a large `expected_old`; mutually exclusive with `expected_old`/anchor/line-number, and **`expected_sha256` is required** (file-level concurrency fallback). Both frames must be unique in the file, otherwise `E_NOT_UNIQUE`/`E_NOT_FOUND`.
+- **Preview multi-file changes with `preview_edits` first**: pass several per-file edit descriptions in one call; it aggregates each file's small diff and summarizes success/failure counts, then write per-file after confirming -- fits workflows like "code change must sync a test page / doc".

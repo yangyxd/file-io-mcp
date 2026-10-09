@@ -26,6 +26,5 @@ regex = "1"
 globset = "0.4"
 sha2 = "0.10"
 encoding_rs = "0.8"
-reqwest = { version = "0.12", features = ["json", "stream"] }
 axum = "0.8"
 include_dir = "0.7"    # 把自带 skill 目录编译进二进制，供 install-skill 子命令释放
