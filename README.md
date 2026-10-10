@@ -24,11 +24,11 @@
 | `list_files` | 列目录 / 按文件名搜索（支持 glob） |
 | `file_info` | 文件/目录元信息（大小、mtime、指纹、文本行数） |
 | `manage_backups` | 备份管理：列出 / 回滚 / 清理 |
-| `delete_file` | 删除文件（需 `confirm=true`，自动备份，可回滚） |
+| `delete_file` | 删除文件（需 `confirm=true`，自动备份并可回滚；>20MB 不备份） |
 | `copy_files` | 复制文件 |
 | `move_files` | 移动 / 重命名文件 |
 
-> **关于"必填"**：下文参数表中的"是"表示**运行时必填**（服务端会校验并返回明确错误码）。其中 `delete_file.confirm`、`regex_replace.max_matches`、`edit_file_lines.expected_old`、`edit_file_lines.path` 在 `tools/list` 的 schema 里是可省略字段（`Option`），省略即触发校验错误，属于有意设计（便于给出可读的错误提示）。
+> **关于"必填"**：下文参数表中的"是"表示**运行时必填**（服务端会校验并返回明确错误码）。其中 `delete_file.confirm`、`regex_replace.max_matches`、`edit_file_lines.path` 在 `tools/list` 的 schema 里是可省略字段（`Option`），省略即触发校验错误，属于有意设计（便于给出可读的错误提示）。而 `edit_file_lines.expected_old`、`write_*.expected_sha256` 省略**不会**报错——只是跳过了该层校验，属于强烈建议而非强制。
 
 ## 核心机制
 
@@ -49,7 +49,7 @@
 
 多个 AI/进程同时改同一文件时：
 
-- **按写入类型决定是否传 `expected_sha256`**：整体覆盖式写入（`write_text_file` / `write_binary_file` 的 `mode=overwrite`）会用你传入的内容重写整个文件，**必须传**，否则会覆盖他人的改动；局部编辑（`edit_file_lines` / `edit_file_sections` / `regex_replace` / `apply_plans`）在**最新内容**上定位改写，天然保留他人的并发改动，**默认不必传** —— 传了过期的 sha 只会把本可成功的编辑变成失败。确需严格快照校验时再传，校验不通过则返回 **`E_EXTERNAL_CHANGED`**。
+- **按写入类型决定是否传 `expected_sha256`**：整体覆盖式写入（`write_text_file` / `write_binary_file` 的 `mode=overwrite`）会用你传入的内容重写整个文件，**强烈建议传**，以便检测并发改动（不传不会被拒绝，只是不做任何校验）；局部编辑（`edit_file_lines` / `edit_file_sections` / `regex_replace` / `apply_plans`）在**最新内容**上定位改写，天然保留他人的并发改动，**默认不必传** —— 传了过期的 sha 只会把本可成功的编辑变成失败。确需严格快照校验时再传，校验不通过则返回 **`E_EXTERNAL_CHANGED`**。
 - `dry_run` 只预览、不写入，**不会因 sha 过期而被拦截**；若并发改动让原计划失效，重新 dry-run 看清最新现状，再不带 `expected_sha256` 重新下发即可。
 - **同路径锁**：同一文件的"读-改-写"串行化。HTTP 模式用进程内锁；stdio 模式下每个 AI 是独立进程，额外使用**跨进程锁文件**（`<文件>.file-io-mcp.lock`，30 秒陈旧锁自动抢占、最长等待 10 秒后降级放行）。
 - **原子写入**：先写同目录临时文件并 `sync_all`，再 `rename` 原子替换；读取方永远不会读到写了一半的文件。若 `rename` 因文件被 IDE/杀软占用而失败，回退为就地覆盖写（并先把备份转为独立副本），保证"原来能写的场景现在依然能写"。
@@ -249,7 +249,7 @@ src/main.rs | utf-8 | 4096B | 120 lines total | sha256:8f3a1c02d94b7e15 | [10-15
 | `offset` | u64 | 否 | insert 的插入字节偏移（必须落在字符边界，否则拒绝，防止把汉字劈开） |
 | `encoding` | string | 否 | 默认保持原文件编码（新建文件默认 UTF-8；`utf-16le/be` 新建会自动带 BOM） |
 | `expected_old` | string | 否 | 写前校验：overwrite=全文 / append=末尾 / insert=offset 附近，不符则拒绝；回显实际内容时超长内容只给头尾摘要+长度+指纹 |
-| `expected_sha256` | string | `overwrite` 必填 | 上次读到的指纹；**`overwrite` 会用你传入的内容重写整个文件，必须传**，否则会覆盖他人的改动；`append`/`insert` 不覆盖，故可选 |
+| `expected_sha256` | string | 否 | 上次读到的指纹；**`overwrite` 会用你传入的内容重写整个文件，强烈建议传**以便检测并发改动（不传只是不校验，不会被拒绝）；`append`/`insert` 不覆盖，故可选 |
 | `dry_run` | bool | 否 | true=只返回 diff 与预计指纹，不写文件，并签发一次性 `planToken`（可用 `apply_plans` 提交，无需重发 `content`） |
 
 ```json
@@ -339,7 +339,7 @@ src/main.rs | utf-8 | 4096B | 120 lines total | sha256:8f3a1c02d94b7e15 | [10-15
 
 ### apply_plans
 
-**按 `planToken` 提交预览**：把预览时冻结的那份编辑计划落盘，**无需再次传输编辑内容**。token 由服务端保存，提交时基于文件当前内容**重新定位**改写目标，保证"落的就是预览那份改动"。**所有支持 `dry_run` 的写工具都会签发 `planToken`**：`preview_edits` 每文件一个，其余工具为该次预览一个，token 一次性、过期约 10 分钟、成败皆清除。
+**按 `planToken` 提交预览**：把预览时**记录**的那份编辑计划（**目标定位 + 替换内容，不含整份文件快照**）落盘，**无需再次传输编辑内容**。token 由服务端保存，提交时基于文件当前内容**重新定位**改写目标，保证"落的就是预览那份改动"。**所有支持 `dry_run` 的写工具都会签发 `planToken`**：`preview_edits` 每文件一个，其余工具为该次预览一个，token 一次性、过期约 10 分钟、成败皆清除。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
@@ -435,7 +435,7 @@ src/main.rs | utf-8 | 4096B | 120 lines total | sha256:8f3a1c02d94b7e15 | [10-15
 | `offset` | u64 | 否 | insert 为插入位置，replace 为替换起始位置 |
 | `replace_length` | usize | 否 | replace 模式下被替换的字节数 |
 | `expected_hex` | string | 否 | **写前校验待改范围的原始字节**（HEX，可带 `0x` 与空格/冒号分隔，便于从 HEX dump 直接粘贴；不能为空串——空串等于没校验，会被拒绝）。按 mode 取范围：`overwrite`=全文 / `append`=文件末尾 / `insert`=`offset` 起 / `replace`=`[offset, offset+replace_length)`；不符返回 `E_GUARD_MISMATCH` 并回显该范围的实际字节 |
-| `expected_sha256` | string | `overwrite` 必填 | 上次读到的指纹（整文件级）；**`overwrite` 会重写整个文件，必须传**，否则会覆盖他人的改动；其余模式不覆盖，故可选 |
+| `expected_sha256` | string | 否 | 上次读到的指纹（整文件级）；**`overwrite` 会重写整个文件，强烈建议传**以便检测并发改动（不传只是不校验，不会被拒绝）；其余模式不覆盖，故可选 |
 | `dry_run` | bool | 否 | true=只返回 HEX diff 预览与预计指纹，不写文件，并签发一次性 `planToken`（可用 `apply_plans` 提交，无需重发 `hex_data`） |
 | `confirm` | bool | 否 | `hex_data` 为空且 `mode=overwrite`（会清空文件）时必须传 `true` 才执行 |
 
@@ -463,7 +463,7 @@ src/main.rs | utf-8 | 4096B | 120 lines total | sha256:8f3a1c02d94b7e15 | [10-15
 | `extensions` | string[] | 否 | 多后缀过滤（如 `["pas","pp"]`），命中任一即可；与 `extension` 取并集 |
 | `recursive` | bool | 否 | 递归子目录，默认 true（仅目录模式） |
 | `encoding` | string | 否 | 默认 `auto`（逐文件自动识别，可区分 GBK/UTF-8）；显式指定则只按该编码解码，失败的文件会列入 `skipped` 而不是静默跳过 |
-| `skip_hidden` | bool | 否 | 跳过隐藏文件/目录（以 `.` 开头，如 `.git`、`.env`），默认 true；`false` 则全都搜（仅目录模式） |
+| `skip_hidden` | bool | 否 | 跳过隐藏文件/目录（以 `.` 开头，如 `.git`、`.env`），默认 true；`false` 或 `include` 命中时也会搜索（仅目录模式） |
 | `include` | string[] | 否 | glob 白名单，如 `["*.rs","src/**/*.ts"]`，任一命中才搜索（仅目录模式） |
 | `exclude` | string[] | 否 | glob 黑名单，如 `["*.min.js","node_modules/**"]`；命中目录时整棵剪枝（仅目录模式） |
 | `max_files` | usize | 否 | 目录模式最多收集多少文件，默认 `max_results*10` |
@@ -545,7 +545,7 @@ D:\proj\src\b.rs | sha256:9f8e7d6c5b4a3210 | enc:GBK | 1 matches
 
 ### delete_file
 
-删除单个文件（不可删目录）。**必须显式传 `confirm=true`** 才会真正删除；删除前会自动备份，可用 `manage_backups` 的 `undo` 恢复。
+删除单个文件（不可删目录）。**必须显式传 `confirm=true`** 才会真正删除（未传则返回 `E_INVALID_PARAM` 并附文件大小与 sha256）；删除前自动备份（**超过 20MB 的文件不备份**），可用 `manage_backups` 的 `undo` 恢复。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|

@@ -213,7 +213,7 @@ struct WriteTextFileParams {
     encoding: Option<String>,
     /// Expected old content (per mode: overwrite=whole file / append=tail / insert=near offset); rejected with the actual content echoed on mismatch
     expected_old: Option<String>,
-    /// sha256 from a prior read; REQUIRED for mode=overwrite (it rewrites the whole file), optional for append/insert
+    /// sha256 from a prior read; strongly recommended for mode=overwrite (it rewrites the whole file) — omit it and no concurrency check happens; optional for append/insert
     expected_sha256: Option<String>,
     /// true = return only a diff preview without writing, plus a one-time planToken to commit via apply_plans
     dry_run: Option<bool>,
@@ -243,7 +243,7 @@ struct WriteBinaryFileParams {
     replace_length: Option<usize>,
     /// Pre-write check of the original bytes in the target range (HEX, same format as hex_data; must not be empty): overwrite=whole file / append=tail / insert=from offset / replace=[offset,+len); mismatch echoes the actual bytes
     expected_hex: Option<String>,
-    /// sha256 from a prior read; REQUIRED for mode=overwrite, optional otherwise
+    /// sha256 from a prior read; strongly recommended for mode=overwrite — omit it and no concurrency check happens; optional otherwise
     expected_sha256: Option<String>,
     /// true = return only the HEX diff preview and expected fingerprint (no write), plus a one-time planToken to commit via apply_plans
     dry_run: Option<bool>,
@@ -347,7 +347,7 @@ struct ListFilesParams {
 struct DeleteFileParams {
     /// File path
     path: String,
-    /// Must be explicitly true to delete; when false or unset nothing is deleted and a hint is returned
+    /// Must be explicitly true to delete; when false or unset nothing is deleted and E_INVALID_PARAM is returned, echoing the file size and fingerprint
     confirm: Option<bool>,
 }
 
@@ -365,7 +365,7 @@ struct EditFileLinesParams {
     content: Option<String>,
     /// File encoding; defaults to keeping the original
     encoding: Option<String>,
-    /// Required for delete/replace: original text of the target line(s), a guard against wrong line numbers
+    /// Strongly recommended for delete/replace: original text of the target line(s), a guard against wrong line numbers (omit it and the check is simply skipped)
     expected_old: Option<String>,
     /// sha256 from a prior read; optional — pass it only to force strict snapshot checking (REQUIRED in context-block mode)
     expected_sha256: Option<String>,
@@ -2937,7 +2937,7 @@ impl FileIoServer {
     #[tool(
         name = "write_text_file",
         description = "Write text in one shot (auto-creates directories). mode=overwrite (default)/append/insert (offset must land on a character boundary). \
-Pass expected_old for a pre-write check. mode=overwrite rewrites the whole file, so expected_sha256 is REQUIRED there to avoid overwriting concurrent changes; the other modes do not overwrite, so it is optional. \
+Pass expected_old for a pre-write check. mode=overwrite rewrites the whole file, so pass expected_sha256 to detect concurrent changes (omit it and no check happens); the other modes never overwrite, so it is optional. \
 dry_run=true previews and returns a one-time planToken; commit it with apply_plans instead of resending the content.",
         annotations(title = "Write text file", destructive_hint = true)
     )]
@@ -3220,7 +3220,7 @@ dry_run=true previews and returns a one-time planToken; commit it with apply_pla
     /// Read text by line number (pairs with edit_file_lines so line numbers are not mis-counted)
     #[tool(
         name = "read_text_lines",
-        description = "Read text by line (1-based, with line numbers), pairs with edit_file_lines. Header includes total line count and sha256; pass the sha256 as expected_sha256 for overwrite-style writes (required) or when you need strict snapshot checking — local edits preserve concurrent changes without it",
+        description = "Read text by line (1-based, with line numbers), pairs with edit_file_lines. Header includes total line count and sha256; pass it as expected_sha256 for overwrite-style writes (to detect concurrent changes) or when you need strict snapshot checking — local edits preserve concurrent changes without it",
         annotations(title = "Read text by line", read_only_hint = true)
     )]
     fn read_text_lines(
@@ -3466,7 +3466,7 @@ dry_run=true previews and returns a one-time planToken; commit it with apply_pla
         name = "write_binary_file",
         description = "Write binary by hex: mode=overwrite (default)/append/insert (offset)/replace (offset+replace_length); an out-of-range offset errors. \
 expected_hex = pre-write check of the original bytes in the range to change (must not be empty). \
-mode=overwrite rewrites the whole file, so expected_sha256 is REQUIRED there to avoid overwriting concurrent changes; the other modes do not overwrite, so it is optional. \
+mode=overwrite rewrites the whole file, so pass expected_sha256 to detect concurrent changes (omit it and no check happens); the other modes never overwrite, so it is optional. \
 dry_run=true returns a HEX diff preview (no write) plus a one-time planToken; commit it with apply_plans instead of resending the hex data.",
         annotations(title = "Write binary file", destructive_hint = true)
     )]
@@ -3741,7 +3741,7 @@ dry_run=true returns a HEX diff preview (no write) plus a one-time planToken; co
         description = "Search text in a file/directory (mode=regex by default; literal takes plain text, no escaping needed). \
 Results are grouped by file and carry that file's sha256 (usable as edit_file_lines' expected_sha256); each hit is line:col:[fragment] \"full line\". \
 Directories recurse by default; max_results caps returned lines (default 100), max_files caps files scanned (default 20000, hitting it warns); encoding is per-file auto (GBK/UTF-8). \
-Hidden files and binary/build artifacts (.dcu/.exe/.dll/.bak/.pyc) are skipped unless extension/extensions/include/exclude scope them.",
+Hidden files (.git/.env etc.) are skipped unless skip_hidden=false or an include glob matches them; binary/build artifacts (.dcu/.exe/.dll/.bak/.pyc) are skipped unless extension(s)/include scope them.",
         annotations(title = "Text search", read_only_hint = true)
     )]
     fn text_search(
@@ -4830,7 +4830,7 @@ dry_run=true previews and returns a one-time planToken; commit it with apply_pla
     /// Delete a file (requires confirmation)
     #[tool(
         name = "delete_file",
-        description = "Delete a single file (directories not allowed); requires confirm=true. A backup is taken before deletion, recoverable with manage_backups undo",
+        description = "Delete a single file (directories not allowed); requires confirm=true, otherwise E_INVALID_PARAM echoing the size and fingerprint. A backup is taken before deletion (files over 20MB are not backed up), recoverable with manage_backups undo",
         annotations(title = "Delete file", destructive_hint = true)
     )]
     fn delete_file(
@@ -5270,7 +5270,7 @@ dry_run=true previews and returns a one-time planToken; commit it with apply_pla
     /// Edit a file by line: delete / insert / replace / append lines
     #[tool(
         name = "edit_file_lines",
-        description = "Edit by line (1-based; path required): operation=delete_lines|insert_lines|replace_lines|append_lines. Locate with anchor_text (whole line, must be unique) or anchor_regex, or start_line/end_line; delete/replace require expected_old as a second check. \
+        description = "Edit by line (1-based; path required): delete_lines / insert_lines / replace_lines / append_lines. Locate with anchor_text (whole line, must be unique) or anchor_regex, or start_line/end_line; for delete/replace pass expected_old as a second check (omit it and the check is simply skipped). \
 expected_sha256 is optional: the edit is located in the LATEST content, so others' concurrent edits are preserved. \
 dry_run=true previews and returns a one-time planToken; commit it with apply_plans instead of resending the edit. \
 Also a \"context block\" mode: context_before + context_after locate the change point (mutually exclusive with expected_old/anchor/line-number; expected_sha256 REQUIRED there), so the AI need not repeat large chunks of old text.",
@@ -5936,10 +5936,10 @@ edits=[{path, operation?, content?, expected_old?, anchor_*, start_line?, end_li
     /// Commit edits frozen by preview_edits (round 1: read-only check that each target still locates; round 2: per file, locates then writes under the file lock).
     #[tool(
         name = "apply_plans",
-        description = "Commit edits frozen by any dry_run preview (preview_edits / edit_file_lines / edit_file_sections / regex_replace / write_text_file / write_binary_file): pass the planToken(s), no need to resend content. \
+        description = "Commit edit plans recorded by any dry_run preview (preview_edits / edit_file_lines / edit_file_sections / regex_replace / write_text_file / write_binary_file): pass the planToken(s), no need to resend content. \
 Tokens are one-time (cleared on success or failure) and expire soon; on any error re-run the preview. \
-The target is re-located against current content at commit, so non-overlapping concurrent edits auto-merge; a changed target gives E_EXTERNAL_CHANGED. \
-strict=true also requires the file-level sha256 to match; a write_text_file/write_binary_file overwrite plan always does. \
+A plan pins the target location and replacement content, not the whole file: the target is re-located against current content at commit, so non-overlapping concurrent edits auto-merge; a changed target gives E_EXTERNAL_CHANGED. \
+strict=true also requires the file-level sha256 to match the previewed one; a write_text_file/write_binary_file overwrite plan always does. \
 One token = one file; several tokens report per-file outcome",
         annotations(title = "Apply preview plans", destructive_hint = true)
     )]
@@ -6352,7 +6352,7 @@ impl ServerHandler for FileIoServer {
                 "file-io-mcp file read/write server (directory can be restricted via FILE_IO_ROOT). Safety points the agent MUST follow: \
                  ① Keep the original encoding + BOM + dominant line ending on read/write; the header flags uncertain cases, so pass encoding explicitly when GBK/UTF-8 are hard to tell apart; \
                  ② Overwrite writes are atomic (temp file + rename) and auto-back up, reversible with manage_backups; deletion requires confirm=true; \
-                 ③ The sha256 from read_text_lines is REQUIRED for overwrite-style writes (write_text_file/write_binary_file mode=overwrite); local edits (edit_file_lines/edit_file_sections/regex_replace/apply_plans) locate within the LATEST content and already preserve others' edits — pass a sha only to force strict snapshot checking, since a stale one turns a safe edit into E_EXTERNAL_CHANGED; \
+                 ③ For overwrite-style writes (write_text_file/write_binary_file mode=overwrite) pass the sha256 from read_text_lines so concurrent changes get detected — omit it and no check happens at all; local edits (edit_file_lines/edit_file_sections/regex_replace/apply_plans) locate within the LATEST content and already preserve others' edits, so pass a sha only to force strict snapshot checking; \
                  ④ For many non-adjacent changes or unknown line numbers use edit_file_sections; regex_replace requires max_matches; when unsure, dry_run=true first; \
                  ⑤ dry_run writes nothing and is never blocked by a stale sha256; every preview returns a one-time planToken — commit with apply_plans(plan_tokens) instead of resending content; on any error re-run the preview; \
 ⑥ On an E_XXX error, fix the input per the message and retry; never ignore errors and force the write. \
