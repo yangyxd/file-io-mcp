@@ -6,7 +6,7 @@
 
 ## 功能概览
 
-共 **15 个工具**：
+共 **17 个工具**：
 
 | 工具 | 说明 |
 |------|------|
@@ -184,7 +184,7 @@ cargo run -- --http --addr 127.0.0.1:8080            # 自定义地址
 
 ## 自带 Skill（file-io-mcp skill，按 MCP 标准协议暴露）
 
-本工具随附一份**使用指引（skill）**，把 15 个工具的安全编辑闭环、工具选型、编码保持与错误码（`E_XXX`）分流等程序性知识内置进去，帮助 **任何接入该 MCP 的 agent**（CodeBuddy、Claude Desktop、Cursor 等）正确、安全地使用这些工具。skill 是 file-io-mcp 项目的一部分，与具体 agent 无关；源文件在仓库 `skills/file-io-mcp/`，并在编译期嵌入二进制。
+本工具随附一份**使用指引（skill）**，把 17 个工具的安全编辑闭环、工具选型、编码保持与错误码（`E_XXX`）分流等程序性知识内置进去，帮助 **任何接入该 MCP 的 agent**（CodeBuddy、Claude Desktop、Cursor 等）正确、安全地使用这些工具。skill 是 file-io-mcp 项目的一部分，与具体 agent 无关；源文件在仓库 `skills/file-io-mcp/`，并在编译期嵌入二进制。
 
 **怎么"声明"这份指引？** MCP 协议没有 "skill" 原语，标准做法是用两个原生机制（都不出现在 `tools/list` 里）：
 

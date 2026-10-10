@@ -5,7 +5,7 @@ description: Enable when the file-io-mcp MCP tools are available, or for any tas
 
 # file-io-mcp usage notes
 
-15 tools: text/binary read-write, precise editing, search, backup/rollback, HTTP. Core goals: **encoding stays intact, changes are verifiable, reversible, and never overwrite each other under concurrency**. Full parameter lists are in each tool's `tools/list` schema (not repeated here).
+17 tools: text/binary read-write, precise editing, search, backup/rollback, HTTP. Core goals: **encoding stays intact, changes are verifiable, reversible, and never overwrite each other under concurrency**. Full parameter lists are in each tool's `tools/list` schema (not repeated here).
 
 ## Selection (task -> tool)
 
