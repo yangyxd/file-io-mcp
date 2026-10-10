@@ -1,11 +1,11 @@
 ---
 name: file-io-mcp
-description: Enable when the file-io-mcp MCP tools are available, or for any task involving reading/writing/editing/searching files or making HTTP requests with these tools. Covers the encoding-safe edit loop, tool selection, and required key parameters.
+description: Enable when the file-io-mcp MCP tools are available, or for any task involving reading/writing/editing/searching files. Covers the encoding-safe edit loop, tool selection, and required key parameters.
 ---
 
 # file-io-mcp usage notes
 
-17 tools: text/binary read-write, precise editing, search, backup/rollback, HTTP. Core goals: **encoding stays intact, changes are verifiable, reversible, and never overwrite each other under concurrency**. Full parameter lists are in each tool's `tools/list` schema (not repeated here).
+17 tools: text/binary read-write, precise editing, search, backup/rollback. Core goals: **encoding stays intact, changes are verifiable, reversible, and never overwrite each other under concurrency**. Full parameter lists are in each tool's `tools/list` schema (not repeated here).
 
 ## Selection (task -> tool)
 
