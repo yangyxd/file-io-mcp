@@ -98,8 +98,8 @@ before = open(f2, "rb").read()
 r = call("edit_file_lines", {"path": f2, "operation": "replace_lines",
                              "start_line": 3, "end_line": 3, "content": "C-changed",
                              "expected_old": "c", "dry_run": True})
-print("D1 edit dry_run:", ok("DRY-RUN" in r and "未写入文件" in r and "- c" in r and "+ C-changed" in r
-                             and "预计 sha256" in r))
+print("D1 edit dry_run:", ok("DRY-RUN" in r and "not written" in r and "- c" in r and "+ C-changed" in r
+                             and "expected sha256" in r))
 print("   file unchanged:", ok(open(f2, "rb").read() == before))
 
 # ---------- D2: write_text_file overwrite dry_run ----------
@@ -126,7 +126,7 @@ f3 = P("big.pas")
 call("write_text_file", {"path": f3, "content": "\n".join(f"l{i}" for i in range(600)) + "\n"})
 r = call("write_text_file", {"path": f3, "content": "\n".join(f"X{i}" for i in range(600)) + "\n",
                              "dry_run": True})
-print("D5 large diff folded:", ok("省略" in r))
+print("D5 large diff folded:", ok("omitted" in r))
 
 # ---------- E1: edit_file_sections 多处 dry_run 按片段独立成块 ----------
 ESEC = ("program demo;\r\n  A := 1;\r\n  B := 2;\r\n  C := 3;\r\n  D := 4;\r\n"
@@ -141,10 +141,10 @@ r = call("edit_file_sections", {"path": fe, "edits": [
 # 三处相距较远，确认被拆成三个独立带标签 hunk，而非一个跨文件大差异
 n_blocks = r.count("=== edits[")
 print("E1 sections dry_run 分段:", ok("DRY-RUN" in r and n_blocks == 3
-                                      and "edits[0] 第 2 行" in r
-                                      and "edits[2] 第 6 行" in r
-                                      and "edits[1] 第 10 行" in r
-                                      and "未写入文件" in r))
+                                      and "edits[0] line 2" in r
+                                      and "edits[2] line 6" in r
+                                      and "edits[1] line 10" in r
+                                      and "not written" in r))
 print("   file unchanged:", ok(open(fe, "rb").read() == ESEC.encode("utf-8")))
 
 # ---------- E2: edit_file_sections 单处多行 dry_run ----------

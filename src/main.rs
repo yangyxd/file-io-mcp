@@ -177,9 +177,9 @@ struct ReadTextFileParams {
     path: String,
     /// Start byte offset, default 0
     offset: Option<u64>,
-    /// Bytes to read (>=1; 0 is rejected), default up to 10MB; when not strict this is a "hint" snapped to character boundaries (noted in the header)
+    /// Bytes to read (>=1; 0 is rejected), default up to 10MB; a hint snapped to character boundaries unless strict=true (noted in the header)
     length: Option<usize>,
-    /// true = read exactly [offset, offset+length), no >=4-byte look-ahead / offset floor; edge-incomplete bytes are dropped and noted
+    /// true = read exactly [offset, offset+length), no look-ahead and no offset floor; edge-incomplete bytes are dropped and noted
     strict: Option<bool>,
     /// Encoding, auto-detected by default
     encoding: Option<String>,
@@ -199,7 +199,7 @@ struct ReadTextLinesParams {
     encoding: Option<String>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 struct WriteTextFileParams {
     /// File path
     path: String,
@@ -213,9 +213,9 @@ struct WriteTextFileParams {
     encoding: Option<String>,
     /// Expected old content (per mode: overwrite=whole file / append=tail / insert=near offset); rejected with the actual content echoed on mismatch
     expected_old: Option<String>,
-    /// sha256 read earlier; write rejected if the file changed since
+    /// sha256 from a prior read; REQUIRED for mode=overwrite (it rewrites the whole file), optional for append/insert
     expected_sha256: Option<String>,
-    /// true = return only a diff preview without writing
+    /// true = return only a diff preview without writing, plus a one-time planToken to commit via apply_plans
     dry_run: Option<bool>,
 }
 
@@ -229,7 +229,7 @@ struct ReadBinaryFileParams {
     length: Option<usize>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 struct WriteBinaryFileParams {
     /// File path
     path: String,
@@ -241,11 +241,11 @@ struct WriteBinaryFileParams {
     offset: Option<u64>,
     /// Bytes replaced for replace
     replace_length: Option<usize>,
-    /// Pre-write check of the original bytes in the target range (HEX, 0x/space/colon allowed, must not be empty): overwrite=whole file / append=tail / insert=from offset / replace=[offset,+len); rejected with actual bytes echoed on mismatch
+    /// Pre-write check of the original bytes in the target range (HEX, same format as hex_data; must not be empty): overwrite=whole file / append=tail / insert=from offset / replace=[offset,+len); mismatch echoes the actual bytes
     expected_hex: Option<String>,
-    /// sha256 read earlier; rejected if the file changed
+    /// sha256 from a prior read; REQUIRED for mode=overwrite, optional otherwise
     expected_sha256: Option<String>,
-    /// true = return only the HEX diff preview and expected fingerprint, without writing
+    /// true = return only the HEX diff preview and expected fingerprint (no write), plus a one-time planToken to commit via apply_plans
     dry_run: Option<bool>,
     /// Required true when hex_data is empty and mode is overwrite (would truncate the file)
     confirm: Option<bool>,
@@ -269,7 +269,7 @@ struct FileInfoParams {
     path: String,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 struct RegexReplaceParams {
     /// File path
     path: String,
@@ -283,11 +283,11 @@ struct RegexReplaceParams {
     encoding: Option<String>,
     /// Global replace, default true; false = replace only the first
     global: Option<bool>,
-    /// true = return only a diff preview without writing
+    /// true = return only a diff preview without writing, plus a one-time planToken to commit via apply_plans
     dry_run: Option<bool>,
     /// Required: expected max number of replacements; rejected if actually exceeded (guards against over-broad regex)
     max_matches: Option<usize>,
-    /// sha256 read earlier; write rejected if the file changed
+    /// sha256 from a prior read; optional (pass it only to force strict snapshot checking)
     expected_sha256: Option<String>,
 }
 
@@ -303,22 +303,21 @@ struct TextSearchParams {
     case_sensitive: Option<bool>,
     /// Max results returned, default 100
     max_results: Option<usize>,
-    /// Suffix filter (single), e.g. "pas"; equivalent to extensions with one item (directory mode only)
+    /// Suffix filter (single), e.g. "pas"; equivalent to extensions with one item (dir mode)
     extension: Option<String>,
-    /// Suffix filter (multiple), e.g. ["pas","pp"], any match suffices (directory mode only)
+    /// Suffix filter (multiple), e.g. ["pas","pp"], any match suffices (dir mode)
     extensions: Option<Vec<String>>,
-    /// Recurse into sub-directories, default true (directory mode only)
+    /// Recurse into sub-directories, default true (dir mode)
     recursive: Option<bool>,
-    /// Encoding, default auto (per-file auto-detection, distinguishes GBK/UTF-8); an explicit value decodes only with that encoding, and files that fail are listed under "skipped" rather than silently dropped
+    /// Encoding, default auto (per-file, distinguishes GBK/UTF-8); explicit value decodes only with it, failures listed under "skipped"
     encoding: Option<String>,
-    /// Skip hidden files and directories (starting with ., e.g. .git/.env), default true; false = search everything (directory mode only)
+    /// Skip hidden files and directories (starting with ., e.g. .git/.env), default true; false = search everything (dir mode)
     skip_hidden: Option<bool>,
-    /// Search only files matching these globs, e.g. ["*.rs","src/**/*.ts"]; any match suffices (directory mode only)
+    /// Search only files matching these globs, e.g. ["*.rs","src/**/*.ts"]; any match suffices (dir mode)
     include: Option<Vec<String>>,
-    /// Skip files/dirs matching these globs, e.g. ["*.min.js","node_modules/**"]; a dir match prunes the whole subtree (directory mode only)
+    /// Skip files/dirs matching these globs, e.g. ["*.min.js","node_modules/**"]; a dir match prunes the whole subtree (dir mode)
     exclude: Option<Vec<String>>,
-    /// Directory mode: max candidate files to scan/collect (controls scan coverage, NOT the number of matches returned;
-    /// hitting the cap emits a "may be incompletely covered" warning). Default 20000. Match count is controlled by max_results.
+    /// Directory mode: max candidate files scanned (a coverage cap, not the match count; hitting it warns), default 20000
     max_files: Option<usize>,
     /// Context lines shown before and after each hit, default 0 (>0 merges adjacent hits in the same file)
     context_lines: Option<usize>,
@@ -348,11 +347,11 @@ struct ListFilesParams {
 struct DeleteFileParams {
     /// File path
     path: String,
-    /// Delete confirmation: must be explicitly true to actually delete; when false (unset) returns a hint and does not delete, preventing accidental deletion
+    /// Must be explicitly true to delete; when false or unset nothing is deleted and a hint is returned
     confirm: Option<bool>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 struct EditFileLinesParams {
     /// Edit mode: delete_lines | insert_lines | replace_lines | append_lines
     operation: String,
@@ -368,7 +367,7 @@ struct EditFileLinesParams {
     encoding: Option<String>,
     /// Required for delete/replace: original text of the target line(s), a guard against wrong line numbers
     expected_old: Option<String>,
-    /// sha256 from a prior read; the write is rejected if the file changed
+    /// sha256 from a prior read; optional — pass it only to force strict snapshot checking (REQUIRED in context-block mode)
     expected_sha256: Option<String>,
     /// Locate by the full target line text (must be unique); pair with start_line if ambiguous
     anchor_text: Option<String>,
@@ -376,9 +375,9 @@ struct EditFileLinesParams {
     anchor_regex: Option<String>,
     /// Which anchor match to use when multiple (1-based); must be unique by default
     anchor_occurrence: Option<usize>,
-    /// If true, return a diff preview without writing
+    /// true = return only a diff preview without writing, plus a one-time planToken to commit via apply_plans
     dry_run: Option<bool>,
-    /// Context block (with context_after): snippet before the change point; the tool replaces the implied text between the two snippets with content. Exclusive with expected_old/anchor/line-number. Requires expected_sha256.
+    /// Context block: snippet before the change point; the tool replaces the implied text between the two snippets with content. Exclusive with expected_old/anchor/line-number; requires expected_sha256.
     context_before: Option<String>,
     /// Snippet after the change point; must match uniquely and follow context_before
     context_after: Option<String>,
@@ -395,7 +394,7 @@ struct PreviewEdit {
     content: Option<String>,
     /// Original target line text (for delete/replace), mutually exclusive with context block
     expected_old: Option<String>,
-    /// sha256 read earlier; if provided, the preview checks the file is unchanged (optional)
+    /// sha256 from a prior read; optional — only to force strict snapshot checking (REQUIRED in context-block mode)
     expected_sha256: Option<String>,
     /// Anchor location: full target line text (must be unique in file)
     anchor_text: Option<String>,
@@ -425,32 +424,34 @@ struct PreviewEditsParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ApplyPlansParams {
-    /// planToken list from preview_edits; a single element commits just that one file
+    /// planToken list from any tool's dry_run preview (preview_edits included); a single element commits just that one file
     plan_tokens: Vec<String>,
-    /// true = the file-level sha256 must also match the preview-time snapshot (default false: only the target is re-located, so non-overlapping concurrent edits auto-merge)
+    /// true = also require the file-level sha256 to match the preview-time snapshot (default false)
     strict: Option<bool>,
 }
 
-/// One edit already frozen by preview_edits: target file + exact modification (parameters saved as-is, so no need to resend large content at commit) + the sha256 read at preview time
-struct PlannedFileEdit {
-    path: String,
-    operation: String,
-    start_line: Option<usize>,
-    end_line: Option<usize>,
-    content: Option<String>,
-    expected_old: Option<String>,
-    anchor_text: Option<String>,
-    anchor_regex: Option<String>,
-    anchor_occurrence: Option<usize>,
-    context_before: Option<String>,
-    context_after: Option<String>,
-    encoding: Option<String>,
-    expected_sha256: String,
+/// A frozen edit operation, covering every write tool that supports dry_run: line-based (edit_file_lines),
+/// exact-fragment based (edit_file_sections), regex (regex_replace), whole-file text (write_text_file) and
+/// binary (write_binary_file). The tool's parameters are saved verbatim, so no need to resend large content at
+/// commit; only expected_sha256 and dry_run get rewritten at commit time, based on the strict and read-only flags.
+#[derive(Clone)]
+enum PlannedOp {
+    Lines(Box<EditFileLinesParams>),
+    Sections(Box<EditFileSectionsParams>),
+    Regex(Box<RegexReplaceParams>),
+    WriteText(Box<WriteTextFileParams>),
+    WriteBinary(Box<WriteBinaryFileParams>),
 }
 
-/// A committed plan: exactly one file's edit; after apply it is deleted from the store whether it succeeds or fails (one-time)
+/// A committed plan: edits for exactly one file; after apply it is deleted from the store whether it succeeds or fails (one-time)
 struct EditPlan {
-    file: PlannedFileEdit,
+    op: PlannedOp,
+    /// Target file path (already resolved), used for logs and strict checks
+    path: String,
+    /// File fingerprint read at preview time, used for strict checks
+    sha: String,
+    /// The context-block mode forcibly requires expected_sha256, so such a plan must always carry sha
+    require_sha: bool,
     expires_at: std::time::Instant,
 }
 
@@ -461,11 +462,18 @@ static PLAN_STORE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, EditPlan
 /// Plan token validity period: a short session is enough; an expired token forces a re-preview
 const PLAN_TTL_SECS: u64 = 600;
 
+thread_local! {
+    /// When true, a dry_run preview must NOT mint a planToken. Set only by apply_plans' internal pre-check:
+    /// that dry_run is a validation step, not a user preview (the token was already issued when the user
+    /// previewed), so minting there would leave one redundant plan per file in the store on every commit.
+    static SUPPRESS_PLAN_TOKEN: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct CopyFilesParams {
     /// Source file path list
     sources: Vec<String>,
-    /// Target: directory (multiple sources) or new file path (single source). Ending with / or \ forces directory interpretation
+    /// New path/name when there is a single source; a trailing / or \ forces directory interpretation
     target: String,
     /// Overwrite existing target, default false
     overwrite: Option<bool>,
@@ -475,14 +483,14 @@ struct CopyFilesParams {
 struct MoveFilesParams {
     /// Source file path list
     sources: Vec<String>,
-    /// Target: directory (multiple sources) or new file path (single source, rename). Ending with / or \ forces directory interpretation
+    /// New path/name when there is a single source (rename); a trailing / or \ forces directory interpretation
     target: String,
     /// Overwrite existing target, default false
     overwrite: Option<bool>,
 }
 
 /// One entry of a batch edit: locate expected_old exactly and replace with content
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 struct SectionEdit {
     /// Original fragment to replace, must match char-by-char (may span multiple lines; \r\n may be written as \n)
     expected_old: String,
@@ -504,7 +512,7 @@ struct PlannedSection {
     line_to: usize,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 struct EditFileSectionsParams {
     /// File path
     path: String,
@@ -512,11 +520,11 @@ struct EditFileSectionsParams {
     edits: Vec<SectionEdit>,
     /// Encoding, keep the original encoding by default (rejected if inconsistent)
     encoding: Option<String>,
-    /// sha256 read earlier; write rejected if the file changed
+    /// sha256 from a prior read; optional (pass it only to force strict snapshot checking)
     expected_sha256: Option<String>,
     /// true (default) = if any edit is unmatched/non-unique, write nothing; false = write only the matched ones and list the skipped
     all_or_nothing: Option<bool>,
-    /// true = return only a diff preview without writing
+    /// true = return only a diff preview without writing, plus a one-time planToken to commit via apply_plans
     dry_run: Option<bool>,
 }
 
@@ -1696,6 +1704,28 @@ impl FileIoServer {
         ))
     }
 
+    /// Version check with an exemption for read-only calls: a real write stays strict (reject outright when the file changed),
+    /// but dry_run writes nothing and carries zero overwrite risk. A stale expected_sha256 is therefore downgraded to a note,
+    /// letting the preview proceed against the LATEST content — this way "just want to see the diff" never fails outright.
+    /// Returns Some(note) only when the sha is stale (only possible on the dry_run path); the caller prepends it to the dry_run output.
+    fn check_expected_sha_lenient(
+        path: &str,
+        current_bytes: &[u8],
+        expected: Option<&str>,
+        dry_run: bool,
+    ) -> Result<Option<String>, McpError> {
+        if let Err(e) = Self::check_expected_sha(path, current_bytes, expected) {
+            if !dry_run {
+                return Err(e);
+            }
+            return Ok(Some(
+                "[note] expected_sha256 is stale (the file changed after you read it); the preview below is based on the LATEST content\n"
+                    .to_string(),
+            ));
+        }
+        Ok(None)
+    }
+
     /// Decode file bytes into FileText: strip and record the BOM, detect the dominant line-ending style.
     /// Strictly symmetric with encode_file, ensuring the BOM is not lost after writing back (UTF-16 files won't degrade into GBK mojibake).
     fn decode_file(bytes: &[u8], encoding_name: &str) -> Result<FileText, String> {
@@ -2628,7 +2658,7 @@ impl FileIoServer {
     /// Read a text file
     #[tool(
         name = "read_text_file",
-        description = "Read a text fragment by byte offset/length. offset default 0; length must be >=1, default up to 10MB. Returns a header: path | encoding (BOM) | size | sha256 | range; the range is auto-snapped to character boundaries by default (flagged), use strict=true for exact byte ranges. For line-based editing use read_text_lines",
+        description = "Read a text fragment by byte offset/length (offset defaults to 0, length up to 10MB). Returns a header: path | encoding (BOM) | size | sha256 | range; the range is snapped to character boundaries unless strict=true. For line-based editing use read_text_lines",
         annotations(title = "Read text file", read_only_hint = true)
     )]
     fn read_text_file(
@@ -2906,7 +2936,9 @@ impl FileIoServer {
     /// Write a text file
     #[tool(
         name = "write_text_file",
-        description = "Write text in one shot (auto-creates directories). mode=overwrite (default)/append/insert (needs offset, must land on a character boundary). Pass expected_old for a pre-write check and expected_sha256 from a prior read to avoid overwriting concurrent changes; dry_run=true returns only a diff",
+        description = "Write text in one shot (auto-creates directories). mode=overwrite (default)/append/insert (offset must land on a character boundary). \
+Pass expected_old for a pre-write check. mode=overwrite rewrites the whole file, so expected_sha256 is REQUIRED there to avoid overwriting concurrent changes; the other modes do not overwrite, so it is optional. \
+dry_run=true previews and returns a one-time planToken; commit it with apply_plans instead of resending the content.",
         annotations(title = "Write text file", destructive_hint = true)
     )]
     fn write_text_file(
@@ -2939,10 +2971,13 @@ impl FileIoServer {
         };
 
         // Pre-write version check: refuse if the file was changed by another AI/program, to avoid wiping others' changes
-        Self::check_expected_sha(
+        let dry_run = params.dry_run.unwrap_or(false);
+        // dry_run has zero write risk: a stale sha256 is downgraded to a note so a read-only preview is never blocked
+        let sha_note = Self::check_expected_sha_lenient(
             &params.path,
             existing_bytes.as_deref().unwrap_or(&[]),
             params.expected_sha256.as_deref(),
+            dry_run,
         )?;
 
         // Decide the write encoding: keep the original file encoding when unspecified/auto; when the specified encoding conflicts with the actual one, error and return the real encoding
@@ -2995,7 +3030,7 @@ impl FileIoServer {
         };
 
         // dry-run: only return a diff preview, don't write the file or back it up
-        if params.dry_run.unwrap_or(false) {
+        if dry_run {
             let old_text = match existing_bytes.as_deref() {
                 Some(b) => Self::decode_file(b, encoding_name)
                     .map_err(|e| e_internal(e, None))?
@@ -3054,15 +3089,30 @@ impl FileIoServer {
             let new_text = Self::decode_file(&new_full, encoding_name)
                 .map_err(|e| e_internal(e, None))?
                 .content;
+            // Mint a one-time planToken so confirmation can go through apply_plans (no need to resend
+            // the whole content). mode is recorded so overwrite commits still go through strict sha checking.
+            let (token_line, commit_hint) = if Self::suppress_plan_token() {
+                (String::new(), String::new())
+            } else {
+                let plan_sha = params
+                    .expected_sha256
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| Self::path_fingerprint_short(&params.path));
+                Self::plan_footer(&self.store_write_text_plan(&params, plan_sha, &mode))
+            };
             return Ok(format!(
-                "DRY-RUN | {} | {} | mode={} | {}B→{}B | not written\n{}expected sha256:{}\nremove dry_run and retry to write",
+                "{}{}DRY-RUN | {} | {} | mode={} | {}B→{}B | not written\n{}expected sha256:{}\nremove dry_run and retry to write{}",
+                sha_note.unwrap_or_default(),
+                token_line,
                 params.path,
                 encoding_label,
                 mode,
                 old_text.len(),
                 new_text.len(),
                 Self::unified_diff(&old_text, &new_text, 200),
-                Self::fingerprint_short_of_bytes(&new_full)
+                Self::fingerprint_short_of_bytes(&new_full),
+                commit_hint
             ));
         }
 
@@ -3170,7 +3220,7 @@ impl FileIoServer {
     /// Read text by line number (pairs with edit_file_lines so line numbers are not mis-counted)
     #[tool(
         name = "read_text_lines",
-        description = "Read text by line (1-based, with line numbers), pairs with edit_file_lines. Header includes total line count and sha256; pass the sha256 to expected_sha256 when editing to prevent concurrent overwrites",
+        description = "Read text by line (1-based, with line numbers), pairs with edit_file_lines. Header includes total line count and sha256; pass the sha256 as expected_sha256 for overwrite-style writes (required) or when you need strict snapshot checking — local edits preserve concurrent changes without it",
         annotations(title = "Read text by line", read_only_hint = true)
     )]
     fn read_text_lines(
@@ -3414,10 +3464,10 @@ impl FileIoServer {
     /// Write hexadecimal data to a binary file
     #[tool(
         name = "write_binary_file",
-        description = "Write binary by hex. mode=overwrite (default)/append/insert (offset)/replace (offset+replace_length); offset out of range errors. \
-expected_hex = pre-write check of the original bytes in the range to change (must not be empty); \
-pass expected_sha256 from a prior read to avoid overwriting concurrent changes; \
-dry_run=true returns only a HEX diff preview without writing to disk",
+        description = "Write binary by hex: mode=overwrite (default)/append/insert (offset)/replace (offset+replace_length); an out-of-range offset errors. \
+expected_hex = pre-write check of the original bytes in the range to change (must not be empty). \
+mode=overwrite rewrites the whole file, so expected_sha256 is REQUIRED there to avoid overwriting concurrent changes; the other modes do not overwrite, so it is optional. \
+dry_run=true returns a HEX diff preview (no write) plus a one-time planToken; commit it with apply_plans instead of resending the hex data.",
         annotations(title = "Write binary file", destructive_hint = true)
     )]
     fn write_binary_file(
@@ -3480,7 +3530,13 @@ dry_run=true returns only a HEX diff preview without writing to disk",
         } else {
             Vec::new()
         };
-        Self::check_expected_sha(&params.path, &current, params.expected_sha256.as_deref())?;
+        // dry_run has zero write risk: a stale sha256 is downgraded to a note so a read-only preview is never blocked
+        let sha_note = Self::check_expected_sha_lenient(
+            &params.path,
+            &current,
+            params.expected_sha256.as_deref(),
+            dry_run,
+        )?;
 
         // Pre-write compare the actual bytes of "the range to change": binaries have no line numbers/anchors, so a wrong offset can only be caught here
         if let Some(exp_hex) = params.expected_hex.as_deref() {
@@ -3578,11 +3634,24 @@ dry_run=true returns only a HEX diff preview without writing to disk",
 
         // dry_run: return only the diff preview, do not write to disk
         if dry_run {
-            return Ok(Self::binary_dry_run_report(
-                &params.path,
-                &current,
-                &new_data,
-                &action,
+            // Mint a one-time planToken so confirmation can go through apply_plans (no need to resend the hex
+            // data). mode is recorded so overwrite commits still go through strict sha checking.
+            let (token_line, commit_hint) = if Self::suppress_plan_token() {
+                (String::new(), String::new())
+            } else {
+                let plan_sha = params
+                    .expected_sha256
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| Self::path_fingerprint_short(&params.path));
+                Self::plan_footer(&self.store_write_binary_plan(&params, plan_sha, &mode))
+            };
+            return Ok(format!(
+                "{}{}{}{}",
+                sha_note.unwrap_or_default(),
+                token_line,
+                Self::binary_dry_run_report(&params.path, &current, &new_data, &action),
+                commit_hint
             ));
         }
 
@@ -3669,12 +3738,10 @@ dry_run=true returns only a HEX diff preview without writing to disk",
     /// Search text content in a file/directory (regex)
     #[tool(
         name = "text_search",
-        description = "Search text in a file/directory. mode=regex (default, regex)/literal (plain text, pattern needs no escaping). \
-Results are grouped by file (include sha256, usable directly as edit_file_lines' expected_sha256); each is line:col:[hit fragment] \"full line\". \
-Directories recurse by default and auto-skip hidden files/dirs (.git/.env etc.; skip_hidden=false turns this off). \
-binary/build artifacts (.dcu/.exe/.dll/.bak/.pyc etc.) are skipped unless extension/extensions/include are given; use extension/extensions and include/exclude (glob) to scope. \
-max_files (default 20000) is the coverage cap on \"how many candidate files to scan\" (hitting it warns, it is NOT the number of matches returned), \
-max_results (default 100) is the \"max number of matching lines to return\"; encoding defaults to auto (per-file detection, distinguishes GBK/UTF-8); context_lines>0 attaches context lines",
+        description = "Search text in a file/directory (mode=regex by default; literal takes plain text, no escaping needed). \
+Results are grouped by file and carry that file's sha256 (usable as edit_file_lines' expected_sha256); each hit is line:col:[fragment] \"full line\". \
+Directories recurse by default; max_results caps returned lines (default 100), max_files caps files scanned (default 20000, hitting it warns); encoding is per-file auto (GBK/UTF-8). \
+Hidden files and binary/build artifacts (.dcu/.exe/.dll/.bak/.pyc) are skipped unless extension/extensions/include/exclude scope them.",
         annotations(title = "Text search", read_only_hint = true)
     )]
     fn text_search(
@@ -3994,8 +4061,10 @@ max_results (default 100) is the \"max number of matching lines to return\"; enc
     #[tool(
         name = "edit_file_sections",
         description = "Change multiple places in one call (all-or-nothing by default): edits=[{expected_old, content, occurrence?, start_line?}]. \
-expected_old must match character-by-character and be unique in the file by default; for multiple hits use occurrence or start_line (a wrong value reports the actual line); an empty content deletes. \
-Located against a single snapshot; overlaps error out; supports expected_sha256 and dry_run; the second line of the header gives the line number of each change",
+expected_old must match character-by-character and be unique in the file by default; for multiple hits use occurrence or start_line (a wrong value reports the actual line); empty content deletes. \
+All fragments are located against one snapshot; overlaps error out; the header's second line gives each change's line number. \
+expected_sha256 is optional: fragments are located in the LATEST content, so others' concurrent edits are preserved. \
+dry_run=true previews and returns a one-time planToken; commit it with apply_plans instead of resending the edits.",
         annotations(title = "Batch section edit", destructive_hint = true)
     )]
     fn edit_file_sections(
@@ -4032,7 +4101,14 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
         self.with_path_lock(&params.path, || {
             let bytes = fs::read(&params.path)
                 .map_err(|e| e_internal(format!("failed to read file: {}", e), None))?;
-            Self::check_expected_sha(&params.path, &bytes, params.expected_sha256.as_deref())?;
+            let dry_run = params.dry_run.unwrap_or(false);
+            // dry_run has zero write risk: a stale sha256 is downgraded to a note so a read-only preview is never blocked
+            let sha_note = Self::check_expected_sha_lenient(
+                &params.path,
+                &bytes,
+                params.expected_sha256.as_deref(),
+                dry_run,
+            )?;
 
             // Same encoding decision as write_text_file/regex_replace: keep the original encoding by default; reject when inconsistent
             let encoding_name = Self::resolve_write_encoding(
@@ -4234,9 +4310,23 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
                 )
             };
 
-            if params.dry_run.unwrap_or(false) {
+            if dry_run {
+                // Freeze this batch into a plan and mint a one-time planToken, so confirmation can go through
+                // apply_plans instead of resending the whole edits array
+                let (token_line, commit_hint) = if Self::suppress_plan_token() {
+                    (String::new(), String::new())
+                } else {
+                    let plan_sha = params
+                        .expected_sha256
+                        .clone()
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| Self::path_fingerprint_short(&params.path));
+                    Self::plan_footer(&self.store_sections_plan(&params, plan_sha))
+                };
                 return Ok(format!(
-                    "DRY-RUN | {} | {} | {} replacement(s) | {}B→{}B | not written\n{}\n{}expected sha256:{}\nremove dry_run and retry to write{}",
+                    "{}{}DRY-RUN | {} | {} | {} replacement(s) | {}B→{}B | not written\n{}\n{}expected sha256:{}\nremove dry_run and retry to write{}{}",
+                    sha_note.unwrap_or_default(),
+                    token_line,
                     params.path,
                     encoding_label,
                     planned.len(),
@@ -4245,7 +4335,8 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
                     Self::format_section_positions(&planned),
                     Self::sections_diff(&ft.content, &planned, 1),
                     Self::fingerprint_short_of_bytes(&new_bytes),
-                    skip_note
+                    skip_note,
+                    commit_hint
                 ));
             }
 
@@ -4277,7 +4368,9 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
     /// Regex-replace file text
     #[tool(
         name = "regex_replace",
-        description = "Regex replace (supports $1/$2); literal=true = plain-text replace (no escaping, $ taken literally). max_matches is required = expected max replacements, rejected if exceeded; global defaults to true; pass expected_sha256 from a prior read to avoid overwriting concurrent changes; dry_run=true returns only a diff",
+        description = "Regex replace (supports $1/$2); literal=true = plain-text replace (no escaping, $ taken literally). max_matches is required (= expected max replacements; rejected if exceeded); global defaults to true. \
+Replaces within the LATEST content, so others' concurrent edits are preserved: expected_sha256 is optional. \
+dry_run=true previews and returns a one-time planToken; commit it with apply_plans instead of resending pattern/replacement.",
         annotations(title = "Regex replace", destructive_hint = true)
     )]
     fn regex_replace(
@@ -4309,7 +4402,14 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
         let bytes = fs::read(&params.path).map_err(|e| {
             e_internal(format!("failed to read file: {}", e), None)
         })?;
-        Self::check_expected_sha(&params.path, &bytes, params.expected_sha256.as_deref())?;
+        let dry_run = params.dry_run.unwrap_or(false);
+        // dry_run has zero write risk: a stale sha256 is downgraded to a note so a read-only preview is never blocked
+        let sha_note = Self::check_expected_sha_lenient(
+            &params.path,
+            &bytes,
+            params.expected_sha256.as_deref(),
+            dry_run,
+        )?;
 
         // Same encoding decision as write_text_file/edit_file_lines: auto-detect and keep the original encoding when unspecified;
         // reject outright when explicitly set but inconsistent with the actual encoding, to avoid rewriting a GBK/UTF-16 file into another encoding
@@ -4429,14 +4529,27 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
             if count > 20 {
                 preview.push_str(&format!("  ... {} matches total, previewing only the first 20\n", count));
             }
+            let (token_line, commit_hint) = if Self::suppress_plan_token() {
+                (String::new(), String::new())
+            } else {
+                let plan_sha = params
+                    .expected_sha256
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| Self::path_fingerprint_short(&params.path));
+                Self::plan_footer(&self.store_regex_plan(&params, plan_sha))
+            };
             return Ok(format!(
-                "{} | DRY-RUN | {} | {} matches | not written\n{}new file size: {}B -> {}B\nremove dry_run and retry to write",
+                "{}{}{} | DRY-RUN | {} | {} matches | not written\n{}new file size: {}B -> {}B\nremove dry_run and retry to write{}",
+                sha_note.unwrap_or_default(),
+                token_line,
                 params.path,
                 params.pattern,
                 count,
                 preview,
                 content.len(),
-                new_content.len()
+                new_content.len(),
+                commit_hint
             ));
         }
 
@@ -4477,7 +4590,7 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
     /// List or search directory contents
     #[tool(
         name = "list_files",
-        description = "List a directory / search by file name (glob_pattern or pattern regex, choose one; recursive defaults to false), with include_dirs, show_size/show_modified",
+        description = "List a directory / search by file name (glob_pattern or pattern regex, choose one; recursive defaults to false)",
         annotations(title = "List directory", read_only_hint = true)
     )]
     fn list_files(
@@ -4717,7 +4830,7 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
     /// Delete a file (requires confirmation)
     #[tool(
         name = "delete_file",
-        description = "Delete a single file (directories not allowed). You must pass confirm=true explicitly to actually delete; when unconfirmed it returns E_INVALID_PARAM and echoes the file size and fingerprint; a backup is taken automatically before deletion, recoverable with manage_backups undo",
+        description = "Delete a single file (directories not allowed); requires confirm=true. A backup is taken before deletion, recoverable with manage_backups undo",
         annotations(title = "Delete file", destructive_hint = true)
     )]
     fn delete_file(
@@ -5157,15 +5270,18 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
     /// Edit a file by line: delete / insert / replace / append lines
     #[tool(
         name = "edit_file_lines",
-        description = "Edit by line (1-based; path required): delete_lines/insert_lines/replace_lines/append_lines. Locate with anchor_text (whole line, must be unique) or anchor_regex, or directly give start_line/end_line; delete/replace require expected_old for a second check; pass expected_sha256 from a prior read to avoid overwriting concurrent changes; dry_run=true returns only a diff. \
-Also supports a \"context block\" mode: give context_before + context_after (mutually exclusive with expected_old/anchor/line-number; requires expected_sha256). The tool auto-locates the implied text between the two frames and replaces it with content; two adjacent frames mean inserting content between them — the AI need not repeat large chunks of old text.",
+        description = "Edit by line (1-based; path required): operation=delete_lines|insert_lines|replace_lines|append_lines. Locate with anchor_text (whole line, must be unique) or anchor_regex, or start_line/end_line; delete/replace require expected_old as a second check. \
+expected_sha256 is optional: the edit is located in the LATEST content, so others' concurrent edits are preserved. \
+dry_run=true previews and returns a one-time planToken; commit it with apply_plans instead of resending the edit. \
+Also a \"context block\" mode: context_before + context_after locate the change point (mutually exclusive with expected_old/anchor/line-number; expected_sha256 REQUIRED there), so the AI need not repeat large chunks of old text.",
         annotations(title = "Edit file by line", destructive_hint = true)
     )]
     fn edit_file_lines(
         &self,
         Parameters(params): Parameters<EditFileLinesParams>,
     ) -> Result<String, McpError> {
-        let target = params.path.ok_or_else(|| {
+        // clone: the whole params is still needed later, to freeze the plan for dry_run
+        let target = params.path.clone().ok_or_else(|| {
             e_param("missing path parameter", None)
         })?;
         let target = self.resolve_path(&target)?;
@@ -5218,7 +5334,14 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
         })?;
 
         // Pre-write version check: if the file was changed by another AI/program, refuse, to avoid wiping someone else's change on whole-file write-back
-        Self::check_expected_sha(&target, &bytes, params.expected_sha256.as_deref())?;
+        let dry_run = params.dry_run.unwrap_or(false);
+        // dry_run has zero write risk: a stale sha256 is downgraded to a note so a read-only preview is never blocked
+        let sha_note = Self::check_expected_sha_lenient(
+            &target,
+            &bytes,
+            params.expected_sha256.as_deref(),
+            dry_run,
+        )?;
 
         // Decide the edit encoding: keep the original file encoding by default; if the specified encoding is inconsistent with the actual one, error out and report the real encoding
         let encoding_name = Self::resolve_write_encoding(&target, params.encoding.as_deref(), Some(&bytes))?;
@@ -5674,9 +5797,22 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
         .map_err(|e| e_internal(e, None))?;
 
         // dry-run: return only the diff preview, write no file and take no backup
-        if params.dry_run.unwrap_or(false) {
+        if dry_run {
+            // Mint a one-time planToken so confirmation can go through apply_plans (no need to resend the edit)
+            let (token_line, commit_hint) = if Self::suppress_plan_token() {
+                (String::new(), String::new())
+            } else {
+                let plan_sha = params
+                    .expected_sha256
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| Self::path_fingerprint_short(&target));
+                Self::plan_footer(&self.store_lines_plan(&params, plan_sha))
+            };
             return Ok(format!(
-                "DRY-RUN | {} | {} | {} | {}→{} lines | {}B→{}B | not written\n{}expected sha256:{}\nremove dry_run and retry to write",
+                "{}{}DRY-RUN | {} | {} | {} | {}→{} lines | {}B→{}B | not written\n{}expected sha256:{}\nremove dry_run and retry to write{}",
+                sha_note.unwrap_or_default(),
+                token_line,
                 target,
                 encoding_label,
                 result,
@@ -5685,7 +5821,8 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
                 bytes.len(),
                 new_bytes.len(),
                 Self::unified_diff(&ft.content, &new_content, 200),
-                Self::fingerprint_short_of_bytes(&new_bytes)
+                Self::fingerprint_short_of_bytes(&new_bytes),
+                commit_hint
             ));
         }
 
@@ -5727,7 +5864,7 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
     /// without writing or backing up. After confirming, call the per-file edit tool to actually apply.
     #[tool(
         name = "preview_edits",
-        description = "Read-only multi-file preview: aggregates several edit_file_lines-style changes (anchors/line numbers/context blocks) into one compact diff, without writing or backing up. \
+        description = "Read-only multi-file preview: aggregates several changes into one compact diff. \
 Each previewed file gets a one-time planToken; commit with apply_plans(plan_tokens) — no need to resend the edit content. \
 edits=[{path, operation?, content?, expected_old?, anchor_*, start_line?, end_line?, context_before?, context_after?, expected_sha256?}]",
         annotations(title = "Multi-file edit preview", read_only_hint = true)
@@ -5767,13 +5904,11 @@ edits=[{path, operation?, content?, expected_old?, anchor_*, start_line?, end_li
             match self.edit_file_lines(Parameters(edit_params)) {
                 Ok(diff) => {
                     ok += 1;
-                    // Preview located successfully: freeze this edit into a plan and issue a one-time planToken.
-                    // At commit the AI only passes the token: no need to resend large content, and the target is re-located against the current content for consistency.
-                    let token = self.store_plan(spec, params.encoding.as_deref());
+                    // edit_file_lines (dry_run) has already frozen this edit and minted the planToken; just relay it here.
+                    // A single issuing point keeps preview_edits from leaving a redundant plan behind.
                     out.push_str(&diff);
-                    if let Some(t) = token {
+                    if Self::extract_plan_token(&diff).is_some() {
                         any_token = true;
-                        out.push_str(&format!("planToken: {}\n", t));
                     }
                     out.push('\n');
                 }
@@ -5801,11 +5936,11 @@ edits=[{path, operation?, content?, expected_old?, anchor_*, start_line?, end_li
     /// Commit edits frozen by preview_edits (round 1: read-only check that each target still locates; round 2: per file, locates then writes under the file lock).
     #[tool(
         name = "apply_plans",
-        description = "Commit edits frozen by preview_edits: pass the planToken(s) it returned, no need to resend edit content. \
-Each token is one-time (cleared on success or failure) and expires shortly; on any error re-run preview_edits. \
-Re-locates against current content at commit, so non-overlapping concurrent edits auto-merge; a changed target gives E_EXTERNAL_CHANGED. \
-strict=true also requires the file-level sha256 to match the preview snapshot. \
-One token commits one file; several tokens report per-file outcome",
+        description = "Commit edits frozen by any dry_run preview (preview_edits / edit_file_lines / edit_file_sections / regex_replace / write_text_file / write_binary_file): pass the planToken(s), no need to resend content. \
+Tokens are one-time (cleared on success or failure) and expire soon; on any error re-run the preview. \
+The target is re-located against current content at commit, so non-overlapping concurrent edits auto-merge; a changed target gives E_EXTERNAL_CHANGED. \
+strict=true also requires the file-level sha256 to match; a write_text_file/write_binary_file overwrite plan always does. \
+One token = one file; several tokens report per-file outcome",
         annotations(title = "Apply preview plans", destructive_hint = true)
     )]
     fn apply_plans(
@@ -5820,21 +5955,29 @@ One token commits one file; several tokens report per-file outcome",
         }
         let strict = params.strict.unwrap_or(false);
         // Take all tokens first (cleared regardless of outcome, one-time); a missing/expired one rejects the whole batch
-        let mut plans: Vec<(String, PlannedFileEdit)> = Vec::new();
+        let mut plans: Vec<(String, EditPlan)> = Vec::new();
         for token in &params.plan_tokens {
             let plan = Self::take_plan(token)?;
-            plans.push((token.clone(), plan.file));
+            plans.push((token.clone(), plan));
         }
         // Round 1 (feasibility, read-only, no write): reject the whole batch up front if any target no longer locates.
         // Skipped for a single token: one file is atomic on its own, so the extra dry-run adds nothing.
         if plans.len() > 1 {
-            for (token, file) in &plans {
-                let p = Self::plan_to_edit_params(file, strict, true);
-                if let Err(e) = self.edit_file_lines(Parameters(p)) {
+            for (token, plan) in &plans {
+                // When the plan carries a required sha256 (strict, or the context-block mode that mandates it), check it STRICTLY here.
+                // A bare dry_run degrades a stale sha to a mere note (it writes nothing), which would let a conflicted file slip past the
+                // pre-check and break whole-batch all-or-nothing; checking it explicitly restores that guarantee.
+                if strict || plan.require_sha {
+                    let cur = fs::read(&plan.path)
+                        .map_err(|e| e_internal(format!("failed to read file: {}", e), None))?;
+                    Self::check_expected_sha(&plan.path, &cur, Some(plan.sha.as_str()))?;
+                }
+                let op = Self::plan_to_op(plan, strict, true);
+                if let Err(e) = self.run_plan_check(op) {
                     return Err(e_param(
                         format!(
                             "E_EXTERNAL_CHANGED batch rejected (all tokens cleared; if a file was changed by someone else, re-run preview_edits); file {} (token {}) no longer locatable: {}",
-                            file.path, token, e
+                            plan.path, token, e
                         ),
                         None,
                     ));
@@ -5845,12 +5988,12 @@ One token commits one file; several tokens report per-file outcome",
         let mut out = String::new();
         let mut ok = 0usize;
         let mut failed = 0usize;
-        for (token, file) in &plans {
-            let p = Self::plan_to_edit_params(file, strict, false);
-            match self.edit_file_lines(Parameters(p)) {
+        for (token, plan) in &plans {
+            let op = Self::plan_to_op(plan, strict, false);
+            match self.run_plan(op) {
                 Ok(res) => {
                     ok += 1;
-                    out.push_str(&format!("applied | {} | token {}\n{}\n", file.path, token, res));
+                    out.push_str(&format!("applied | {} | token {}\n{}\n", plan.path, token, res));
                 }
                 Err(e) => {
                     failed += 1;
@@ -5864,7 +6007,7 @@ One token commits one file; several tokens report per-file outcome",
                             None,
                         ));
                     }
-                    out.push_str(&format!("failed | {} | token {}: {}\n", file.path, token, e));
+                    out.push_str(&format!("failed | {} | token {}: {}\n", plan.path, token, e));
                 }
             }
         }
@@ -5877,37 +6020,75 @@ One token commits one file; several tokens report per-file outcome",
 
     /// Freeze one successfully previewed edit into a plan and issue a one-time planToken (written into the process-level store).
     /// Returns None on failure (e.g. path resolution error); the caller then only shows the diff, without a token.
-    fn store_plan(&self, spec: &PreviewEdit, global_encoding: Option<&str>) -> Option<String> {
-        let path = self.resolve_path(&spec.path).ok()?;
-        // Concurrency guard: prefer an explicitly provided sha; otherwise compute the short fingerprint of the current content (same source as check_expected_sha)
-        let sha = spec
-            .expected_sha256
-            .clone()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| Self::path_fingerprint_short(&path));
+    fn store_lines_plan(&self, params: &EditFileLinesParams, sha: String) -> Option<String> {
+        let path = self.resolve_path(params.path.as_deref()?).ok()?;
+        // The context-block mode forcibly requires expected_sha256, so such a plan must always carry sha
+        let require_sha = params.context_before.is_some() || params.context_after.is_some();
+        let mut q = params.clone();
+        q.expected_sha256 = None;
+        q.dry_run = None;
+        Self::insert_plan(PlannedOp::Lines(Box::new(q)), path, sha, require_sha)
+    }
+
+    /// Freeze an edit_file_sections batch into a plan and issue a one-time planToken, so that a dry_run preview can be
+    /// committed later through apply_plans without resending the edits.
+    fn store_sections_plan(&self, params: &EditFileSectionsParams, sha: String) -> Option<String> {
+        let path = self.resolve_path(&params.path).ok()?;
+        let mut q = params.clone();
+        q.expected_sha256 = None;
+        q.dry_run = None;
+        Self::insert_plan(PlannedOp::Sections(Box::new(q)), path, sha, false)
+    }
+
+    /// Freeze a regex_replace as a plan and mint a one-time token.
+    fn store_regex_plan(&self, params: &RegexReplaceParams, sha: String) -> Option<String> {
+        let path = self.resolve_path(&params.path).ok()?;
+        let mut q = params.clone();
+        q.expected_sha256 = None;
+        q.dry_run = None;
+        Self::insert_plan(PlannedOp::Regex(Box::new(q)), path, sha, false)
+    }
+
+    /// Freeze a write_text_file as a plan and mint a one-time token.
+    /// mode=overwrite rewrites the whole file, so it always goes through strict sha checking to avoid overwriting
+    /// anyone else's edits; append/insert do not overwrite, so they stay concurrency-friendly without it.
+    fn store_write_text_plan(
+        &self,
+        params: &WriteTextFileParams,
+        sha: String,
+        mode: &str,
+    ) -> Option<String> {
+        let path = self.resolve_path(&params.path).ok()?;
+        let require_sha = mode == "overwrite";
+        let mut q = params.clone();
+        q.expected_sha256 = None;
+        q.dry_run = None;
+        Self::insert_plan(PlannedOp::WriteText(Box::new(q)), path, sha, require_sha)
+    }
+
+    /// Freeze a write_binary_file as a plan and mint a one-time token (overwrite must go through strict sha checking).
+    fn store_write_binary_plan(
+        &self,
+        params: &WriteBinaryFileParams,
+        sha: String,
+        mode: &str,
+    ) -> Option<String> {
+        let path = self.resolve_path(&params.path).ok()?;
+        let require_sha = mode == "overwrite";
+        let mut q = params.clone();
+        q.expected_sha256 = None;
+        q.dry_run = None;
+        Self::insert_plan(PlannedOp::WriteBinary(Box::new(q)), path, sha, require_sha)
+    }
+
+    /// Write a plan into the process-level store and mint its one-time token.
+    fn insert_plan(op: PlannedOp, path: String, sha: String, require_sha: bool) -> Option<String> {
         let token = Self::new_plan_token();
         let plan = EditPlan {
-            file: PlannedFileEdit {
-                path,
-                operation: spec
-                    .operation
-                    .clone()
-                    .unwrap_or_else(|| "replace_lines".to_string()),
-                start_line: spec.start_line,
-                end_line: spec.end_line,
-                content: spec.content.clone(),
-                expected_old: spec.expected_old.clone(),
-                anchor_text: spec.anchor_text.clone(),
-                anchor_regex: spec.anchor_regex.clone(),
-                anchor_occurrence: spec.anchor_occurrence,
-                context_before: spec.context_before.clone(),
-                context_after: spec.context_after.clone(),
-                encoding: spec
-                    .encoding
-                    .clone()
-                    .or_else(|| global_encoding.map(|s| s.to_string())),
-                expected_sha256: sha,
-            },
+            op,
+            path,
+            sha,
+            require_sha,
             expires_at: std::time::Instant::now() + std::time::Duration::from_secs(PLAN_TTL_SECS),
         };
         let store = PLAN_STORE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
@@ -5938,35 +6119,58 @@ One token commits one file; several tokens report per-file outcome",
         })
     }
 
-    /// Construct edit_file_lines parameters from a plan.
-    /// strict=true passes expected_sha256 (whole-file match required); false omits it and relies on re-location inside edit_file_lines (target region must still match uniquely), so non-overlapping concurrent edits merge.
-    /// The context-block mode always passes expected_sha256 (tool hard requirement).
-    fn plan_to_edit_params(
-        file: &PlannedFileEdit,
-        strict: bool,
-        dry_run: bool,
-    ) -> EditFileLinesParams {
-        let is_context = file.context_before.is_some() || file.context_after.is_some();
-        let pass_sha = strict || is_context;
-        EditFileLinesParams {
-            operation: file.operation.clone(),
-            path: Some(file.path.clone()),
-            start_line: file.start_line,
-            end_line: file.end_line,
-            content: file.content.clone(),
-            encoding: file.encoding.clone(),
-            expected_old: file.expected_old.clone(),
-            expected_sha256: if pass_sha {
-                Some(file.expected_sha256.clone())
-            } else {
-                None
-            },
-            anchor_text: file.anchor_text.clone(),
-            anchor_regex: file.anchor_regex.clone(),
-            anchor_occurrence: file.anchor_occurrence,
-            dry_run: Some(dry_run),
-            context_before: file.context_before.clone(),
-            context_after: file.context_after.clone(),
+    /// Rebuild a frozen plan back into tool parameters: only expected_sha256/dry_run get rewritten.
+    /// strict=true passes sha (whole-file match required); false omits it and relies on the tool's own re-location
+    /// (the target must still match uniquely), so non-overlapping concurrent edits merge.
+    /// The context-block mode forcibly passes sha (tool hard requirement).
+    fn plan_to_op(plan: &EditPlan, strict: bool, dry_run: bool) -> PlannedOp {
+        let pass_sha = if strict || plan.require_sha {
+            Some(plan.sha.clone())
+        } else {
+            None
+        };
+        match &plan.op {
+            PlannedOp::Lines(p) => {
+                let mut q = (**p).clone();
+                q.expected_sha256 = pass_sha;
+                q.dry_run = Some(dry_run);
+                PlannedOp::Lines(Box::new(q))
+            }
+            PlannedOp::Sections(p) => {
+                let mut q = (**p).clone();
+                q.expected_sha256 = pass_sha;
+                q.dry_run = Some(dry_run);
+                PlannedOp::Sections(Box::new(q))
+            }
+            PlannedOp::Regex(p) => {
+                let mut q = (**p).clone();
+                q.expected_sha256 = pass_sha;
+                q.dry_run = Some(dry_run);
+                PlannedOp::Regex(Box::new(q))
+            }
+            PlannedOp::WriteText(p) => {
+                let mut q = (**p).clone();
+                q.expected_sha256 = pass_sha;
+                q.dry_run = Some(dry_run);
+                PlannedOp::WriteText(Box::new(q))
+            }
+            PlannedOp::WriteBinary(p) => {
+                let mut q = (**p).clone();
+                q.expected_sha256 = pass_sha;
+                q.dry_run = Some(dry_run);
+                PlannedOp::WriteBinary(Box::new(q))
+            }
+        }
+    }
+
+    /// Dispatch a rebuilt plan to the edit tool it was frozen from.
+    fn run_plan(&self, op: PlannedOp) -> Result<String, McpError> {
+        match op {
+            PlannedOp::Lines(p) => self.edit_file_lines(Parameters(*p)),
+            PlannedOp::Sections(p) => self.edit_file_sections(Parameters(*p)),
+            PlannedOp::Regex(p) => self.regex_replace(Parameters(*p)),
+            PlannedOp::WriteText(p) => self.write_text_file(Parameters(*p)),
+            PlannedOp::WriteBinary(p) => self.write_binary_file(Parameters(*p)),
         }
     }
 
@@ -5984,6 +6188,44 @@ One token commits one file; several tokens report per-file outcome",
         h.update(format!("file-io-mcp-plan-{}-{}", now, n).as_bytes());
         let digest = h.finalize();
         digest.iter().take(16).map(|b| format!("{:02x}", b)).collect()
+    }
+
+    /// Build the preview footer for a one-time planToken: the "planToken: xxx" line plus the commit hint.
+    /// Shared by every write tool that supports dry_run, so all previews carry the same format.
+    fn plan_footer(token: &Option<String>) -> (String, String) {
+        match token {
+            Some(t) => (
+                format!("planToken: {}\n", t),
+                format!(
+                    "\ncommit with apply_plans(plan_tokens=[\"{}\"]) — no need to resend the content",
+                    t
+                ),
+            ),
+            None => (String::new(), String::new()),
+        }
+    }
+
+    /// Extract a planToken from a preview result (a line formatted as "planToken: <32 hex chars>").
+    fn extract_plan_token(text: &str) -> Option<String> {
+        text.lines()
+            .find_map(|l| l.trim().strip_prefix("planToken: "))
+            .map(|s| s.trim().to_string())
+            .filter(|s| s.len() == 32 && s.chars().all(|c| c.is_ascii_hexdigit()))
+    }
+
+    /// Whether the current dry_run is an internal pre-check, which must not mint a planToken.
+    fn suppress_plan_token() -> bool {
+        SUPPRESS_PLAN_TOKEN.with(|c| c.get())
+    }
+
+    /// Run a frozen plan in read-only pre-check mode. Identical to run_plan, except that any dry_run inside
+    /// skips minting a planToken (it was already issued when the user previewed), so a commit never leaves
+    /// redundant plans behind. The flag is restored even if the plan errors.
+    fn run_plan_check(&self, op: PlannedOp) -> Result<String, McpError> {
+        let prev = SUPPRESS_PLAN_TOKEN.with(|c| c.replace(true));
+        let r = self.run_plan(op);
+        SUPPRESS_PLAN_TOKEN.with(|c| c.set(prev));
+        r
     }
 }
 
@@ -6108,13 +6350,13 @@ impl ServerHandler for FileIoServer {
             server_info: rmcp::model::Implementation::from_build_env(),
             instructions: Some(
                 "file-io-mcp file read/write server (directory can be restricted via FILE_IO_ROOT). Safety points the agent MUST follow: \
-                 ① Keep the original encoding + BOM + dominant line ending on read/write; encoding distinguishes GBK/UTF-8, and the header hints when uncertain, so specifying encoding explicitly is safest; \
-                 ② Overwrite writes are atomic (temp file + rename) and auto-back up before writing, reversible with manage_backups; deletion requires confirm=true; \
-                 ③ Always read_text_lines first to get sha256 before editing, and pass expected_sha256 back on write — if someone else changed it you get E_EXTERNAL_CHANGED, re-read then edit, never blindly overwrite; \
-                 ④ For multiple changes or when line numbers are unknown use edit_file_sections; regex_replace requires max_matches; when unsure, dry_run=true first to see the diff; \
-                 ⑤ preview_edits returns a one-time planToken per file; commit with apply_plans(plan_tokens) — no need to resend the edit content; on any error just re-run preview_edits; \
+                 ① Keep the original encoding + BOM + dominant line ending on read/write; the header flags uncertain cases, so pass encoding explicitly when GBK/UTF-8 are hard to tell apart; \
+                 ② Overwrite writes are atomic (temp file + rename) and auto-back up, reversible with manage_backups; deletion requires confirm=true; \
+                 ③ The sha256 from read_text_lines is REQUIRED for overwrite-style writes (write_text_file/write_binary_file mode=overwrite); local edits (edit_file_lines/edit_file_sections/regex_replace/apply_plans) locate within the LATEST content and already preserve others' edits — pass a sha only to force strict snapshot checking, since a stale one turns a safe edit into E_EXTERNAL_CHANGED; \
+                 ④ For many non-adjacent changes or unknown line numbers use edit_file_sections; regex_replace requires max_matches; when unsure, dry_run=true first; \
+                 ⑤ dry_run writes nothing and is never blocked by a stale sha256; every preview returns a one-time planToken — commit with apply_plans(plan_tokens) instead of resending content; on any error re-run the preview; \
 ⑥ On an E_XXX error, fix the input per the message and retry; never ignore errors and force the write. \
-                 For full tool selection and the safe-edit loop, see the resource: file-io-mcp://skill/guide (read it via resources/read when needed).".into(),
+                 For tool selection and the safe-edit loop, see the resource: file-io-mcp://skill/guide (resources/read).".into(),
             ),
         }
     }

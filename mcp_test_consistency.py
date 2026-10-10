@@ -109,7 +109,7 @@ call("write_text_file", {"path": f5, "content": "unit A;\nbegin\n  x := 1;\nend.
 r = call("edit_file_lines", {"path": f5, "operation": "replace_lines",
                              "anchor_text": "x := 1;", "content": "  x := 2;", "expected_old": "y"})
 print("C5 anchor miss suggests similar lines:",
-      ok("E_NOT_FOUND" in r and "可能想改的行" in r and "第 3 行" in r))
+      ok("E_NOT_FOUND" in r and "likely lines you want to change" in r and "line 3" in r))
 print("   ", r.replace("\n", " ")[:150])
 
 proc.kill()

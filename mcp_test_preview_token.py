@@ -136,13 +136,13 @@ print("   all batch tokens cleared:",
       ok("E_INVALID_PARAM" in r1 and "E_INVALID_PARAM" in r2))
 print("   untouched file not written:", ok("B" not in read(f6b)))
 
-# ---------- T7: non-preview edit generates no token (regression) ----------
+# ---------- T7: only dry_run mints a token; a real write mints none ----------
 f7 = P("t7.txt")
 call("write_text_file", {"path": f7, "content": BASE})
 r = call("edit_file_lines", {"path": f7, "operation": "replace_lines", "start_line": 2,
-                            "end_line": 2, "content": "B", "expected_old": "b",
-                            "dry_run": True})
-print("T7 non-preview no token:", ok("planToken" not in r))
+                            "end_line": 2, "content": "B", "expected_old": "b"})
+print("T7 real write mints no token:",
+      ok("planToken" not in r and "B" in read(f7)))
 
 # ---------- T8: concurrency, non-overlapping edits auto-merge ----------
 f8 = P("t8.txt")
@@ -186,5 +186,104 @@ t11 = tokens_of(r)[0]
 writeb(f11, "a\nb\nc\nd\ne\n")   # append only: target still locatable
 r = call("apply_plans", {"plan_tokens": [t11], "strict": True})
 print("T11 strict rejects on sha change:", ok("E_EXTERNAL_CHANGED" in r))
+
+# ---------- T12: edit_file_sections dry_run also issues a planToken ----------
+f12 = P("t12.txt")
+call("write_text_file", {"path": f12, "content": "alpha\nbeta\ngamma\n"})
+r = call("edit_file_sections", {"path": f12, "dry_run": True, "edits": [
+    {"expected_old": "alpha", "content": "ALPHA"},
+    {"expected_old": "gamma", "content": "GAMMA"},
+]})
+t12 = tokens_of(r)
+print("T12 sections dry_run issues token:", ok(len(t12) == 1 and "DRY-RUN" in r),
+      "| tokens:", len(t12))
+print("   file untouched:", ok(read(f12) == "alpha\nbeta\ngamma\n"))
+
+# ---------- T13: commit that sections plan through apply_plans ----------
+r = call("apply_plans", {"plan_tokens": t12})
+c12 = read(f12)
+print("T13 sections committed via token:",
+      ok("1 succeeded, 0 failed" in r and "ALPHA" in c12 and "GAMMA" in c12),
+      "|", r.replace("\n", " ")[:70])
+
+# ---------- T14: mixed batch (preview_edits token + sections token) ----------
+fa14, fb14 = P("t14a.txt"), P("t14b.txt")
+call("write_text_file", {"path": fa14, "content": "a\nb\n"})
+call("write_text_file", {"path": fb14, "content": "x\ny\n"})
+r = call("preview_edits", {"edits": [
+    {"path": fa14, "operation": "replace_lines", "start_line": 2, "end_line": 2,
+     "content": "B", "expected_old": "b"}]})
+t14a = tokens_of(r)
+r = call("edit_file_sections", {"path": fb14, "dry_run": True, "edits": [
+    {"expected_old": "y", "content": "Y"}]})
+t14b = tokens_of(r)
+r = call("apply_plans", {"plan_tokens": t14a + t14b})
+print("T14 mixed batch commit:", ok("2 succeeded, 0 failed" in r),
+      "|", r.replace("\n", " ")[:78])
+print("   both applied:", ok("B" in read(fa14) and "Y" in read(fb14)))
+
+# ---------- T15: edit_file_lines dry_run issues a token ----------
+f15 = P("t15.txt")
+call("write_text_file", {"path": f15, "content": "l1\nl2\n"})
+r = call("edit_file_lines", {"path": f15, "operation": "replace_lines", "start_line": 2,
+                            "end_line": 2, "content": "L2", "expected_old": "l2",
+                            "dry_run": True})
+t15 = tokens_of(r)
+print("T15 lines dry_run token:", ok(len(t15) == 1 and "DRY-RUN" in r), "| count:", len(t15))
+r = call("apply_plans", {"plan_tokens": t15})
+print("   committed via token:", ok("1 succeeded" in r and "L2" in read(f15)))
+
+# ---------- T16: regex_replace dry_run issues a token ----------
+f16 = P("t16.txt")
+call("write_text_file", {"path": f16, "content": "foo\nfoo\n"})
+r = call("regex_replace", {"path": f16, "pattern": "foo", "replacement": "bar",
+                           "literal": True, "max_matches": 2, "dry_run": True})
+t16 = tokens_of(r)
+print("T16 regex dry_run token:", ok(len(t16) == 1), "| count:", len(t16))
+r = call("apply_plans", {"plan_tokens": t16})
+print("   committed via token:",
+      ok("1 succeeded" in r and "bar" in read(f16) and "foo" not in read(f16)))
+
+# ---------- T17: write_text_file dry_run issues a token (no content resend) ----------
+f17 = P("t17.txt")
+call("write_text_file", {"path": f17, "content": "old\n"})
+sha17 = call("read_text_lines", {"path": f17}).split("sha256:")[1].split(" ")[0]
+r = call("write_text_file", {"path": f17, "content": "new\nnew2\n",
+                             "expected_sha256": sha17, "dry_run": True})
+t17 = tokens_of(r)
+print("T17 write_text dry_run token:", ok(len(t17) == 1), "| count:", len(t17))
+print("   file untouched:", ok(read(f17) == "old\n"))
+r = call("apply_plans", {"plan_tokens": t17})
+print("   committed via token:", ok("1 succeeded" in r and read(f17) == "new\nnew2\n"))
+
+# ---------- T18: write_binary_file dry_run issues a token ----------
+f18 = P("t18.bin")
+r = call("write_binary_file", {"path": f18, "hex_data": "48656C6C6F",
+                               "mode": "overwrite", "confirm": True, "dry_run": True})
+t18 = tokens_of(r)
+print("T18 write_binary dry_run token:", ok(len(t18) == 1), "| count:", len(t18))
+r = call("apply_plans", {"plan_tokens": t18})
+print("   committed via token:", ok("1 succeeded" in r and "Hello" in read(f18)))
+
+# ---------- T19: tokens from different tools can be committed in one batch ----------
+fa19, fb19, fc19 = P("t19a.txt"), P("t19b.txt"), P("t19c.txt")
+for p19 in (fa19, fb19, fc19):
+    call("write_text_file", {"path": p19, "content": "x\n"})
+r = call("preview_edits", {"edits": [
+    {"path": fa19, "operation": "replace_lines", "start_line": 1, "end_line": 1,
+     "content": "A", "expected_old": "x"}]})
+tk_a = tokens_of(r)
+r = call("edit_file_lines", {"path": fb19, "operation": "replace_lines", "start_line": 1,
+                             "end_line": 1, "content": "B", "expected_old": "x",
+                             "dry_run": True})
+tk_b = tokens_of(r)
+r = call("regex_replace", {"path": fc19, "pattern": "x", "replacement": "C",
+                           "literal": True, "max_matches": 1, "dry_run": True})
+tk_c = tokens_of(r)
+r = call("apply_plans", {"plan_tokens": tk_a + tk_b + tk_c})
+print("T19 cross-tool batch:", ok("3 succeeded, 0 failed" in r),
+      "|", r.replace("\n", " ")[:78])
+print("   all applied:",
+      ok(read(fa19) == "A\n" and read(fb19) == "B\n" and read(fc19) == "C\n"))
 
 proc.kill()

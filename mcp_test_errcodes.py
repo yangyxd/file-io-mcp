@@ -110,7 +110,34 @@ expect("bad backup action", call("manage_backups", {"path": f, "action": "bogus"
 # 13) 十六进制非法
 expect("bad hex", call("write_binary_file", {"path": P("b.bin"), "hex_data": "ZZ"}),
        "E_INVALID_PARAM")
-# 14) 正常路径不应出现错误码
+# 14) dry_run 只读零风险：sha 过期不阻断预览，降级为 note
+f2 = P("dry.pas")
+call("write_text_file", {"path": f2, "content": "l1\nl2\nl3\n"})
+sha2 = call("read_text_lines", {"path": f2}).split("sha256:")[1].split(" ")[0]
+open(f2, "wb").write(b"l1\nl2\nl3\nl4\n")   # 模拟他人改动
+out = call("edit_file_lines", {"path": f2, "operation": "replace_lines", "start_line": 2,
+                               "end_line": 2, "content": "L2", "expected_old": "l2",
+                               "expected_sha256": sha2, "dry_run": True})
+print(f"{'dry_run survives stale sha':<46} {'-':<22} "
+      f"{'PASS' if ('expected_sha256 is stale' in out and 'DRY-RUN' in out and not out.startswith('[ERROR]')) else '**FAIL**'}")
+# 15) 局部编辑不传 sha：他人改了别处也应成功，并保留他人改动
+f3 = P("local.pas")
+call("write_text_file", {"path": f3, "content": "aaa\nkeep\nzzz\n"})
+open(f3, "wb").write(b"aaa\nkeep\nzzz\nadded-by-other\n")
+out = call("regex_replace", {"path": f3, "pattern": "zzz", "replacement": "ZZZ",
+                             "literal": True, "max_matches": 1})
+print(f"{'local edit merges concurrent change':<46} {'-':<22} "
+      f"{'PASS' if ('matches' in out and 'sha256:' in out and not out.startswith('[ERROR]')) else '**FAIL**'}")
+final = open(f3, "rb").read().decode("utf-8", "replace")
+print(f"{'  others change preserved':<46} {'-':<22} "
+      f"{'PASS' if ('added-by-other' in final and 'ZZZ' in final) else '**FAIL**'}")
+# 16) 并发安全不放松：真实写入仍严格校验 sha
+out = call("edit_file_lines", {"path": f3, "operation": "replace_lines", "start_line": 1,
+                               "end_line": 1, "content": "AAA", "expected_old": "aaa",
+                               "expected_sha256": "deadbeefdeadbeef"})
+print(f"{'write still strict on stale sha':<46} {'E_EXTERNAL_CHANGED':<22} "
+      f"{'PASS' if 'E_EXTERNAL_CHANGED' in out else '**FAIL**'}")
+# 17) 正常路径不应出现错误码
 out = call("read_text_lines", {"path": f})
 print(f"{'success path has no E_ code':<46} {'-':<22} {'PASS' if not out.startswith('[ERROR]') else '**FAIL**'}")
 
