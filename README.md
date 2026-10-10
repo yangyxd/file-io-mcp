@@ -190,7 +190,7 @@ cargo run -- --http --addr 127.0.0.1:8080            # 自定义地址
 **怎么"声明"这份指引？** MCP 协议没有 "skill" 原语，标准做法是用两个原生机制（都不出现在 `tools/list` 里）：
 
 1. **MCP Resource（标准：声明一份文档）**：服务器在 `initialize` 时声明 `resources` 能力，把 `SKILL.md` 作为 resource `file-io-mcp://skill/guide`（`text/markdown`）暴露。client 一连上就通过 `resources/list` 发现它，`resources/read` 读取。这正是 MCP 规范里"服务器对外提供知识/上下文"的标准原语。
-2. **`instructions`（标准：注入要点）**：`initialize` 返回的 `instructions` 字段是协议定义的服务器级说明，规范上客户端应注入 agent 上下文。服务器已把**最核心安全要点**（编辑前取 sha256、回传 `expected_sha256` 防并发覆盖、写前备份可回滚、正则替换 `max_matches` 必填、错误按 `E_XXX` 修正重试）写进这里，`instructions` 末尾再指向上面的 resource 取完整指引。
+2. **`instructions`（标准：注入要点）**：`initialize` 返回的 `instructions` 字段是协议定义的服务器级说明，规范上客户端应注入 agent 上下文。服务器已把**最核心安全要点**（编辑前取 sha256、覆盖式写入须回传 `expected_sha256` 防并发覆盖、写前备份可回滚、正则替换 `max_matches` 必填、错误按 `E_XXX` 修正重试）写进这里，`instructions` 末尾再指向上面的 resource 取完整指引。
 
 > 说明：resource 是"声明"对了，但**是否把 resource 内容喂给 agent，由 client 决定**——多数 client 不会自动读取，需 client/agent 主动 `resources/read`；而 `instructions` 会被自动注入。两者互补，均属标准协议，无任何非标准机制。
 
@@ -217,7 +217,7 @@ cargo run -- --http --addr 127.0.0.1:8080            # 自定义地址
 
 ### read_text_lines
 
-按行读取（1-based，带行号），与 `edit_file_lines` 配套。返回头包含总行数与 `sha256` —— 编辑同一文件时把它传给 `expected_sha256` 即可防止并发覆盖。
+按行读取（1-based，带行号），与 `edit_file_lines` 配套。返回头包含总行数与 `sha256` —— 覆盖式写入须把它作为 `expected_sha256` 回传；局部编辑默认无需传（工具在最新内容上定位，天然保留他人的并发改动）。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
@@ -249,8 +249,8 @@ src/main.rs | utf-8 | 4096B | 120 lines total | sha256:8f3a1c02d94b7e15 | [10-15
 | `offset` | u64 | 否 | insert 的插入字节偏移（必须落在字符边界，否则拒绝，防止把汉字劈开） |
 | `encoding` | string | 否 | 默认保持原文件编码（新建文件默认 UTF-8；`utf-16le/be` 新建会自动带 BOM） |
 | `expected_old` | string | 否 | 写前校验：overwrite=全文 / append=末尾 / insert=offset 附近，不符则拒绝；回显实际内容时超长内容只给头尾摘要+长度+指纹 |
-| `expected_sha256` | string | 否 | 上次读到的指纹，文件被改动则拒绝写入 |
-| `dry_run` | bool | 否 | true=只返回 diff 与预计指纹，不写文件 |
+| `expected_sha256` | string | `overwrite` 必填 | 上次读到的指纹；**`overwrite` 会用你传入的内容重写整个文件，必须传**，否则会覆盖他人的改动；`append`/`insert` 不覆盖，故可选 |
+| `dry_run` | bool | 否 | true=只返回 diff 与预计指纹，不写文件，并签发一次性 `planToken`（可用 `apply_plans` 提交，无需重发 `content`） |
 
 ```json
 { "path": "logs/app.log", "content": "新日志行\n", "mode": "append" }
@@ -272,9 +272,9 @@ src/main.rs | utf-8 | 4096B | 120 lines total | sha256:8f3a1c02d94b7e15 | [10-15
 | `anchor_text` | string | 否 | **锚点定位**：目标行的完整文本，须全文唯一命中 |
 | `anchor_regex` | string | 否 | 锚点定位：正则匹配目标行，须唯一命中 |
 | `anchor_occurrence` | usize | 否 | 锚点命中多处时选第几处（1-based），默认要求唯一 |
-| `expected_sha256` | string | 否 | 上次读到的指纹 |
+| `expected_sha256` | string | 否 | 上次读到的指纹；**默认不必传**（在最新内容上定位，天然保留他人的并发改动），仅需严格快照校验时传；**上下文块模式必传** |
 | `encoding` | string | 否 | 默认保持原文件编码 |
-| `dry_run` | bool | 否 | true=只返回 diff 预览 |
+| `dry_run` | bool | 否 | true=只返回 diff 预览，不写文件，并签发一次性 `planToken`（可用 `apply_plans` 提交，无需重发本次编辑） |
 
 **操作说明：**
 
@@ -402,9 +402,9 @@ src/main.rs | utf-8 | 4096B | 120 lines total | sha256:8f3a1c02d94b7e15 | [10-15
 | `replacement` | string | 是 | 替换内容，支持 `$1`、`$2`（`literal=true` 时按字面量） |
 | `max_matches` | usize | **是**（运行时） | 预期最多替换几处；实际匹配数超过该值即拒绝（防止正则过宽或匹配空串造成大范围误替换） |
 | `global` | bool | 否 | 全局替换，默认 true；false 时只替换首个 |
-| `dry_run` | bool | 否 | true=返回 diff 预览不写入 |
+| `dry_run` | bool | 否 | true=返回 diff 预览，不写入，并签发一次性 `planToken`（可用 `apply_plans` 提交，无需重发 pattern/replacement） |
 | `encoding` | string | 否 | 默认自动识别并保持原编码 |
-| `expected_sha256` | string | 否 | 上次读到的指纹 |
+| `expected_sha256` | string | 否 | 上次读到的指纹；**默认不必传**（替换基于最新内容，天然保留他人的并发改动），仅需严格快照校验时传 |
 
 > 文件超过 64MB 会被拒绝（防 OOM）。
 
@@ -435,8 +435,8 @@ src/main.rs | utf-8 | 4096B | 120 lines total | sha256:8f3a1c02d94b7e15 | [10-15
 | `offset` | u64 | 否 | insert 为插入位置，replace 为替换起始位置 |
 | `replace_length` | usize | 否 | replace 模式下被替换的字节数 |
 | `expected_hex` | string | 否 | **写前校验待改范围的原始字节**（HEX，可带 `0x` 与空格/冒号分隔，便于从 HEX dump 直接粘贴；不能为空串——空串等于没校验，会被拒绝）。按 mode 取范围：`overwrite`=全文 / `append`=文件末尾 / `insert`=`offset` 起 / `replace`=`[offset, offset+replace_length)`；不符返回 `E_GUARD_MISMATCH` 并回显该范围的实际字节 |
-| `expected_sha256` | string | 否 | 上次读到的指纹（整文件级，防外部改动） |
-| `dry_run` | bool | 否 | true=只返回 HEX diff 预览与预计指纹，不写文件 |
+| `expected_sha256` | string | `overwrite` 必填 | 上次读到的指纹（整文件级）；**`overwrite` 会重写整个文件，必须传**，否则会覆盖他人的改动；其余模式不覆盖，故可选 |
+| `dry_run` | bool | 否 | true=只返回 HEX diff 预览与预计指纹，不写文件，并签发一次性 `planToken`（可用 `apply_plans` 提交，无需重发 `hex_data`） |
 | `confirm` | bool | 否 | `hex_data` 为空且 `mode=overwrite`（会清空文件）时必须传 `true` 才执行 |
 
 ```json
@@ -587,7 +587,7 @@ D:\proj\src\b.rs | sha256:9f8e7d6c5b4a3210 | enc:GBK | 1 matches
 **安全地改一个 Delphi 单元（GBK 编码、有并发）**
 
 1. `read_text_lines` 读取目标行 → 拿到内容、总行号、`sha256`
-2. `edit_file_lines` 用 `anchor_text` 定位 + `expected_old` 校验 + `expected_sha256` 防并发，先 `dry_run=true` 看 diff
+2. `edit_file_lines` 用 `anchor_text` 定位 + `expected_old` 校验，先 `dry_run=true` 看 diff（局部编辑无需传 `expected_sha256`，工具在最新内容上定位并保留他人改动）
 3. 确认无误后去掉 `dry_run` 实写；若返回 `E_EXTERNAL_CHANGED`，重新读取后再改
 4. 改错了用 `manage_backups` `action=undo` 回滚
 
