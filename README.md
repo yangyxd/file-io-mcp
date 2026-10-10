@@ -262,8 +262,7 @@ src/main.rs | utf-8 | 4096B | 120 lines total | sha256:8f3a1c02d94b7e15 | [10-15
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `operation` | string | 是 | `delete_lines` / `insert_lines` / `replace_lines` / `append_lines` |
-| `path` | string | 是（二选一） | 文件路径 |
-| `file_path` | string | 否 | **已废弃**，仅为兼容旧调用保留，请改用 `path` |
+| `path` | string | 是 | 文件路径 |
 | `start_line` | usize | 视操作 | 起始行号；与锚点参数二选一 |
 | `end_line` | usize | 视操作 | 结束行号（含）；用锚点定位时可省（默认单行） |
 | `content` | string | 视操作 | 插入/替换/追加的内容，多行用 `\n` 分隔 |

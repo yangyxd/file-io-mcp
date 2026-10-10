@@ -177,7 +177,7 @@ struct ReadTextFileParams {
     path: String,
     /// Start byte offset, default 0
     offset: Option<u64>,
-    /// Bytes to read (>=1), default up to 10MB; when not strict this is a "hint" snapped to character boundaries (noted in the header)
+    /// Bytes to read (>=1; 0 is rejected), default up to 10MB; when not strict this is a "hint" snapped to character boundaries (noted in the header)
     length: Option<usize>,
     /// true = read exactly [offset, offset+length), no >=4-byte look-ahead / offset floor; edge-incomplete bytes are dropped and noted
     strict: Option<bool>,
@@ -231,6 +231,8 @@ struct ReadBinaryFileParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct WriteBinaryFileParams {
+    /// File path
+    path: String,
     /// Hex data, e.g. "48656C6C6F" (0x/space/colon separators allowed); empty string = 0 bytes: only replace may delete bytes; overwrite needs confirm=true
     hex_data: String,
     /// Mode: overwrite (default) / append / insert / replace
@@ -307,7 +309,7 @@ struct TextSearchParams {
     extensions: Option<Vec<String>>,
     /// Recurse into sub-directories, default true (directory mode only)
     recursive: Option<bool>,
-    /// Encoding, default auto (per-file auto-detection, distinguishes GBK/UTF-8); explicit value decodes only with that encoding
+    /// Encoding, default auto (per-file auto-detection, distinguishes GBK/UTF-8); an explicit value decodes only with that encoding, and files that fail are listed under "skipped" rather than silently dropped
     encoding: Option<String>,
     /// Skip hidden files and directories (starting with ., e.g. .git/.env), default true; false = search everything (directory mode only)
     skip_hidden: Option<bool>,
@@ -326,7 +328,7 @@ struct TextSearchParams {
 struct ListFilesParams {
     /// Directory path
     path: String,
-    /// Filename regex filter (choose one with glob_pattern)
+    /// Filename regex filter (choose one with glob_pattern; if both given, pattern takes precedence)
     pattern: Option<String>,
     /// Glob filter, e.g. "*.pas", "**/*.rs" (choose one with pattern)
     glob_pattern: Option<String>,
@@ -352,38 +354,33 @@ struct DeleteFileParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct EditFileLinesParams {
-    /// delete_lines/insert_lines/replace_lines/append_lines
+    /// Edit mode: delete_lines | insert_lines | replace_lines | append_lines
     operation: String,
-    /// File path
+    /// File path (required; error if omitted)
     path: Option<String>,
-    /// [Deprecated, kept only for backward compatibility] same as path; prefer path
-    file_path: Option<String>,
-    /// Start line number (1-based): delete/insert/replace
+    /// Start line (1-based) for delete/insert/replace
     start_line: Option<usize>,
-    /// End line number (1-based, inclusive): delete/replace; may be omitted when locating by anchor (single line by default)
+    /// End line (1-based, inclusive) for delete/replace; omit for a single line or anchor-based location
     end_line: Option<usize>,
     /// Content for insert/replace/append
     content: Option<String>,
-    /// Encoding, keep the original file encoding by default
+    /// File encoding; defaults to keeping the original
     encoding: Option<String>,
-    /// Required for delete/replace: original content of the target line(s), a second guard against miscounted line numbers
+    /// Required for delete/replace: original text of the target line(s), a guard against wrong line numbers
     expected_old: Option<String>,
-    /// sha256 read earlier; write rejected if the file changed
+    /// sha256 from a prior read; the write is rejected if the file changed
     expected_sha256: Option<String>,
-    /// Anchor location: full text of the target line (must match uniquely in the file); choose one with start_line
+    /// Locate by the full target line text (must be unique); pair with start_line if ambiguous
     anchor_text: Option<String>,
-    /// Anchor location: regex matching the target line (must match uniquely)
+    /// Locate by a regex matching the target line (must be unique)
     anchor_regex: Option<String>,
-    /// When the anchor matches multiple places, which one to pick (1-based); unique match required by default
+    /// Which anchor match to use when multiple (1-based); must be unique by default
     anchor_occurrence: Option<usize>,
-    /// true = return only a diff preview without writing
+    /// If true, return a diff preview without writing
     dry_run: Option<bool>,
-    /// Context-block mode (stronger): mutually exclusive with expected_old/anchor/line-number. With context_after, give small
-    /// context snippets on both sides of the change point; the tool auto-locates the (implied) text between them and replaces it with content;
-    /// two adjacent frames mean inserting content between them.
-    /// Using this mode requires expected_sha256 (file-level concurrency guard fallback).
+    /// Context block (with context_after): snippet before the change point; the tool replaces the implied text between the two snippets with content. Exclusive with expected_old/anchor/line-number. Requires expected_sha256.
     context_before: Option<String>,
-    /// Context block (see context_before): small context after the change point; both before/after must match uniquely and after must come after before
+    /// Snippet after the change point; must match uniquely and follow context_before
     context_after: Option<String>,
 }
 
@@ -430,7 +427,7 @@ struct PreviewEditsParams {
 struct CopyFilesParams {
     /// Source file path list
     sources: Vec<String>,
-    /// Target: directory (multiple sources) or new file path (single source)
+    /// Target: directory (multiple sources) or new file path (single source). Ending with / or \ forces directory interpretation
     target: String,
     /// Overwrite existing target, default false
     overwrite: Option<bool>,
@@ -440,7 +437,7 @@ struct CopyFilesParams {
 struct MoveFilesParams {
     /// Source file path list
     sources: Vec<String>,
-    /// Target: directory (multiple sources) or new file path (single source, rename)
+    /// Target: directory (multiple sources) or new file path (single source, rename). Ending with / or \ forces directory interpretation
     target: String,
     /// Overwrite existing target, default false
     overwrite: Option<bool>,
@@ -2592,7 +2589,7 @@ impl FileIoServer {
     /// 读取文本文件
     #[tool(
         name = "read_text_file",
-        description = "Read a text fragment by byte offset/length (offset/length >= 1, default up to 10MB). Returns a header: path | encoding (BOM) | size | sha256 | range; the range is auto-snapped to character boundaries by default (flagged), use strict=true for exact byte ranges. For line-based editing use read_text_lines",
+        description = "Read a text fragment by byte offset/length. offset default 0; length must be >=1, default up to 10MB. Returns a header: path | encoding (BOM) | size | sha256 | range; the range is auto-snapped to character boundaries by default (flagged), use strict=true for exact byte ranges. For line-based editing use read_text_lines",
         annotations(title = "Read text file", read_only_hint = true)
     )]
     fn read_text_file(
@@ -2870,7 +2867,7 @@ impl FileIoServer {
     /// 写入文本文件
     #[tool(
         name = "write_text_file",
-        description = "Write text in one shot (auto-creates directories). mode=overwrite (default)/append/insert (needs offset, must land on a character boundary). Pass expected_old for a pre-write check; dry_run=true returns only a diff",
+        description = "Write text in one shot (auto-creates directories). mode=overwrite (default)/append/insert (needs offset, must land on a character boundary). Pass expected_old for a pre-write check and expected_sha256 from a prior read to avoid overwriting concurrent changes; dry_run=true returns only a diff",
         annotations(title = "Write text file", destructive_hint = true)
     )]
     fn write_text_file(
@@ -3084,7 +3081,7 @@ impl FileIoServer {
                 if off < bom.len() {
                     return Err(e_param(
                         format!(
-                            "insert 的 offset={} 落在文件 BOM 内（BOM 占 {} 字节，插入会破坏编码）。请改用 offset>={} 或 overwrite 模式",
+                            "insert offset={} lands inside the file BOM (BOM is {} bytes; inserting would break encoding). Use offset>={} or overwrite mode",
                             off,
                             bom.len(),
                             bom.len()
@@ -3096,8 +3093,8 @@ impl FileIoServer {
                 if !Self::is_char_boundary(encoding_name, &original, off) {
                     return Err(e_param(
                         format!(
-                            "插入偏移 {} 不在 {} 的字符边界上（会切断一个字符导致乱码）。\
-                             请改用 edit_file_lines 按行插入，或修正 offset 到字符起始字节",
+                            "insert offset {} is not on a character boundary of {} (would split a character and cause mojibake).\
+                             Use edit_file_lines to insert by line, or set offset to the start byte of a character",
                             off, encoding_name
                         ),
                         None,
@@ -3131,7 +3128,7 @@ impl FileIoServer {
         })
     }
 
-    /// 按行号读取文本文件（与 edit_file_lines 配合使用，避免行号算错）
+    /// Read text by line number (pairs with edit_file_lines so line numbers are not mis-counted)
     #[tool(
         name = "read_text_lines",
         description = "Read text by line (1-based, with line numbers), pairs with edit_file_lines. Header includes total line count and sha256; pass the sha256 to expected_sha256 when editing to prevent concurrent overwrites",
@@ -3250,7 +3247,7 @@ impl FileIoServer {
             })
             .collect();
 
-        // 版本指纹：与写入前校验同一算法（小文件全量 sha256，大文件为 size+头尾采样）
+        // Version fingerprint: same algorithm as the pre-write check (small files use full sha256; large files use size + head/tail sampling)
         let sha = Self::file_fingerprint(&params.path, file_size as u64, Some(&bytes))
             .map(|h| h[..16].to_string())
             .unwrap_or_else(|| "-".to_string());
@@ -3269,7 +3266,7 @@ impl FileIoServer {
         ))
     }
 
-    /// 读取二进制文件，返回HEX dump
+    /// Read a binary file and return a HEX dump
     #[tool(
         name = "read_binary_file",
         description = "Read a binary file as a HEX dump (offset + hex + ASCII), sliced by offset/length (max 4MB per call, truncation is flagged when exceeded). Header includes sha256",
@@ -3314,7 +3311,7 @@ impl FileIoServer {
         file.read_exact(&mut buffer)
             .map_err(|e| e_internal(format!("read failed: {}", e), None))?;
 
-        // 格式化为经典 HEX dump 格式
+        // Format as the classic HEX dump layout
         let mut hex_dump = String::new();
         for (i, chunk) in buffer.chunks(16).enumerate() {
             let offset = start + (i * 16) as u64;
@@ -3380,6 +3377,7 @@ impl FileIoServer {
         name = "write_binary_file",
         description = "Write binary by hex. mode=overwrite (default)/append/insert (offset)/replace (offset+replace_length); offset out of range errors. \
 expected_hex = pre-write check of the original bytes in the range to change (must not be empty); \
+pass expected_sha256 from a prior read to avoid overwriting concurrent changes; \
 dry_run=true returns only a HEX diff preview without writing to disk",
         annotations(title = "Write binary file", destructive_hint = true)
     )]
@@ -3539,7 +3537,7 @@ dry_run=true returns only a HEX diff preview without writing to disk",
             }
         };
 
-        // dry_run：只返回 diff 预览，不落盘
+        // dry_run: return only the diff preview, do not write to disk
         if dry_run {
             return Ok(Self::binary_dry_run_report(
                 &params.path,
@@ -3629,15 +3627,15 @@ dry_run=true returns only a HEX diff preview without writing to disk",
         })
     }
 
-    /// 搜索文件/目录中的文本内容(正则)
+    /// Search text content in a file/directory (regex)
     #[tool(
         name = "text_search",
         description = "Search text in a file/directory. mode=regex (default, regex)/literal (plain text, pattern needs no escaping). \
 Results are grouped by file (include sha256, usable directly as edit_file_lines' expected_sha256); each is line:col:[hit fragment] \"full line\". \
-Directories recurse by default and auto-skip hidden files/dirs (.git/.env etc.; skip_hidden=false turns this off). When extension/extensions/include are not given, \
-binary/build artifacts (.dcu/.exe/.res/.dll/.bak/.pyc etc.) are skipped by default to focus the budget on source; use extension/extensions, \
-include/exclude (glob) to control scope; max_files (default 20000) is the coverage cap on "how many candidate files to scan" (hitting it warns, it is NOT the number of matches returned), \
-max_results (default 100) is the "max number of matching lines to return"; encoding defaults to auto (per-file detection, distinguishes GBK/UTF-8); context_lines>0 attaches context lines",
+Directories recurse by default and auto-skip hidden files/dirs (.git/.env etc.; skip_hidden=false turns this off). \
+binary/build artifacts (.dcu/.exe/.dll/.bak/.pyc etc.) are skipped unless extension/extensions/include are given; use extension/extensions and include/exclude (glob) to scope. \
+max_files (default 20000) is the coverage cap on \"how many candidate files to scan\" (hitting it warns, it is NOT the number of matches returned), \
+max_results (default 100) is the \"max number of matching lines to return\"; encoding defaults to auto (per-file detection, distinguishes GBK/UTF-8); context_lines>0 attaches context lines",
         annotations(title = "Text search", read_only_hint = true)
     )]
     fn text_search(
@@ -3918,7 +3916,7 @@ max_results (default 100) is the "max number of matching lines to return"; encod
             extras.push(format!("skipped:{}", skipped.len()));
         }
 
-        // 命中数：未截断直接给总数；截断时写成 返回数/已扫描到的实际数 并显式标注 truncated
+        // Hit count: when not truncated, report the total directly; when truncated, write "returned / actually scanned" and explicitly flag it as truncated
         let matches_label = if found > stored {
             format!("{}/{} matches(truncated)", stored, found)
         } else {
@@ -3953,7 +3951,7 @@ max_results (default 100) is the "max number of matching lines to return"; encod
         Ok(out)
     }
 
-    /// 批量原子片段编辑：一次调用完成多处"精确文本 → 新文本"替换
+    /// Batch atomic section edit: completes multiple "exact text -> new text" replacements in one call
     #[tool(
         name = "edit_file_sections",
         description = "Change multiple places in one call (all-or-nothing by default): edits=[{expected_old, content, occurrence?, start_line?}]. \
@@ -3997,7 +3995,7 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
                 .map_err(|e| e_internal(format!("failed to read file: {}", e), None))?;
             Self::check_expected_sha(&params.path, &bytes, params.expected_sha256.as_deref())?;
 
-            // 与 write_text_file/regex_replace 同一套编码决策：默认保持原编码，不一致时拒绝
+            // Same encoding decision as write_text_file/regex_replace: keep the original encoding by default; reject when inconsistent
             let encoding_name = Self::resolve_write_encoding(
                 &params.path,
                 params.encoding.as_deref(),
@@ -4011,8 +4009,8 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
             if ft.has_invalid {
                 return Err(e_internal(
                     format!(
-                        "文件 {} 按 {} 解码时存在非法字节（已用 U+FFFD 替换），拒绝写回以免原字节永久丢失。\
-                         请确认真实编码后用正确的 encoding 重新调用",
+                        "file {} decoded as {} contains invalid bytes (replaced with U+FFFD); refusing to write back to avoid permanently losing the original bytes.\
+                         Confirm the real encoding and re-call with the correct encoding",
                         params.path, ft.encoding
                     ),
                     None,
@@ -4024,24 +4022,24 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
                 format!("{}(BOM)", ft.encoding)
             };
 
-            // 统一到 LF 再匹配：AI 读到的文本可能带/不带 \r，两侧归一后更稳（写回时还原主换行风格）
+            // Normalize to LF before matching: the text the AI sees may or may not have \r; normalizing both sides is more robust (restore the main line-ending style on write-back)
             let hay = ft.content.replace("\r\n", "\n");
 
-            // ---- 第一步：所有片段都在**原文快照**上定位，而不是"改一个再找下一个" ----
+            // ---- Step 1: locate every section against the ORIGINAL snapshot, not "change one then find the next" ----
             let mut planned: Vec<PlannedSection> = Vec::new();
             let mut problems: Vec<String> = Vec::new();
             for (idx, op) in params.edits.iter().enumerate() {
                 let needle = op.expected_old.replace("\r\n", "\n");
                 if needle.is_empty() {
                     problems.push(format!(
-                        "edits[{}]: expected_old 不能为空（要插入内容请把插入点周围的原文一并作为 expected_old，并在 content 里原样带上它）",
+                        "edits[{}]: expected_old must not be empty (to insert content, include the surrounding original text as expected_old and carry it verbatim in content)",
                         idx
                     ));
                     continue;
                 }
                 let mut hits = Self::find_all(&hay, &needle);
-                // 可选的行号约束（文本 + 行号双约束）：只承认"从声明的第 start_line 行开始"的命中。
-                // 既能消歧（同一片段出现多次），也能在行号算错时直接告诉调用方它实际在第几行。
+                // Optional line-number constraint (text + line dual constraint): only accept hits that "start from the declared start_line".
+                // This disambiguates (the same section appears multiple times) and tells the caller the actual line when the line number is miscalculated.
                 if let Some(k) = op.start_line {
                     let pinned: Vec<(usize, usize)> = hits
                         .iter()
@@ -4052,19 +4050,19 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
                         let spots: Vec<String> = hits
                             .iter()
                             .take(10)
-                            .map(|(s, _)| format!("第 {} 行", Self::line_of(&hay, *s)))
+                            .map(|(s, _)| format!("line {}", Self::line_of(&hay, *s)))
                             .collect();
                         problems.push(if spots.is_empty() {
                             format!(
-                                "edits[{}]: expected_old 与文件内容不匹配（全文件均未命中，第 {} 行自然也没有）。\
-                                 它必须与原文逐字符一致（含缩进、空行、标点）；建议先用 read_text_lines 读出准确文本再复制过来",
+                                "edits[{}]: expected_old does not match the file content (no hit anywhere in the file, and line {} is naturally empty too).\
+                                 It must match the original character-by-character (including indentation, blank lines, punctuation); suggest reading the exact text with read_text_lines first and copying it over",
                                 idx, k
                             )
                         } else {
                             format!(
-                                "edits[{}]: start_line={} 与 expected_old 的实际位置不一致：它出现在 {}。\
-                                 请修正 start_line，或删掉 start_line 让它按默认的唯一性规则定位",
-                                idx, k, spots.join("、")
+                                "edits[{}]: start_line={} does not match the actual position of expected_old: it appears at {}.\
+                                 Fix start_line, or drop start_line to let it locate by the default uniqueness rule",
+                                idx, k, spots.join(", ")
                             )
                         });
                         continue;
@@ -4078,7 +4076,7 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
                         Some(k) if k >= 1 && (k as usize) <= n => Some(hits[k as usize - 1]),
                         Some(k) => {
                             problems.push(format!(
-                                "edits[{}]: occurrence={} 超出范围（expected_old 只命中 {} 处）",
+                                "edits[{}]: occurrence={} out of range (expected_old only matched {} time(s))",
                                 idx, k, n
                             ));
                             continue;
@@ -4087,12 +4085,12 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
                             let spots: Vec<String> = hits
                                 .iter()
                                 .take(10)
-                                .map(|(s, _)| format!("第 {} 行", Self::line_of(&hay, *s)))
+                                .map(|(s, _)| format!("line {}", Self::line_of(&hay, *s)))
                                 .collect();
-                            let more = if hits.len() > 10 { " 等" } else { "" };
+                            let more = if hits.len() > 10 { " etc." } else { "" };
                             problems.push(format!(
-                                "edits[{}]: expected_old 在文件中不唯一（命中 {} 处：{}{}），无法确定要改哪一处。\
-                                 请把 expected_old 写得更长以唯一定位，或用 occurrence 指定第几处，或用 start_line 声明它从第几行开始",
+                                "edits[{}]: expected_old is not unique in the file (matched {} time(s): {}{}), cannot decide which one to change.\
+                                 Make expected_old longer to locate uniquely, or use occurrence to pick the Nth hit, or use start_line to declare which line it starts on",
                                 idx, n, spots.join("、"), more
                             ));
                             continue;
@@ -4101,9 +4099,9 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
                 };
                 match chosen {
                     Some((s, e)) => {
-                        // 记下该片段在**改动前**原文中的行区间，供返回头回报落点。
-                        // 结束行只能用"匹配文本里的换行数"推算：不能用 e-1（多字节字符的
-                        // 最后一个字节不在字符边界上，切片会 panic）。
+                        // Record the section's line range in the PRE-CHANGE original text, for the header to report the landing point.
+                        // The end line can only be estimated from "the number of newlines in the matched text": cannot use e-1 (the last byte of a
+                        // multi-byte character is not on a character boundary, and slicing would panic).
                         let line_from = Self::line_of(&hay, s);
                         let nl = hay[s..e].matches('\n').count();
                         let line_to = if nl > 0 && hay.as_bytes()[e - 1] == b'\n' {
@@ -4129,7 +4127,7 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
             }
 
             if !problems.is_empty() && (all_or_nothing || planned.is_empty()) {
-                // 显式指定错误码：混合原因时按"命中不唯一"优先，便于调用方分流
+                // Explicit error code: when reasons are mixed, prioritize "not unique" so the caller can branch
                 let code = if problems.iter().all(|p| p.contains("不唯一")) {
                     "E_NOT_UNIQUE"
                 } else {
@@ -4137,7 +4135,7 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
                 };
                 return Err(e_param(
                     format!(
-                        "{} 批量编辑未通过校验，本次一处未改（{} 条问题，{} 条可应用）。\n=== 问题清单:\n{}",
+                        "{} batch edit failed validation; nothing changed ({} problem(s), {} applicable).\n=== Problem list:\n{}",
                         code,
                         problems.len(),
                         planned.len(),
@@ -4147,13 +4145,13 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
                 ));
             }
 
-            // ---- 第二步：重叠检测（同一段被两条编辑改会得到意料之外的结果） ----
+            // ---- Step 2: overlap detection (the same range edited by two edits yields unexpected results) ----
             planned.sort_by_key(|p| p.start);
             for w in planned.windows(2) {
                 if w[1].start < w[0].end {
                     return Err(e_param(
                         format!(
-                            "edits[{}] 与 edits[{}] 的命中范围重叠（参数错误），无法同时应用。请合并为一条，或让两条片段的命中区间互不相交",
+                            "edits[{}] and edits[{}] hit ranges overlap (parameter error); cannot apply together. Merge into one edit, or make the two hits' ranges disjoint",
                             w[0].idx, w[1].idx
                         ),
                         None,
@@ -4161,7 +4159,7 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
                 }
             }
 
-            // ---- 第三步：按快照一次性拼接 ----
+            // ---- Step 3: splice everything at once against the snapshot ----
             let mut new_content = String::with_capacity(hay.len());
             let mut cursor = 0usize;
             for p in &planned {
@@ -4185,8 +4183,8 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
                 out
             };
 
-            // 被跳过的条目（all_or_nothing=false 时才有）：dry-run 也必须能看到，
-            // 否则"先预览再决定"就失去了意义
+            // Skipped entries (only present when all_or_nothing=false): dry-run must also show them,
+            // otherwise "preview first, then decide" loses its meaning
             let skip_note = if problems.is_empty() {
                 String::new()
             } else {
@@ -4199,7 +4197,7 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
 
             if params.dry_run.unwrap_or(false) {
                 return Ok(format!(
-                    "DRY-RUN | {} | {} | {} 处替换 | {}B→{}B | 未写入文件\n{}\n{}预计 sha256:{}\n确认无误后去掉 dry_run 重新调用即可写入{}",
+                    "DRY-RUN | {} | {} | {} replacement(s) | {}B→{}B | not written\n{}\n{}expected sha256:{}\nremove dry_run and retry to write{}",
                     params.path,
                     encoding_label,
                     planned.len(),
@@ -4221,7 +4219,7 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
                 tail = " | undoable".to_string();
             }
             Ok(format!(
-                "OK {} | {} | {} 处替换 | {}B→{}B | sha256:{}{}\n{}{}",
+                "OK {} | {} | {} replacement(s) | {}B→{}B | sha256:{}{}\n{}{}",
                 params.path,
                 encoding_label,
                 planned.len(),
@@ -4229,7 +4227,7 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
                 new_bytes.len(),
                 Self::fingerprint_short_of_bytes(&new_bytes),
                 tail,
-                // 落点行号（改动前）：便于调用方核对"改的是不是我说的那几处"，不必再读一次文件
+                // Landing line numbers (pre-change): let the caller verify "is this the section I meant" without re-reading the file
                 Self::format_section_positions(&planned),
                 skip_note
             ))
@@ -4237,10 +4235,10 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
     }
 
 
-    /// 正则替换文件文本
+    /// Regex-replace file text
     #[tool(
         name = "regex_replace",
-        description = "Regex replace (supports $1/$2); literal=true = plain-text replace (no escaping, $ taken literally). max_matches is required = expected max replacements, rejected if exceeded; global defaults to true; dry_run=true returns only a diff",
+        description = "Regex replace (supports $1/$2); literal=true = plain-text replace (no escaping, $ taken literally). max_matches is required = expected max replacements, rejected if exceeded; global defaults to true; pass expected_sha256 from a prior read to avoid overwriting concurrent changes; dry_run=true returns only a diff",
         annotations(title = "Regex replace", destructive_hint = true)
     )]
     fn regex_replace(
@@ -4253,45 +4251,45 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
             p
         };
 
-        // 检查文件大小，避免大文件导致 OOM
+        // Check file size to avoid OOM on large files
         let file_size = fs::metadata(&params.path)
             .map_err(|e| e_internal(format!("failed to get file info: {}", e), None))?
             .len();
         if file_size > MAX_REGEX_FILE_SIZE {
             return Err(e_param(
                 format!(
-                    "文件过大 ({}B)，最大支持 {}B。如需处理大文件，请手动分割后操作",
+                    "file too large ({}B), max supported is {}B. To process a large file, split it manually first",
                     file_size, MAX_REGEX_FILE_SIZE
                 ),
                 None,
             ));
         }
 
-        // 同一文件的读-改-写串行化 + 写前版本校验
+        // Serialize read-modify-write per file + pre-write version check
         self.with_path_lock(&params.path, || {
         let bytes = fs::read(&params.path).map_err(|e| {
             e_internal(format!("failed to read file: {}", e), None)
         })?;
         Self::check_expected_sha(&params.path, &bytes, params.expected_sha256.as_deref())?;
 
-        // 与 write_text_file/edit_file_lines 同一套编码决策：未指定则自动检测并保持原编码写回；
-        // 显式指定且与实际编码不一致时直接拒绝，避免把 GBK/UTF-16 文件改写成另一种编码
+        // Same encoding decision as write_text_file/edit_file_lines: auto-detect and keep the original encoding when unspecified;
+        // reject outright when explicitly set but inconsistent with the actual encoding, to avoid rewriting a GBK/UTF-16 file into another encoding
         let encoding_name = Self::resolve_write_encoding(
             &params.path,
             params.encoding.as_deref(),
             Some(&bytes),
         )?;
 
-        // 统一解码：剥离 BOM 并记住 BOM/编码，写回时原样补回
+        // Unified decode: strip the BOM and remember BOM/encoding, restore verbatim on write-back
         let ft = Self::decode_file(&bytes, encoding_name)
             .map_err(|e| e_internal(e, None))?;
         let FileText { encoding, bom, line_ending, content, has_invalid } = ft;
-        // 解码时替换过非法字节的内容不允许写回，否则原字节被永久破坏
+        // Content whose invalid bytes were replaced during decode must not be written back, or the original bytes are permanently corrupted
         if has_invalid {
             return Err(e_internal(
                 format!(
-                    "文件 {} 按 {} 解码时存在非法字节（已用 U+FFFD 替换），拒绝写回以免原字节永久丢失。\
-                     请确认文件真实编码后用正确的 encoding 重新调用",
+                    "file {} decoded as {} contains invalid bytes (replaced with U+FFFD); refusing to write back to avoid permanently losing the original bytes.\
+                     Confirm the real encoding and re-call with the correct encoding",
                     params.path, encoding
                 ),
                 None,
@@ -4303,12 +4301,12 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
             format!("{}(BOM)", encoding)
         };
 
-        // literal=true：pattern 按纯文本处理（转义后再编译），replacement 里的 $ 也转成字面量。
-        // 这样"把 A 精确换成 B"不需要任何正则知识，也不会被元字符/捕获组引用坑到。
+        // literal=true: treat pattern as plain text (escape then compile), and turn $ in replacement into a literal too.
+        // This way "replace A with B exactly" needs no regex knowledge and won't be tripped up by metacharacters / capture-group references.
         let literal = params.literal.unwrap_or(false);
         if literal && params.pattern.is_empty() {
             return Err(e_param(
-                "literal 模式下 pattern 不能为空（空串会匹配任意位置）",
+                "in literal mode pattern must not be empty (empty string matches any position)",
                 None,
             ));
         }
@@ -4318,7 +4316,7 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
             params.pattern.clone()
         };
         let re = Regex::new(&pattern_src).map_err(|e| {
-            e_param(format!("正则表达式错误: {}", e), None)
+            e_param(format!("regex error: {}", e), None)
         })?;
         let repl: String = if literal {
             params.replacement.replace('$', "$$")
@@ -4327,23 +4325,23 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
         };
 
         let global = params.global.unwrap_or(true);
-        // max_matches 必须显式设置：强制 AI 先想清楚"预期改几处"，避免过宽正则/匹配空串造成大范围误替换
+        // max_matches must be set explicitly: force the AI to think through "how many edits are expected", avoiding broad regex / empty-string matches that cause large unintended replacements
         let max_matches = params.max_matches.ok_or_else(|| {
             e_param(
-                "regex_replace 必须显式设置 max_matches（本次预期最多替换几处）。\
-                 请先估算预期匹配数后传入该上限，例如 max_matches=1 表示只允许改 1 处；\
-                 实际匹配数超过该值时会被拒绝，防止正则过宽或匹配空串导致大范围误替换。".to_string(),
+                "regex_replace requires max_matches to be set explicitly (the max replacements expected this time).\
+                 Estimate the expected match count first and pass it as the cap, e.g. max_matches=1 allows only 1 change;\
+                 if the actual match count exceeds it, the call is rejected to prevent broad regex / empty-string matches from causing large unintended replacements.".to_string(),
                 None,
             )
         })?;
         if max_matches == 0 {
             return Err(e_param(
-                "max_matches 必须大于 0（若为 0 请直接不调用本工具）".to_string(),
+                "max_matches must be greater than 0 (if 0, just do not call this tool)".to_string(),
                 None,
             ));
         }
 
-        // 计算匹配数（带上限，防止匹配空串/过宽正则时计数爆炸）
+        // Count matches (capped, to avoid counter blow-up on empty-string matches / overly broad regex)
         let count = if global {
             re.find_iter(&content).take(max_matches + 1).count()
         } else {
@@ -4356,8 +4354,8 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
         if count > max_matches {
             return Err(e_param(
                 format!(
-                    "匹配数量 {} 超过你设置的上限 {}，拒绝执行！请检查正则是否过宽或匹配了空串。\
-                     确认无误可重新调用并把 max_matches 调高到预期值",
+                    "match count {} exceeds your cap {}; execution refused! Check whether the regex is too broad or matched an empty string.\
+                     If correct, re-call with max_matches raised to the expected value",
                     count, max_matches
                 ),
                 None,
@@ -4370,7 +4368,7 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
             re.replacen(&content, 1, repl.as_str()).into_owned()
         };
 
-        // dry-run：只预览不写入
+        // dry-run: only preview, do not write
         if params.dry_run.unwrap_or(false) {
             let mut preview = String::new();
             for (i, mat) in re.find_iter(&content).take(20).enumerate() {
@@ -4390,10 +4388,10 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
                 ));
             }
             if count > 20 {
-                preview.push_str(&format!("  ... 共 {} 处匹配，仅预览前 20 处\n", count));
+                preview.push_str(&format!("  ... {} matches total, previewing only the first 20\n", count));
             }
             return Ok(format!(
-                "{} | DRY-RUN | {} | {} matches | 未写入文件\n{}新文件大小: {}B → {}B\n确认无误后去掉 dry_run 重新调用以实际写入",
+                "{} | DRY-RUN | {} | {} matches | not written\n{}new file size: {}B -> {}B\nremove dry_run and retry to write",
                 params.path,
                 params.pattern,
                 count,
@@ -4437,10 +4435,10 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
         })
     }
 
-    /// 列出或搜索目录内容
+    /// List or search directory contents
     #[tool(
         name = "list_files",
-        description = "List a directory / search by file name (glob_pattern or pattern regex, choose one), with recursive, include_dirs, show_size/show_modified",
+        description = "List a directory / search by file name (glob_pattern or pattern regex, choose one; recursive defaults to false), with include_dirs, show_size/show_modified",
         annotations(title = "List directory", read_only_hint = true)
     )]
     fn list_files(
@@ -4454,14 +4452,14 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
         };
         let recursive = params.recursive.unwrap_or(false);
         let include_dirs = params.include_dirs.unwrap_or(true);
-        // max_results=0 会让工具"立即截断返回空"，这里兜到至少 1，避免空结果难以归因
+        // max_results=0 would make the tool "truncate and return empty immediately"; clamp to at least 1 so empty results are not hard to attribute
         let max_results = params.max_results.unwrap_or(500).max(1);
         let show_size = params.show_size.unwrap_or(true);
         let show_modified = params.show_modified.unwrap_or(false);
 
         let re = match &params.pattern {
             Some(p) => Some(Regex::new(p).map_err(|e| {
-                e_param(format!("正则表达式错误: {}", e), None)
+                e_param(format!("regex error: {}", e), None)
             })?),
             None => None,
         };
@@ -4469,10 +4467,10 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
         let glob_matcher = match &params.glob_pattern {
             Some(g) => {
                 if params.pattern.is_some() {
-                    return Err(e_param("pattern 和 glob_pattern 不能同时使用", None));
+                    return Err(e_param("pattern and glob_pattern cannot be used together", None));
                 }
                 let glob = Glob::new(g).map_err(|e| {
-                    e_param(format!("Glob 表达式错误: {}", e), None)
+                    e_param(format!("glob syntax error: {}", e), None)
                 })?;
                 Some(glob.compile_matcher())
             }
@@ -4521,7 +4519,7 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
                     return Ok(());
                 }
                 let name = entry.file_name().to_string_lossy().to_string();
-                // 跳过本工具自己产生的临时文件与锁文件
+                // Skip temporary files and lock files produced by this tool itself
                 if is_internal_file(&name) { continue; }
                 let ft = entry.file_type().ok();
                 let is_dir = ft.as_ref().map(|t| t.is_dir()).unwrap_or(false);
@@ -4539,7 +4537,7 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
                     }
                 }
 
-                // 匹配：正则 / glob / 全部列出
+                // Match: regex / glob / list all
                 let matched = match re {
                     Some(re) => re.is_match(&name),
                     None => match glob_matcher {
@@ -4586,12 +4584,12 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
         .map_err(|e| e_internal(e, None))?;
 
         let truncated = if truncated_flag {
-            format!("\n... 结果已截断，最多显示 {} 条", max_results)
+            format!("\n... results truncated, showing at most {} entries", max_results)
         } else {
             String::new()
         };
 
-        // 紧凑输出
+        // Compact output
         let has_modified = show_modified && entries.iter().any(|(_, _, _, m)| !m.is_empty());
         let mut lines = Vec::new();
         for (path, is_dir, size, modified) in &entries {
@@ -4615,7 +4613,7 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
         ) + if lines.is_empty() { String::new() } else { format!("\n{}", lines.join("\n")) }.as_str())
     }
 
-    /// 获取文件元信息（大小、类型、修改时间、SHA256）
+    /// Get file metadata (size, type, modified time, SHA256)
     #[tool(
         name = "file_info",
         description = "File/directory metadata: path | type | size | mtime (seconds) | sha256 | lines (text line count). sha256 is the same source as the read tools, so it can be used directly as expected_sha256",
@@ -4645,14 +4643,14 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
             .unwrap_or_else(|| "-".to_string());
 
         let file_type = if metadata.is_file() {
-            "文件"
+            "file"
         } else if metadata.is_dir() {
-            "目录"
+            "dir"
         } else {
-            "其他"
+            "other"
         };
 
-        // 版本指纹（与读取工具返回、写入前校验完全同一算法，可直接当 expected_sha256 用）
+        // Version fingerprint (same algorithm as the read tools return and the pre-write check; can be used directly as expected_sha256)
         let hash = if metadata.is_file() {
             Self::file_fingerprint(&params.path, metadata.len(), None)
                 .map(|h| h[..16].to_string())
@@ -4661,8 +4659,8 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
             "-".to_string()
         };
 
-        // 文本文件额外回报行数：改完想确认"行数对不对 / 有没有被换行风格弄坏"时，
-        // 用 file_info 就能核对，不必把整份内容再读进上下文（非文本/无法解码时显示 -）
+        // Text files additionally report their line count: when you want to confirm "are the line numbers right / were they broken by line-ending style",
+        // file_info lets you verify without re-reading the whole content into context (shows - for non-text / undecodable files)
         let lines = if metadata.is_file() {
             Self::count_lines_of(&params.path)
                 .map(|n| n.to_string())
@@ -4677,7 +4675,7 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
         ))
     }
 
-    /// 删除文件(需用户确认)
+    /// Delete a file (requires confirmation)
     #[tool(
         name = "delete_file",
         description = "Delete a single file (directories not allowed). You must pass confirm=true explicitly to actually delete; when unconfirmed it returns E_INVALID_PARAM and echoes the file size and fingerprint; a backup is taken automatically before deletion, recoverable with manage_backups undo",
@@ -4694,29 +4692,29 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
         };
         let path = std::path::Path::new(&params.path);
 
-        // 与该文件的写操作互斥，避免"边写边删"（进程内锁 + 跨进程文件锁）
+        // Exclusive with this file's write operations, to avoid "deleting while writing" (in-process lock + cross-process file lock)
         let lock = self.lock_for(&params.path);
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let _file_guard = Self::acquire_file_lock(&params.path);
 
         if !path.exists() {
-            return Err(e_param(format!("文件不存在: {}", params.path), None));
+            return Err(e_param(format!("file does not exist: {}", params.path), None));
         }
 
         if !path.is_file() {
-            return Ok(format!("路径不是普通文件，无法删除: {}", params.path));
+            return Ok(format!("path is not a regular file, cannot delete: {}", params.path));
         }
 
-        // 删除不可逆：必须显式确认，未传 confirm=true 时只回报信息（含大小与指纹）供调用方判断
+        // Deletion is irreversible: must be explicitly confirmed; when confirm=true is not passed, only echo info (size + fingerprint) for the caller to judge
         if params.confirm != Some(true) {
             let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
             let fp = Self::file_fingerprint(&params.path, size, None)
                 .map(|h| format!("sha256:{}", h))
-                .unwrap_or_else(|| "sha256:不可用".to_string());
+                .unwrap_or_else(|| "sha256:unavailable".to_string());
             return Err(e_param(
                 format!(
-                    "delete_file 需要显式确认：{} 将被删除（{}B，{}）。\
-                     确认无误后请带 confirm=true 重新调用（删除前会自动备份，可用 manage_backups action=undo 恢复）",
+                    "delete_file requires explicit confirmation: {} will be deleted ({}B, {}).\
+                     If correct, re-call with confirm=true (a backup is taken automatically before deletion, restorable via manage_backups action=undo)",
                     params.path, size, fp
                 ),
                 None,
@@ -4727,17 +4725,17 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
             .map_err(|e| e_internal(format!("E_NOT_FOUND failed to get file info: {}", e), None))?
             .len();
 
-        // 删除前备份（硬链接），删除后仍可用 manage_backups action=undo 恢复
+        // Back up before deleting (hard link); after deletion it can still be restored with manage_backups action=undo
         let bak = Self::backup_before_write(&params.path, "delete_file", None);
         retry_io(|| fs::remove_file(path)).map_err(|e| {
-            e_internal(format!("E_WRITE 删除文件失败: {}", e), None)
+            e_internal(format!("E_WRITE failed to delete file: {}", e), None)
         })?;
         let tail = if bak.is_some() { " | undoable" } else { "" };
 
         Ok(format!("OK {} | {}B deleted{}", params.path, size, tail))
     }
 
-    /// 备份管理：列出 / 回滚 / 清理
+    /// Backup management: list / undo / clean
     #[tool(
         name = "manage_backups",
         description = "Backup management (backups live in the tool's own directory, not polluting the project; up to 10 per file, auto-pruned beyond that). list = list / undo = roll back the most recent write or delete (rejected by default if the file changed again afterward, force=true overrides) / clean = clean up",
@@ -4754,14 +4752,14 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
         };
         let action = params.action.to_lowercase();
 
-        // list 是只读操作，不加锁，避免在目标目录创建/删除锁文件；
-        // undo/clean 会改动文件或备份，才需要与写操作互斥。
+        // list is read-only, so no lock (avoids creating/deleting lock files in the target dir);
+        // undo/clean mutate the file or backups, so they must be exclusive with write operations.
         match action.as_str() {
             "list" => {
                 let records = Self::list_backup_records(&params.path);
                 if records.is_empty() {
                     return Ok(format!(
-                        "{} | 0 backups | 备份目录: {}",
+                        "{} | 0 backups | backup dir: {}",
                         params.path,
                         Self::backup_dir_for(&params.path)
                             .map(|d| d.display().to_string())
@@ -4788,38 +4786,38 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
                     ));
                 }
                 Ok(format!(
-                    "{} | {} backups | 最新在末尾\n{}",
+                    "{} | {} backups | newest at the end\n{}",
                     params.path,
                     records.len(),
                     lines.join("\n")
                 ))
             }
             "undo" => {
-                // 会改文件，需与写操作互斥（进程内锁 + 跨进程文件锁）
+                // Will modify the file; must be exclusive with write operations (in-process lock + cross-process file lock)
                 let lock = self.lock_for(&params.path);
                 let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
                 let _file_guard = Self::acquire_file_lock(&params.path);
                 let records = Self::list_backup_records(&params.path);
                 let Some((bak, meta)) = records.last() else {
                     return Err(e_param(
-                        format!("E_NOT_FOUND {} 没有任何备份可回滚", params.path),
+                        format!("E_NOT_FOUND {} has no backups to roll back to", params.path),
                         None,
                     ));
                 };
                 let bak_bytes = fs::read(bak)
-                    .map_err(|e| e_internal(format!("E_BACKUP 读取备份失败: {}", e), None))?;
-                // 若文件在此之后又被改过，默认拒绝，避免把别人的新改动一起回滚掉
+                    .map_err(|e| e_internal(format!("E_BACKUP failed to read backup: {}", e), None))?;
+                // If the file was changed again afterward, reject by default to avoid rolling back someone else's new changes
                 let after_sha = meta.get("after_sha256").and_then(|v| v.as_str());
                 if !params.force.unwrap_or(false) {
                     if let Some(after) = after_sha {
                         let cur = Self::path_fingerprint_short(&params.path);
-                        // 文件已不存在（cur="-"）时允许回滚恢复；否则要求当前内容与备份记录的"写入后内容"一致
+                        // Allow rollback recovery when the file no longer exists (cur="-"); otherwise require the current content to match the backup record's "post-write content"
                         if cur != "-" && !after.eq_ignore_ascii_case(&cur) {
                             return Err(e_param(
                                 format!(
-                                    "E_EXTERNAL_CHANGED 文件在备份之后又被修改过，拒绝回滚以免丢失新改动。\n\
-                                     文件: {}\n备份对应的写入后 sha256: {}\n当前 sha256: {}\n\
-                                     确认要丢弃这些改动请用 force=true 重试",
+                                    "E_EXTERNAL_CHANGED file was modified again after the backup; rollback refused to avoid losing new changes.\n\
+                                     file: {}\nbackup's post-write sha256: {}\ncurrent sha256: {}\n\
+                                     if you really want to discard these changes, re-call with force=true",
                                     params.path, after, cur
                                 ),
                                 None,
@@ -4827,9 +4825,9 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
                         }
                     }
                 }
-                // 回滚前把当前内容也备份一份，这样"回滚"本身也能被撤销
+                // Also back up the current content before rolling back, so the "rollback" itself can be undone
                 let current_bak = if std::path::Path::new(&params.path).exists() {
-                    Self::backup_before_write(&params.path, "undo(回滚前快照)", None)
+                    Self::backup_before_write(&params.path, "undo(snapshot before rollback)", None)
                 } else {
                     if let Some(dir) = Self::backup_dir_for(&params.path) {
                         let _ = retry_io(|| fs::create_dir_all(&dir));
@@ -4842,17 +4840,17 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
                     current_bak.as_ref().map(|b| b.bak.as_path()),
                 )
                 .map_err(|e| {
-                    e_internal(format!("E_WRITE 回滚写入失败: {}", e), None)
+                    e_internal(format!("E_WRITE rollback write failed: {}", e), None)
                 })?;
                 if let Some(h) = &current_bak {
                     Self::finish_backup(h, &bak_bytes);
                 }
-                // 已消费的备份移出列表（连同 meta），避免重复回滚同一版本
+                // Remove consumed backups from the list (with meta) to avoid rolling back the same version repeatedly
                 let _ = fs::remove_file(bak);
                 let _ = fs::remove_file(bak.with_extension("json"));
                 let tool = meta.get("tool").and_then(|v| v.as_str()).unwrap_or("-");
                 Ok(format!(
-                    "OK {} | 已回滚到 {} 之前的版本（该备份由 {} 创建） | {}B | sha256:{}",
+                    "OK {} | rolled back to the version before {} (backup created by {}) | {}B | sha256:{}",
                     params.path,
                     bak.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
                     tool,
@@ -4861,25 +4859,25 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
                 ))
             }
             "clean" => {
-                // 会删备份，需与写操作互斥（进程内锁 + 跨进程文件锁）
+                // Will delete backups; must be exclusive with write operations (in-process lock + cross-process file lock)
                 let lock = self.lock_for(&params.path);
                 let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
                 let _file_guard = Self::acquire_file_lock(&params.path);
                 let keep = params.keep.unwrap_or(BACKUP_KEEP);
                 let Some(dir) = Self::backup_dir_for(&params.path) else {
-                    return Ok(format!("{} | 备份目录无效", params.path));
+                    return Ok(format!("{} | backup dir invalid", params.path));
                 };
                 let before = Self::list_backup_records(&params.path).len();
                 Self::trim_backups(&dir, keep);
                 let after = Self::list_backup_records(&params.path).len();
                 Ok(format!(
-                    "OK {} | 清理完成 | {} → {} 份备份 | keep={}",
+                    "OK {} | cleanup done | {} -> {} backups | keep={}",
                     params.path, before, after, keep
                 ))
             }
             _ => Err(e_param(
                 format!(
-                    "E_INVALID_PARAM 不支持的 action: {}，可选: list, undo, clean",
+                    "E_INVALID_PARAM unsupported action: {}, options: list, undo, clean",
                     params.action
                 ),
                 None,
@@ -4887,9 +4885,7 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
         }
     }
 
-
-
-    /// 复制文件
+    /// Copy files
     #[tool(
         name = "copy_files",
         description = "Copy files (auto-creates directories): with multiple sources target is treated as a directory; with a single source you may specify a new path/name; existing targets are skipped by default, overwrite=true overrides",
@@ -4903,39 +4899,39 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
         let target = self.resolve_path(&params.target)?;
         let target_path = std::path::Path::new(&target);
 
-        // 解析所有源文件路径
+        // Resolve all source file paths
         let sources: Vec<String> = params.sources.iter()
             .map(|s| self.resolve_path(s))
             .collect::<Result<Vec<_>, _>>()?;
 
-        // 目标语义：已存在按实际类型；不存在时多文件=目录、单文件=新文件路径（除非路径以分隔符结尾）
+        // Target semantics: an existing path keeps its real type; if missing, multiple sources = a directory and a single source = a new file path (unless the path ends with a separator)
         let target_is_dir = Self::target_is_dir_for(target_path, &params.target, sources.len());
 
         // 校验所有源文件存在
         for s in &sources {
             if !std::path::Path::new(s).is_file() {
                 return Err(e_param(
-                    format!("源文件不存在或不是普通文件: {}", s), None,
+                    format!("source file does not exist or is not a regular file: {}", s), None,
                 ));
             }
         }
 
-        // 如果是多文件，目标必须是目录
+        // If there are multiple sources, the target must be a directory
         if sources.len() > 1 && target_path.exists() && !target_is_dir {
             return Err(e_param(
-                format!("多文件复制时目标必须是目录: {}", target), None,
+                format!("with multiple sources the copy target must be a directory: {}", target), None,
             ));
         }
 
-        // 确保目标目录存在
+        // Ensure the target directory exists
         if target_is_dir {
             retry_io(|| fs::create_dir_all(target_path))
-                .map_err(|e| e_internal(format!("创建目标目录失败: {}", e), None))?;
+                .map_err(|e| e_internal(format!("failed to create target directory: {}", e), None))?;
         } else {
-            // 单文件且目标不是目录，确保父目录存在
+            // Single source and the target is not a directory: ensure the parent directory exists
             if let Some(parent) = target_path.parent() {
                 retry_io(|| fs::create_dir_all(parent))
-                    .map_err(|e| e_internal(format!("创建父目录失败: {}", e), None))?;
+                    .map_err(|e| e_internal(format!("failed to create parent directory: {}", e), None))?;
             }
         }
 
@@ -4946,7 +4942,7 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
         for src in &sources {
             let src_path = std::path::Path::new(src);
             let file_name = src_path.file_name().ok_or_else(|| {
-                e_param(format!("无法获取文件名: {}", src), None)
+                e_param(format!("failed to get file name: {}", src), None)
             })?;
 
             let dest = if target_is_dir {
@@ -4956,29 +4952,29 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
             };
 
             let dest_str = dest.to_string_lossy().to_string();
-            // 源与目标相同（复制到自身）：直接跳过，否则 overwrite=true 时 fs::copy 会报"文件被占用"
+            // Source equals target (copying onto itself): skip directly; otherwise with overwrite=true, fs::copy would report "file in use"
             if src.as_str() == dest_str {
-                results.push(format!("跳过 {} (源与目标相同)", dest.display()));
+                results.push(format!("skipped {} (source equals target)", dest.display()));
                 skipped += 1;
                 continue;
             }
 
             if dest.exists() && !overwrite {
-                results.push(format!("跳过 {} (已存在)", dest.display()));
+                results.push(format!("skipped {} (already exists)", dest.display()));
                 skipped += 1;
                 continue;
             }
 
             let size = fs::metadata(src)
-                .map_err(|e| e_internal(format!("无法读取源文件信息: {}", e), None))?
+                .map_err(|e| e_internal(format!("failed to read source file info: {}", e), None))?
                 .len();
 
-            // 与目标文件的其他写操作互斥（进程内锁 + 跨进程文件锁）
+            // Exclusive with the target file's other write operations (in-process lock + cross-process file lock)
             let lock = self.lock_for(&dest_str);
             let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
             let _file_guard = Self::acquire_file_lock(&dest_str);
             retry_io(|| fs::copy(src, &dest))
-                .map_err(|e| e_internal(format!("复制失败 {} -> {}: {}", src, dest.display(), e), None))?;
+                .map_err(|e| e_internal(format!("copy failed {} -> {}: {}", src, dest.display(), e), None))?;
 
             copied += size;
             results.push(format!("OK {} -> {} | {}B", src, dest.display(), size));
@@ -4994,7 +4990,7 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
         ))
     }
 
-    /// 移动/重命名文件
+    /// Move/rename files
     #[tool(
         name = "move_files",
         description = "Move/rename files (auto-creates directories): with multiple sources target is treated as a directory; with a single source you may specify a new path/name; existing targets are skipped by default, overwrite=true overrides",
@@ -5008,38 +5004,38 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
         let target = self.resolve_path(&params.target)?;
         let target_path = std::path::Path::new(&target);
 
-        // 解析所有源文件路径
+        // Resolve all source file paths
         let sources: Vec<String> = params.sources.iter()
             .map(|s| self.resolve_path(s))
             .collect::<Result<Vec<_>, _>>()?;
 
-        // 目标语义：已存在按实际类型；不存在时多文件=目录、单文件=新文件路径（除非路径以分隔符结尾）
+        // Target semantics: an existing path keeps its real type; if missing, multiple sources = a directory and a single source = a new file path (unless the path ends with a separator)
         let target_is_dir = Self::target_is_dir_for(target_path, &params.target, sources.len());
 
         // 校验所有源文件存在
         for s in &sources {
             if !std::path::Path::new(s).is_file() {
                 return Err(e_param(
-                    format!("源文件不存在或不是普通文件: {}", s), None,
+                    format!("source file does not exist or is not a regular file: {}", s), None,
                 ));
             }
         }
 
-        // 如果是多文件，目标必须是目录
+        // If there are multiple sources, the target must be a directory
         if sources.len() > 1 && target_path.exists() && !target_is_dir {
             return Err(e_param(
-                format!("多文件移动时目标必须是目录: {}", target), None,
+                format!("with multiple sources the move target must be a directory: {}", target), None,
             ));
         }
 
-        // 确保目标目录存在
+        // Ensure the target directory exists
         if target_is_dir {
             retry_io(|| fs::create_dir_all(target_path))
-                .map_err(|e| e_internal(format!("创建目标目录失败: {}", e), None))?;
+                .map_err(|e| e_internal(format!("failed to create target directory: {}", e), None))?;
         } else {
             if let Some(parent) = target_path.parent() {
                 retry_io(|| fs::create_dir_all(parent))
-                    .map_err(|e| e_internal(format!("创建父目录失败: {}", e), None))?;
+                    .map_err(|e| e_internal(format!("failed to create parent directory: {}", e), None))?;
             }
         }
 
@@ -5050,7 +5046,7 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
         for src in &sources {
             let src_path = std::path::Path::new(src);
             let file_name = src_path.file_name().ok_or_else(|| {
-                e_param(format!("无法获取文件名: {}", src), None)
+                e_param(format!("failed to get file name: {}", src), None)
             })?;
 
             let dest = if target_is_dir {
@@ -5060,7 +5056,7 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
             };
 
             if dest.exists() && !overwrite {
-                results.push(format!("跳过 {} (已存在)", dest.display()));
+                results.push(format!("skipped {} (already exists)", dest.display()));
                 skipped += 1;
                 continue;
             }
@@ -5070,13 +5066,13 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
                 .len();
 
             let dest_str = dest.to_string_lossy().to_string();
-            // 源与目标相同（重命名到自身）：无需操作
+            // Source equals target (renaming onto itself): nothing to do
             if src.as_str() == dest_str {
                 results.push(format!("跳过 {} (源与目标相同)", dest.display()));
                 skipped += 1;
                 continue;
             }
-            // 固定顺序加锁（进程内 + 跨进程文件锁），避免并发 A→B / B→A 时互相等待死锁
+            // Lock in a fixed order (in-process + cross-process file lock) to avoid deadlock when concurrent A->B / B->A wait on each other
             let src_first = src.as_str() < dest_str.as_str();
             let (p1, p2) = if src_first {
                 (src.as_str(), dest_str.as_str())
@@ -5089,19 +5085,19 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
             let _g2 = l2.lock().unwrap_or_else(|e| e.into_inner());
             let _f1 = Self::acquire_file_lock(p1);
             let _f2 = Self::acquire_file_lock(p2);
-            // 跨卷时 rename 会失败（Windows ERROR_NOT_SAME_DEVICE=17 / Unix EXDEV=18），回退为"复制 + 删除"
+            // rename fails across volumes (Windows ERROR_NOT_SAME_DEVICE=17 / Unix EXDEV=18); fall back to "copy + delete"
             match retry_io(|| fs::rename(src, &dest)) {
                 Ok(()) => {}
                 Err(e) if Self::is_cross_device_error(&e) => {
                     retry_io(|| fs::copy(src, &dest)).map_err(|e| {
-                        e_internal(format!("跨卷移动复制失败 {} -> {}: {}", src, dest.display(), e), None)
+                        e_internal(format!("cross-volume move copy failed {} -> {}: {}", src, dest.display(), e), None)
                     })?;
                     retry_io(|| fs::remove_file(src)).map_err(|e| {
-                        e_internal(format!("跨卷移动删除源文件失败 {}: {}", src, e), None)
+                        e_internal(format!("cross-volume move failed to delete source {}: {}", src, e), None)
                     })?;
                 }
                 Err(e) => {
-                    return Err(e_internal(format!("移动失败 {} -> {}: {}", src, dest.display(), e), None));
+                    return Err(e_internal(format!("move failed {} -> {}: {}", src, dest.display(), e), None));
                 }
             }
 
@@ -5122,24 +5118,24 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
     /// 按行编辑文件：删除/插入/替换/追加行
     #[tool(
         name = "edit_file_lines",
-        description = "Edit by line (1-based): delete_lines/insert_lines/replace_lines/append_lines. Locate with anchor_text (whole line, must be unique) or anchor_regex, or directly give start_line/end_line; delete/replace require expected_old for a second check; dry_run=true returns only a diff. \
-Also supports a \"context block\" mode: give context_before + context_after (mutually exclusive with expected_old/anchor/line-number, and expected_sha256 is required); the tool auto-locates the (implied) text between the two frames and replaces it with content; two adjacent frames mean inserting content between them — the AI need not repeat large chunks of old text.",
+        description = "Edit by line (1-based; path required): delete_lines/insert_lines/replace_lines/append_lines. Locate with anchor_text (whole line, must be unique) or anchor_regex, or directly give start_line/end_line; delete/replace require expected_old for a second check; pass expected_sha256 from a prior read to avoid overwriting concurrent changes; dry_run=true returns only a diff. \
+Also supports a \"context block\" mode: give context_before + context_after (mutually exclusive with expected_old/anchor/line-number; requires expected_sha256). The tool auto-locates the implied text between the two frames and replaces it with content; two adjacent frames mean inserting content between them — the AI need not repeat large chunks of old text.",
         annotations(title = "Edit file by line", destructive_hint = true)
     )]
     fn edit_file_lines(
         &self,
         Parameters(params): Parameters<EditFileLinesParams>,
     ) -> Result<String, McpError> {
-        let target = params.path.or(params.file_path).ok_or_else(|| {
-            e_param("缺少 path 或 file_path 参数", None)
+        let target = params.path.ok_or_else(|| {
+            e_param("missing path parameter", None)
         })?;
         let target = self.resolve_path(&target)?;
 
-        // 上下文块模式（强版）参数校验：与 expected_old/锚点/行号 互斥，且必须传 expected_sha256
+        // Context-block mode (strong form) parameter validation: mutually exclusive with expected_old/anchor/line-number, and expected_sha256 is required
         let context_active = params.context_before.is_some() || params.context_after.is_some();
         if params.context_before.is_some() != params.context_after.is_some() {
             return Err(e_param(
-                "context_before 与 context_after 必须同时提供或同时省略",
+                "context_before and context_after must be provided together or omitted together",
                 None,
             ));
         }
@@ -5152,7 +5148,7 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
                 || params.anchor_occurrence.is_some()
             {
                 return Err(e_param(
-                    "使用上下文块(context_before/context_after)时，不能再提供 expected_old/anchor_text/anchor_regex/start_line/end_line/anchor_occurrence（互斥）",
+                    "when using the context block (context_before/context_after), you must not also provide expected_old/anchor_text/anchor_regex/start_line/end_line/anchor_occurrence (mutually exclusive)",
                     None,
                 ));
             }
@@ -5160,43 +5156,43 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
                 Some(s) if s.trim().len() >= 8 => {}
                 _ => {
                     return Err(e_param(
-                        "E_INVALID_PARAM 使用上下文块时必须传 expected_sha256（文件级并发防护兜底，防止读-写之间文件被他人改动）",
+                        "E_INVALID_PARAM when using the context block you must pass expected_sha256 (file-level concurrency guard to prevent the file being changed by others between read and write)",
                         None,
                     ));
                 }
             }
         }
 
-        // 同一文件的读-改-写串行化：多个 AI 并发编辑同一文件时不会互相覆盖
+        // Serialize read-modify-write per file: multiple AIs editing the same file concurrently won't overwrite each other
         self.with_path_lock(&target, || {
-        // 读取文件字节
+        // Read file bytes
         let bytes = retry_io(|| fs::read(&target)).map_err(|e| {
             match e.kind() {
                 std::io::ErrorKind::NotFound => {
-                    e_internal(format!("文件不存在: {}", target), None)
+                    e_internal(format!("file does not exist: {}", target), None)
                 }
                 std::io::ErrorKind::PermissionDenied => {
-                    e_internal(format!("没有权限操作文件: {}", target), None)
+                    e_internal(format!("no permission to operate on file: {}", target), None)
                 }
                 _ => e_internal(format!("failed to read file: {}", e), None),
             }
         })?;
 
-        // 写前版本校验：文件已被其他 AI/程序改过则拒绝，避免整文件写回时抹掉别人的修改
+        // Pre-write version check: if the file was changed by another AI/program, refuse, to avoid wiping someone else's change on whole-file write-back
         Self::check_expected_sha(&target, &bytes, params.expected_sha256.as_deref())?;
 
-        // 决定编辑编码：默认保持原文件编码；指定编码与实际不一致时直接报错返回真实编码
+        // Decide the edit encoding: keep the original file encoding by default; if the specified encoding is inconsistent with the actual one, error out and report the real encoding
         let encoding_name = Self::resolve_write_encoding(&target, params.encoding.as_deref(), Some(&bytes))?;
 
-        // 统一解码：剥离 BOM 并记录 BOM/编码/主换行风格，写回时原样复原
+        // Unified decode: strip the BOM and record BOM/encoding/dominant line ending, restore verbatim on write-back
         let ft = Self::decode_file(&bytes, encoding_name)
             .map_err(|e| e_internal(e, None))?;
-        // 解码时替换过非法字节的内容不允许写回，否则原字节被永久破坏
+        // Content whose invalid bytes were replaced during decode must not be written back, or the original bytes are permanently corrupted
         if ft.has_invalid {
             return Err(e_internal(
                 format!(
-                    "文件 {} 按 {} 解码时存在非法字节（已用 U+FFFD 替换），拒绝写回以免原字节永久丢失。\
-                     请确认文件真实编码后用正确的 encoding 重新调用",
+                    "file {} decoded as {} contains invalid bytes (replaced with U+FFFD); refusing to write back to avoid permanently losing the original bytes.\
+                     Confirm the real encoding and re-call with the correct encoding",
                     target, ft.encoding
                 ),
                 None,
@@ -5207,9 +5203,9 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
         let bom = ft.bom;
         let encoding = ft.encoding.clone();
 
-        // 拆分为"裸行"（去掉行尾 \r），写回时统一用主换行风格 line_ending 连接，
-        // 保证一个文件不会残留多种换行符。
-        // 空文件按 0 行处理：否则 append_lines 会在文件开头插出一个空行
+        // Split into "bare lines" (strip trailing \r), then join with the dominant line_ending on write-back,
+        // so a file never ends up with mixed line endings.
+        // Treat an empty file as 0 lines: otherwise append_lines would insert a blank line at the very start
         let lines: Vec<String> = if ft.content.is_empty() {
             Vec::new()
         } else {
@@ -5221,9 +5217,9 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
         let total_lines = lines.len();
         let mut modified: Vec<String> = lines.clone();
 
-        // 上下文块模式（强版）：把 (before, after) 两帧解析成 (start, end, operation, expected_old)，
-        // 之后复用下方既有的 anchor/operation 逻辑；非上下文模式则原样回退到 params。
-        // 这样 AI 只需给"改动点两侧的小段上下文"，工具自己算出被隐含的旧文本并做精确校验，无需复述大段旧内容。
+        // Context-block mode (strong form): resolve the (before, after) frames into (start, end, operation, expected_old),
+        // then reuse the anchor/operation logic below; non-context mode falls back to params as-is.
+        // This way the AI only gives "a small slice of context on both sides of the change", and the tool itself computes the implied old text and validates it precisely, without repeating large chunks of old content.
         let (eff_start, eff_end, eff_op, eff_old): (
             Option<usize>,
             Option<usize>,
@@ -5242,7 +5238,7 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
                 .collect();
             if before_lines.is_empty() || after_lines.is_empty() {
                 return Err(e_param(
-                    "context_before/context_after 不能为空（各需至少一行真实文本）",
+                    "context_before/context_after must not be empty (each needs at least one line of real text)",
                     None,
                 ));
             }
@@ -5251,7 +5247,7 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
             if kb > total_lines || ka > total_lines {
                 return Err(e_param(
                     format!(
-                        "context_before({}行)/context_after({}行) 超过文件总行数({})",
+                        "context_before({}L)/context_after({}L) exceeds the file's total line count ({})",
                         kb, ka, total_lines
                     ),
                     None,
@@ -5277,7 +5273,7 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
                 0 => {
                     return Err(e_param(
                         format!(
-                            "E_NOT_FOUND 上下文块未匹配到唯一落点：context_before 命中 {} 处、context_after 命中 {} 处，但不存在 before 在前 after 在后的组合。请确认两者是文件中真实的连续片段",
+                            "E_NOT_FOUND context block did not match a unique landing point: context_before hit {} place(s), context_after hit {} place(s), but no combination with before before after exists. Confirm both are real, consecutive fragments in the file",
                             before_hits.len(),
                             after_hits.len()
                         ),
@@ -5289,10 +5285,10 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
                     let gap_start = b + kb; // 0-based：被隐含替换/插入区间的起点
                     let gap_end = a; // 0-based：区间终点（不含）
                     if gap_start == gap_end {
-                        // 两帧相邻 → 在其间插入 content
+                        // Two frames adjacent -> insert content between them
                         (Some(gap_start + 1), Some(gap_start), "insert_lines".to_string(), None)
                     } else {
-                        // 两帧之间夹着旧文本 → 用 content 替换它（expected_old 由工具推导并精确校验）
+                        // Old text sits between the two frames -> replace it with content (expected_old is derived and precisely validated by the tool)
                         let old = lines[gap_start..gap_end].join("\n");
                         (Some(gap_start + 1), Some(gap_end), "replace_lines".to_string(), Some(old))
                     }
@@ -5303,15 +5299,15 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
                         .map(|(b, a)| {
                             let gs = b + kb;
                             if gs == *a {
-                                format!("第 {} 行后插入", gs + 1)
+                                format!("insert after line {}", gs + 1)
                             } else {
-                                format!("第 {}~{} 行", gs + 1, a)
+                                format!("lines {}~{}", gs + 1, a)
                             }
                         })
                         .collect();
                     return Err(e_param(
                         format!(
-                            "E_NOT_UNIQUE 上下文块落点不唯一（命中 {} 处）。请用更长的 context_before/context_after 缩小范围，或改用锚点/行号定位。候选区间(改动前,1-based): {}",
+                            "E_NOT_UNIQUE context block landing point is not unique (hit {} place(s)). Use longer context_before/context_after to narrow it, or switch to anchor/line-number locating. Candidate ranges (pre-change, 1-based): {}",
                             cands.len(),
                             list.join("; ")
                         ),
@@ -5328,14 +5324,14 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
             )
         };
 
-        // 辅助：对期望旧内容进行比对（用于防止行号算错）
+        // Helper: compare the expected old content (to prevent miscounted line numbers)
         let check_expected_old = |range: std::ops::Range<usize>, expected: &str| -> Result<(), McpError> {
             let actual_lines: Vec<String> = lines[range.clone()]
                 .iter()
                 .map(|s| s.trim_end_matches('\r').to_string())
                 .collect();
-            // 逐行比较，兼容 \r\n
-            // 容忍 expected_old 尾随的单个换行（AI 常把整行连同换行一起复制过来）：
+            // Compare line by line, tolerant of \r\n
+            // Tolerate a single trailing newline on expected_old (the AI often copies the whole line including the newline):
             // 否则 split 会多出一个空元素导致长度不等而误拒。
             let expected = expected
                 .strip_suffix("\r\n")
@@ -5345,7 +5341,7 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
             let matches = expected_lines.len() == actual_lines.len()
                 && expected_lines.iter().zip(actual_lines.iter()).all(|(e, a)| e.trim_end_matches('\r') == a.as_str());
             if !matches {
-                // 输出实际内容 (附近 ±2 行上下文)
+                // Output the actual content (with +/-2 lines of nearby context)
                 let ctx_start = (range.start.saturating_sub(2)).max(0);
                 let ctx_end = (range.end + 2).min(total_lines);
                 let width = total_lines.to_string().len().max(3);
@@ -5360,13 +5356,13 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
                         width = width
                     ));
                 }
-                // 行数不符是"行号算错"最常见的成因，直接点明，省掉一轮试错往返
+                // A line-count mismatch is the most common cause of "miscounted line numbers"; state it directly to save a round of trial-and-error
                 let count_hint = if expected_lines.len() == actual_lines.len() {
                     String::new()
                 } else {
                     format!(
-                        "⚠️ 行数不符：声明的区间 {}~{} 只覆盖 {} 行，而 expected_old 是 {} 行（{} {} 行）。\
-                         请核对 start_line/end_line，或让 expected_old 的行数与区间完全一致。\n",
+                        "⚠️ line count mismatch: the declared range {}~{} only covers {} lines, but expected_old is {} lines ({} {} line(s)).\
+                         Check start_line/end_line, or make expected_old's line count exactly match the range.\n",
                         range.start + 1,
                         range.end,
                         actual_lines.len(),
@@ -5377,11 +5373,11 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
                 };
                 return Err(e_param(
                     format!(
-                        "expected_old 不匹配！行号可能算错了。期望 {}~{} 行的实际内容与提供的 expected_old 不一致。\n\
+                        "expected_old does not match! The line numbers may be miscounted. The actual content of lines {}~{} differs from the provided expected_old.\n\
                          {}\
-                         文件总行数: {}\n\
-                         === 期望内容({}行):\n{}\n\
-                         === 实际内容(上下文 >>> 标记目标行):\n{}",
+                         total file lines: {}\n\
+                         === expected content ({} lines):\n{}\n\
+                         === actual content (lines marked with >>> are the target):\n{}",
                         range.start + 1,
                         range.end,
                         count_hint,
@@ -5396,11 +5392,11 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
             Ok(())
         };
 
-        // 锚点定位：把 anchor_text / anchor_regex 换算成行号（默认要求全文唯一命中，避免改错位置）
+        // Anchor locating: convert anchor_text / anchor_regex into line numbers (by default require a unique file-wide hit, to avoid editing the wrong place)
         let used_anchor = params.anchor_text.is_some() || params.anchor_regex.is_some();
         if params.anchor_text.is_some() && params.anchor_regex.is_some() {
             return Err(e_param(
-                "anchor_text 与 anchor_regex 不能同时使用，请二选一",
+                "anchor_text and anchor_regex cannot be used together; pick one",
                 None,
             ));
         }
@@ -5409,7 +5405,7 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
         if used_anchor {
             if params.start_line.is_some() {
                 return Err(e_param(
-                    "anchor_text/anchor_regex 与 start_line 不能同时使用，请二选一",
+                    "anchor_text/anchor_regex and start_line cannot be used together; pick one",
                     None,
                 ));
             }
@@ -5424,7 +5420,7 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
             } else {
                 let pat = params.anchor_regex.as_deref().unwrap_or("");
                 let re = Regex::new(pat).map_err(|e| {
-                    e_param(format!("anchor_regex 正则表达式错误: {}", e), None)
+                    e_param(format!("anchor_regex regex error: {}", e), None)
                 })?;
                 lines
                     .iter()
@@ -5435,14 +5431,14 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
             };
             match hits.len() {
                 0 => {
-                    // 未精确命中时给出"含该文本的行"作为提示，省掉一轮重新读取
+                    // When no precise hit, give the "lines containing the text" as a hint, saving a round of re-reading
                     let mut hints: Vec<String> = Vec::new();
                     if let Some(t) = params.anchor_text.as_deref().map(|s| s.trim()) {
                         if !t.is_empty() {
                             for (i, l) in lines.iter().enumerate() {
                                 let l = l.trim_end_matches('\r');
                                 if l.contains(t) {
-                                    hints.push(format!("第 {} 行: {}", i + 1, l.trim()));
+                                    hints.push(format!("line {}: {}", i + 1, l.trim()));
                                     if hints.len() >= 5 {
                                         break;
                                     }
@@ -5453,12 +5449,12 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
                     let hint = if hints.is_empty() {
                         String::new()
                     } else {
-                        format!("\n可能想改的行（包含你给的文本）:\n  {}", hints.join("\n  "))
+                        format!("\nlikely lines you want to change (containing the text you gave):\n  {}", hints.join("\n  "))
                     };
                     return Err(e_param(
                         format!(
-                            "E_NOT_FOUND 锚点未精确匹配到任何行（anchor_text={:?} anchor_regex={:?}）。\
-                             注意 anchor_text 需与整行完整一致（含缩进）；确认真实内容可先 read_text_lines{}",
+                            "E_NOT_FOUND anchor did not precisely match any line (anchor_text={:?} anchor_regex={:?}).\
+                             Note anchor_text must match the whole line exactly (including indentation); to confirm the real content, read with read_text_lines first{}",
                             params.anchor_text, params.anchor_regex, hint
                         ),
                         None,
@@ -5469,7 +5465,7 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
                     Some(occ) if occ >= 1 && occ <= n => start_line = Some(hits[occ - 1]),
                     Some(occ) => {
                         return Err(e_param(
-                            format!("anchor_occurrence={} 超出命中数量 {}", occ, n),
+                            format!("anchor_occurrence={} exceeds the hit count {}", occ, n),
                             None,
                         ));
                     }
@@ -5481,8 +5477,8 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
                             .join(", ");
                         return Err(e_param(
                             format!(
-                                "E_NOT_UNIQUE 锚点命中 {} 处（行: {}），无法确定要改哪一处。\
-                                 请把 anchor_text 写得更完整（含上下文/缩进），或指定 anchor_occurrence 选择第几处",
+                                "E_NOT_UNIQUE anchor hit {} place(s) (lines: {}), cannot decide which one to change.\
+                                 Make anchor_text more complete (with context/indentation), or set anchor_occurrence to pick the Nth hit",
                                 n, list
                             ),
                             None,
@@ -5499,12 +5495,12 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
         let result = match eff_op.as_str() {
             "delete_lines" => {
                 let start = start_line.ok_or_else(|| {
-                    e_param("删除行操作需要指定 start_line 或 anchor_text/anchor_regex", None)
+                    e_param("delete_lines requires start_line or anchor_text/anchor_regex", None)
                 })?;
-                // 锚点模式下 end_line 可省（默认只删命中那一行）；否则必须显式给出范围
+                // In anchor mode end_line may be omitted (by default only the hit line is deleted); otherwise the range must be given explicitly
                 let end = end_line
                     .or(if used_anchor { Some(start) } else { None })
-                    .ok_or_else(|| e_param("删除行操作需要指定 end_line", None))?;
+                    .ok_or_else(|| e_param("delete_lines requires end_line", None))?;
                 if start < 1 || end > total_lines || start > end {
                     return Err(e_param(
                         format!("invalid line range: {}-{}, total lines: {}", start, end, total_lines),
@@ -5513,7 +5509,7 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
                 }
                 let exp = eff_old.as_deref().ok_or_else(|| {
                     e_param(
-                        "delete_lines 必须提供 expected_old（将 read_text_lines 读到的目标行原样传入），用于防止行号算错",
+                        "delete_lines requires expected_old (pass the target lines exactly as read by read_text_lines) to prevent miscounted line numbers",
                         None,
                     )
                 })?;
@@ -5524,7 +5520,7 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
 
             "insert_lines" => {
                 let start = start_line.ok_or_else(|| {
-                    e_param("插入行操作需要指定 start_line 或 anchor_text/anchor_regex", None)
+                    e_param("insert_lines requires start_line or anchor_text/anchor_regex", None)
                 })?;
                 let insert_content = params.content.as_ref().ok_or_else(|| {
                     e_param("insert_lines requires content", None)
@@ -5535,14 +5531,14 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
                         None,
                     ));
                 }
-                // 拆分插入内容，兼容 \r\n
+                // Split the inserted content, tolerant of \r\n
                 let insert_lines: Vec<String> = insert_content
                     .split('\n')
                     .map(|s| s.trim_end_matches('\r').to_string())
                     .collect();
                 let idx = start - 1;
-                // 插入点在文件末尾且文件以换行结尾时，split 产生的末尾空串只是"结尾换行标记"，
-                // 应插到它之前，否则会凭空多出一个空行（与 append_lines 保持一致）
+                // When the insert point is at end-of-file and the file ends with a newline, the trailing empty string produced by split is only the "end-of-line marker";
+                // insert before it, otherwise a spurious blank line would appear (consistent with append_lines)
                 let idx = if idx == modified.len()
                     && modified.last().map(|s| s.is_empty()).unwrap_or(false)
                 {
@@ -5601,8 +5597,8 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
                     .split('\n')
                     .map(|s| s.trim_end_matches('\r').to_string())
                     .collect();
-                // 文件以换行结尾时，split 产生的末尾空串只是"结尾换行标记"而不是真实空行：
-                // 追加应插在它之前，否则会凭空多出一个空行（"a\nb\n" + "c" 会变成 "a\nb\n\nc"）。
+                // When the file ends with a newline, the trailing empty string produced by split is only the "end-of-line marker", not a real blank line:
+                // appending should go before it, otherwise a spurious blank line appears ("a\nb\n" + "c" becomes "a\nb\n\nc").
                 let insert_at = if modified.last().map(|s| s.is_empty()).unwrap_or(false) {
                     modified.len() - 1
                 } else {
@@ -5627,7 +5623,7 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
             }
         };
 
-        // 用主换行风格统一连接，保证写回后整个文件只有一种换行符
+        // Join with the dominant line ending uniformly, so the written-back file has only one kind of newline
         let new_content = modified.join(line_ending);
         let new_bytes = Self::encode_file(&FileText {
             encoding: encoding.clone(),
@@ -5638,7 +5634,7 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
         })
         .map_err(|e| e_internal(e, None))?;
 
-        // dry-run：只返回 diff 预览，不写文件、不备份
+        // dry-run: return only the diff preview, write no file and take no backup
         if params.dry_run.unwrap_or(false) {
             return Ok(format!(
                 "DRY-RUN | {} | {} | {} | {}→{} lines | {}B→{}B | not written\n{}expected sha256:{}\nremove dry_run and retry to write",
@@ -5654,13 +5650,13 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
             ));
         }
 
-        // 自动创建父目录
+        // Auto-create the parent directory
         Self::ensure_parent_dir(&target)
             .map_err(|e| e_internal(e, None))?;
 
-        // 写前备份（硬链接零拷贝），便于事后回滚
+        // Back up before writing (hard-link zero-copy) for later rollback
         let bak = Self::backup_before_write(&target, "edit_file_lines", Some(&bytes));
-        // 原子写入：先写临时文件再 rename 替换，中途失败不会损坏原文件
+        // Atomic write: write a temp file then rename to replace, so a mid-way failure won't corrupt the original file
         Self::atomic_write_ex(&target, &new_bytes, bak.as_ref().map(|b| b.bak.as_path())).map_err(|e| {
             if e.kind() == std::io::ErrorKind::PermissionDenied {
                 e_internal(format!("E_NO_PERMISSION no permission to operate on file: {}", target), None)
@@ -5688,8 +5684,8 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
         })
     }
 
-    /// 多文件只读预览：把多个 edit_file_lines 式改动（支持锚点/行号/上下文块）聚合成一份紧凑 diff，
-    /// 不写入、不备份。确认无误后再逐文件调用对应编辑工具实写。
+    /// Read-only multi-file preview: aggregate several edit_file_lines-style changes (anchors/line numbers/context blocks) into one compact diff,
+    /// without writing or backing up. After confirming, call the per-file edit tool to actually apply.
     #[tool(
         name = "preview_edits",
         description = "Read-only multi-file preview: aggregates several edit_file_lines-style changes (anchors/line numbers/context blocks) into one compact diff, without writing or backing up. After confirming, call the per-file edit tool to actually apply. edits=[{path, operation?, content?, expected_old?, anchor_*, start_line?, end_line?, context_before?, context_after?, expected_sha256?}]",
@@ -5712,7 +5708,6 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
                     .clone()
                     .unwrap_or_else(|| "replace_lines".to_string()),
                 path: Some(spec.path.clone()),
-                file_path: None,
                 start_line: spec.start_line,
                 end_line: spec.end_line,
                 content: spec.content.clone(),
@@ -5747,13 +5742,13 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
     }
 }
 
-/// 最近一次 panic 的文本：由启动时装的 hook 写入、catch_unwind 分支取走。
-/// 只有"两个工具同时 panic"这种极罕见并发下才可能串味，不影响兜底本身。
+/// Text of the most recent panic: written by the hook installed at startup and taken by the catch_unwind branch.
+/// Only under the extremely rare concurrency of "two tools panicking at once" could it get crossed; the fallback itself is unaffected.
 static LAST_PANIC_MSG: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
     std::sync::OnceLock::new();
 
-/// 装 panic hook：① 截获 panic 文本供兜底分支回显；② 保留默认 stderr 输出——
-/// 默认输出里的 `文件:行号` 是定位依据（release 虽 strip 掉符号表，这行仍在），不能吃掉。
+/// Install the panic hook: ① capture the panic text for the fallback branch to echo; ② keep the default stderr output --
+/// the `file:line` in the default output is the locating clue (though release strips the symbol table, this line remains), so it must not be swallowed.
 fn install_panic_hook() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -5771,16 +5766,16 @@ fn install_panic_hook() {
     }));
 }
 
-/// 包住 ToolRouter：把工具实现里的 panic 兜住，降级成一条普通错误返回。
+/// Wrap ToolRouter: catch panics from tool implementations and demote them to an ordinary error response.
 ///
-/// 背景：edit_file_sections 曾在"中文 + start_line"的分支上数组越界 panic，
-/// 而 release 配了 `panic = "abort"`，一次 panic 就把整个 MCP 服务带走——
-/// stdio 下调用方只看到超时/断连，HTTP 下整个进程退出、所有会话一起没。
-/// 这里在派发处加一层 catch_unwind：某个工具崩了只影响这一次调用，
-/// 服务继续运行、其余工具照常可用。
+/// Background: edit_file_sections once panicked with an array index-out-of-bounds on the "Chinese + start_line" branch,
+/// and with release configured `panic = "abort"`, one panic took down the entire MCP service --
+/// under stdio the caller only sees a timeout/disconnect, and under HTTP the whole process exits and all sessions die.
+/// Here we add a catch_unwind layer at dispatch: if one tool crashes, only that one call is affected,
+/// the service keeps running and the other tools remain usable.
 ///
-/// 覆盖不到的是"工具之外"的 panic（rmcp 协议层、传输层），那仍会让进程退出；
-/// 但绝大多数风险在本文件这几千行手写的下标/切片逻辑里，已被这里兜住。
+/// What it can't cover is panics "outside the tools" (the rmcp protocol layer, transport layer) -- those still exit the process;
+/// but the vast majority of risk lives in these few thousand lines of hand-written index/slice logic in this file, now caught here.
 struct PanicSafeRouter<'a> {
     inner: &'a rmcp::handler::server::router::tool::ToolRouter<FileIoServer>,
 }
@@ -5793,12 +5788,12 @@ impl<'a> PanicSafeRouter<'a> {
         let tool_name = tcc.name().to_string();
         let fut = self.inner.call(tcc);
         // AssertUnwindSafe：future 里持有 &self/&params 的共享引用，编译器无法证明
-        // UnwindSafe。panic 后我们立刻丢弃这个 future（不再 poll），不会观察到中间态。
+        // UnwindSafe. After a panic we immediately drop this future (no more polling), so no intermediate state is observed.
         match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(fut)).await {
             Ok(result) => result,
             Err(payload) => {
                 let msg = Self::panic_message(&payload);
-                // 打一条 stderr：release 虽 strip 掉符号表，但 panic 的 文件:行号 仍在，便于定位
+                // Print a stderr line: although release strips the symbol table, the panic's file:line is still there, aiding locating
                 eprintln!(
                     "[file-io-mcp] tool {} panicked internally (captured, server continues): {}",
                     tool_name, msg
@@ -5819,21 +5814,21 @@ impl<'a> PanicSafeRouter<'a> {
         self.inner.list_all()
     }
 
-    /// 返回值按 'a 而不是跟随 &self：调用方写法是 `self.safe_router().get(name)`，
-    /// 跟 &self 的话会在临时值上借用、语句结束即失效。
+    /// The return value follows 'a rather than &self: the caller writes `self.safe_router().get(name)`,
+    /// and with &self it would borrow on a temporary that dies at the end of the statement.
     fn get(&self, name: &str) -> Option<&'a rmcp::model::Tool> {
         self.inner.get(name)
     }
 
-    /// 取走最近一次 panic 的文本（由启动时装的 hook 写入），取完即清空
+    /// Take the most recent panic's text (written by the hook installed at startup); clears it after taking
     fn take_last_panic_msg() -> Option<String> {
         LAST_PANIC_MSG.get()?.lock().ok().and_then(|mut g| g.take())
     }
 
     fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-        // rustc 1.98 起 panic!("...") 的 payload 是 std 的内部类型，实测 downcast 到
-        // &str / String 都是 None；但 PanicHookInfo::payload_as_str() 能取到文本，
-        // 故优先用 hook 截获的内容，downcast 仅作兜底。
+        // Since rustc 1.98, the payload of panic!("...") is an internal std type; in practice downcasting to
+        // &str / String is None; but PanicHookInfo::payload_as_str() can retrieve the text,
+        // so prefer the text captured by the hook, and use downcast only as a fallback.
         if let Some(msg) = Self::take_last_panic_msg() {
             return msg;
         }
@@ -5848,7 +5843,7 @@ impl<'a> PanicSafeRouter<'a> {
 }
 
 impl FileIoServer {
-    /// 供 `#[tool_handler(router = ...)]` 使用：派发时套上 panic 兜底层
+    /// For `#[tool_handler(router = ...)]`: wrap the dispatch in the panic-catch layer
     fn safe_router(&self) -> PanicSafeRouter<'_> {
         PanicSafeRouter {
             inner: &self.tool_router,
@@ -5920,11 +5915,11 @@ impl ServerHandler for FileIoServer {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 先装 panic hook：派发处会兜住工具内的 panic，这里负责把它的文本截获下来
+    // Install the panic hook first: the dispatch site catches in-tool panics; here we capture its text
     install_panic_hook();
 
-    // 可选的安全沙箱：通过环境变量 FILE_IO_ROOT 限制可访问的根目录。
-    // 未设置时不限制路径（向后兼容），但生产环境建议配置以防越权访问。
+    // Optional security sandbox: restrict the accessible root directory via the FILE_IO_ROOT environment variable.
+    // When unset, paths are unrestricted (backward compatible), but production should configure it to prevent unauthorized access.
     let root = match std::env::var("FILE_IO_ROOT") {
         Ok(r) if !r.trim().is_empty() => {
             let p = std::path::PathBuf::from(r.trim());
@@ -5946,7 +5941,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // 命令行参数解析：默认 stdio，--http 启动为 HTTP 模式
+    // Parse command-line arguments: default stdio, --http starts HTTP mode
     let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|a| a == "--http") {
@@ -5958,7 +5953,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 启动 Streamable HTTP 模式（单端点 /mcp）
+/// Start Streamable HTTP mode (single endpoint /mcp)
 async fn run_http(root: Option<std::path::PathBuf>) -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let addr: std::net::SocketAddr = args
