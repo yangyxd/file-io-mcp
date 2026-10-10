@@ -13,7 +13,9 @@
 | `read_text_file` | 按字节读文本片段，返回编码与文件指纹 |
 | `read_text_lines` | 按行读文本（带行号），编辑前取内容与指纹 |
 | `write_text_file` | 整段写文本，支持覆盖/追加/插入，可 dry-run 预览 diff |
-| `edit_file_lines` | 按行编辑：删/插/替/追，支持锚点定位与 `expected_old` 校验 |
+| `edit_file_lines` | 按行编辑：删/插/替/追，支持锚点定位、`expected_old` 校验，以及"上下文块"小范围语义定位 |
+| `preview_edits` | **多文件只读预览**：把多个 edit_file_lines 式改动聚合成一份紧凑 diff，不写入、不备份；每个预览成功的文件附一个一次性 `planToken` |
+| `apply_plans` | **按 token 提交预览**：传入 `preview_edits` 返回的 `planToken`（一个 token = 一个文件），无需重发编辑内容；多个 token 逐文件报告结果 |
 | `edit_file_sections` | **批量精确替换**：一次调用改多处，默认全成或全不成，全部基于同一次快照定位 |
 | `regex_replace` | 正则替换（`literal=true` 即免转义的纯文本替换），`max_matches` 必填防误伤，可 dry-run |
 | `read_binary_file` | 读二进制 HEX dump |
@@ -180,6 +182,19 @@ cargo run -- --http --addr 127.0.0.1:8080            # 自定义地址
 - **JSON 单次响应**：`Accept: application/json` 时返回普通 JSON
 - **Keep-Alive**：每 15 秒 ping
 
+## 自带 Skill（file-io-mcp skill，按 MCP 标准协议暴露）
+
+本工具随附一份**使用指引（skill）**，把 15 个工具的安全编辑闭环、工具选型、编码保持与错误码（`E_XXX`）分流等程序性知识内置进去，帮助 **任何接入该 MCP 的 agent**（CodeBuddy、Claude Desktop、Cursor 等）正确、安全地使用这些工具。skill 是 file-io-mcp 项目的一部分，与具体 agent 无关；源文件在仓库 `skills/file-io-mcp/`，并在编译期嵌入二进制。
+
+**怎么"声明"这份指引？** MCP 协议没有 "skill" 原语，标准做法是用两个原生机制（都不出现在 `tools/list` 里）：
+
+1. **MCP Resource（标准：声明一份文档）**：服务器在 `initialize` 时声明 `resources` 能力，把 `SKILL.md` 作为 resource `file-io-mcp://skill/guide`（`text/markdown`）暴露。client 一连上就通过 `resources/list` 发现它，`resources/read` 读取。这正是 MCP 规范里"服务器对外提供知识/上下文"的标准原语。
+2. **`instructions`（标准：注入要点）**：`initialize` 返回的 `instructions` 字段是协议定义的服务器级说明，规范上客户端应注入 agent 上下文。服务器已把**最核心安全要点**（编辑前取 sha256、回传 `expected_sha256` 防并发覆盖、写前备份可回滚、正则替换 `max_matches` 必填、错误按 `E_XXX` 修正重试）写进这里，`instructions` 末尾再指向上面的 resource 取完整指引。
+
+> 说明：resource 是"声明"对了，但**是否把 resource 内容喂给 agent，由 client 决定**——多数 client 不会自动读取，需 client/agent 主动 `resources/read`；而 `instructions` 会被自动注入。两者互补，均属标准协议，无任何非标准机制。
+
+**想把它变成某个 agent 的正式 skill？** 这是 agent 自身的功能（不在 MCP 协议内）。直接把仓库 `skills/file-io-mcp/` 整个文件夹复制到该 agent 的 skills 目录即可（例如 CodeBuddy 用户级 `~/.codebuddy/skills-marketplace/skills/file-io-mcp`），重启 agent 后在 skills 中启用。该文件夹随仓库分发，无需编译、与本项目 exe 无关。
+
 ## 工具详细说明
 
 > 通用约定见上文"核心机制"：编码保持、`sha256` 指纹、`expected_sha256`、原子写入与备份，各工具不再重复说明。
@@ -285,6 +300,8 @@ src/main.rs | utf-8 | 4096B | 120 lines total | sha256:8f3a1c02d94b7e15 | [10-15
 - 多处命中 → `E_NOT_UNIQUE` 并列出全部行号，可用 `anchor_occurrence` 指定第几处；
 - `anchor_text` 必须与整行完全一致（含缩进）。
 
+**上下文块模式（语义级小范围定位）**：除锚点/行号外，还可给 `context_before` + `context_after` 两小段上下文（与 `expected_old`/锚点/行号 **互斥**，且**必须传 `expected_sha256`**）。工具自动定位两帧之间（被隐含）的文本并替换为 `content`；两帧相邻即视为在其间插入 `content`。AI 因此无需复述大段旧文本，落点仍经 `expected_sha256` 防并发、`dry_run` 出 diff。两帧均须全文唯一命中，否则报 `E_NOT_UNIQUE` / `E_NOT_FOUND`。
+
 **示例**：删除第 3-5 行并校验
 
 ```json
@@ -295,6 +312,46 @@ src/main.rs | utf-8 | 4096B | 120 lines total | sha256:8f3a1c02d94b7e15 | [10-15
   "end_line": 5,
   "expected_old": "old line 3\nold line 4\nold line 5"
 }
+```
+
+### preview_edits
+
+**多文件只读预览**：把多个 `edit_file_lines` 式改动（支持锚点/行号/上下文块）聚合成一份紧凑 diff，**不写入、不备份**。每个预览成功的文件会附一个**一次性 `planToken`**；确认无误后用 `apply_plans(plan_tokens)` 按 token 提交，**无需再次传输编辑内容**，且提交时基于当前内容重新定位，保证落的就是预览那份改动。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `edits` | array | 是 | 编辑描述列表，每条 `{path, operation?, content?, expected_old?, anchor_*, start_line?, end_line?, context_before?, context_after?, expected_sha256?}` |
+| `encoding` | string | 否 | 全局默认编码（可被单条 `edits[].encoding` 覆盖） |
+
+- 每条编辑复用 `edit_file_lines` 的 dry-run 逻辑并附该文件路径的小 hunk；末尾给出 `成功 N 个 / 失败 N 个` 汇总。
+- 某条失败（如锚点未命中）仅在该条下标记 `❌`，不影响其余条目的预览。
+- 纯预览：绝不改动任何文件、不创建备份、不获取写锁之外的副作用。
+- 涉及"上下文块"的条目同样需遵循"必须传 `expected_sha256`"规则。
+- 每个预览成功的条目会输出 `planToken: <32 位十六进制>`，**一个文件一个 token**，可留到确认后再用 `apply_plans` 提交。
+
+```json
+{ "edits": [
+  { "path": "src/a.pas", "operation": "replace_lines", "start_line": 3, "end_line": 3, "content": "C", "expected_old": "c" },
+  { "path": "docs/a.md", "context_before": "## 标题", "context_after": "下一节", "content": "新增一段", "expected_sha256": "a1b2c3d4" }
+] }
+```
+
+### apply_plans
+
+**按 `planToken` 提交预览**：直接把 `preview_edits` 冻结的那份编辑计划落盘，**无需再次传输编辑内容**。token 由服务端保存，提交时基于文件当前内容**重新定位**改写目标，保证"落的就是预览那份改动"。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `plan_tokens` | array | 是 | `preview_edits` 返回的 token 列表（一个 token = 一个文件） |
+| `strict` | bool | 否 | 默认 `false`：只重新定位改写目标，**非重叠的并发改动自动合并**；`true` 时额外要求整文件 sha256 与预览快照一致 |
+
+- **一次性**：token 无论提交成功还是失败都会清除，重复使用报 `E_INVALID_PARAM`；有效期约 10 分钟，过期需重新 `preview_edits`。
+- **并发**：提交时基于当前内容重新定位，若目标区域被他人改过则报 `E_EXTERNAL_CHANGED`（token 同时清除），重新 `preview_edits` 即可；多个 token 时先做一轮只读可行性检查，任一文件不可定位则整批拒绝。
+- 单个 token 在文件写锁临界区内"定位→写入"，天然原子；多个 token 逐文件报告结果。
+
+```json
+{ "plan_tokens": ["3f2a...c1"] }
+{ "plan_tokens": ["3f2a...c1", "9b7e...04"], "strict": false }
 ```
 
 ### edit_file_sections
@@ -321,6 +378,7 @@ src/main.rs | utf-8 | 4096B | 120 lines total | sha256:8f3a1c02d94b7e15 | [10-15
 
 - **行号 + 文本双约束**：片段在文件里出现多次时，除了写更长的上下文，也可以给 `start_line`（如 `{ "expected_old": "dup = 1", "content": "DUP", "start_line": 3 }`）；行号写错时会直接告诉你它实际在第几行。
 - `all_or_nothing=false` 时被跳过的条目会列在结果里；`dry_run=true` 时**同样会列出**，方便“先预览再决定”。
+- **dry-run 预览按片段独立成块**：每处命中片段单独输出一个带 `=== edits[k] 第 X~Y 行 ===` 标签的小 hunk（含少量上下文），不会像整文件 diff 那样把相距较远的多处改动合并成一个“跨文件大差异”。落点行号（改动前）与各 `edits` 下标一一对应，逐块核对即可。
 
 - 失败时：未命中给 `E_GUARD_MISMATCH`，命中多处给 `E_NOT_UNIQUE`（会列出各处行号），并明确告知“本次一处未改”。
 

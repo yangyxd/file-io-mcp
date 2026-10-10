@@ -424,6 +424,44 @@ struct PreviewEditsParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ApplyPlansParams {
+    /// planToken list from preview_edits; a single element commits just that one file
+    plan_tokens: Vec<String>,
+    /// true = the file-level sha256 must also match the preview-time snapshot (default false: only the target is re-located, so non-overlapping concurrent edits auto-merge)
+    strict: Option<bool>,
+}
+
+/// One edit already frozen by preview_edits: target file + exact modification (parameters saved as-is, so no need to resend large content at commit) + the sha256 read at preview time
+struct PlannedFileEdit {
+    path: String,
+    operation: String,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+    content: Option<String>,
+    expected_old: Option<String>,
+    anchor_text: Option<String>,
+    anchor_regex: Option<String>,
+    anchor_occurrence: Option<usize>,
+    context_before: Option<String>,
+    context_after: Option<String>,
+    encoding: Option<String>,
+    expected_sha256: String,
+}
+
+/// A committed plan: exactly one file's edit; after apply it is deleted from the store whether it succeeds or fails (one-time)
+struct EditPlan {
+    file: PlannedFileEdit,
+    expires_at: std::time::Instant,
+}
+
+/// Process-level plan store (must NOT live in FileIoServer fields: the HTTP mode news an instance per session and Clone only shallow-copies, so a process-global covers both the single stdio session and multiple HTTP sessions)
+static PLAN_STORE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, EditPlan>>> =
+    std::sync::OnceLock::new();
+
+/// Plan token validity period: a short session is enough; an expired token forces a re-preview
+const PLAN_TTL_SECS: u64 = 600;
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct CopyFilesParams {
     /// Source file path list
     sources: Vec<String>,
@@ -640,7 +678,7 @@ impl FileIoServer {
     fn acquire_file_lock(path: &str) -> FileLockGuard {
         const WAIT_MS: u64 = 50;
         const MAX_WAIT_MS: u64 = 10_000;
-        const STALE_MS: u128 = 30_000; // 持有者崩溃留下的死锁超过该时长则强制抢占
+        const STALE_MS: u128 = 30_000; // a lock left behind by a crashed holder is force-preempted once it exceeds this duration
 
         let lock_path = std::path::PathBuf::from(format!("{}.file-io-mcp.lock", path));
         let mut waited = 0u64;
@@ -668,14 +706,14 @@ impl FileIoServer {
                     waited += WAIT_MS;
                 }
                 Err(_) => {
-                    // 无法创建锁文件（目录不可写等）：降级为无锁
+                    // cannot create the lock file (e.g. the directory is not writable): degrade to no lock
                     return FileLockGuard { path: std::path::PathBuf::new() };
                 }
             }
         }
     }
 
-    /// 锁文件是否过期（持有进程可能已崩溃）
+    /// Whether the lock file is stale (the holding process may have crashed)
     fn is_stale_lock(lock_path: &std::path::Path, stale_ms: u128) -> bool {
         match fs::metadata(lock_path).and_then(|m| m.modified()) {
             Ok(t) => match t.elapsed() {
@@ -1105,9 +1143,9 @@ impl FileIoServer {
     }
 
     /// Auto-detect the file encoding and report a confidence flag.
-    /// The core is to reliably tell GBK from UTF-8: you cannot only look at "是否合法 UTF-8",
+    /// The core is to reliably tell GBK from UTF-8: you cannot only look at "whether it is valid UTF-8",
     /// because some GBK Chinese byte sequences are also valid UTF-8 (they decode into Cyrillic/Arabic and come out garbled overall).
-    /// Method: decode with both encodings, score each by "像不像中文文本", take the higher; mark low confidence when they are close.
+    /// Method: decode with both encodings, score each by "how Chinese-like the text looks", take the higher; mark low confidence when they are close.
     fn detect_encoding_with_confidence(bytes: &[u8]) -> (&'static str, bool) {
         // BOM detection (a BOM means it is certain)
         if bytes.len() >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF {
@@ -1127,7 +1165,7 @@ impl FileIoServer {
         }
 
         // UTF-16 detection without BOM must come before the UTF-8 check:
-        // UTF-16LE ASCII text alternates "ASCII 字节 + 0x00"; but 0x00 is a valid character in UTF-8,
+        // UTF-16LE ASCII text alternates "ASCII bytes + 0x00"; but 0x00 is a valid character in UTF-8,
         // so checking UTF-8 first would misjudge it as utf-8 and read screenfuls of NUL "garbage".
         // For large files only look at the first 64KB (the NUL-alternation pattern of UTF-16 is obvious at the start)
         let probe: &[u8] = if bytes.len() > 64 * 1024 {
@@ -1177,13 +1215,13 @@ impl FileIoServer {
 
         // Structurally valid UTF-8 is a strong signal: as long as the full UTF-8 check passes and the score is not below GBK (allowing GBK to lead by <=0.02
         // of noise), judge it UTF-8 with **high confidence**.
-        // Do not use "两候选分数差足够大" as a deterministic condition -- e.g. UTF-8 source where pure ASCII dominates,
-        // decodes just as smoothly with GBK; both scores are near 1.0 with a tiny gap, and would be falsely reported as "编码识别不确定".
+        // Do not use "a large enough gap between the two candidate scores" as a deterministic condition -- e.g. UTF-8 source where pure ASCII dominates,
+        // decodes just as smoothly with GBK; both scores are near 1.0 with a tiny gap, and would be falsely reported as "encoding uncertain".
         // Only consider GBK when its score is clearly higher (leads by >0.02); and it counts as high confidence only when it leads by >=0.1.
         let (best, best_score, confident) = if s_utf8.is_finite() && s_gbk <= s_utf8 + 0.02 {
             ("utf-8", s_utf8, true)
         } else {
-            // 走到这里说明 s_gbk > s_utf8（含 s_utf8 为负无穷，即非法 UTF-8）
+            // reaching here means s_gbk > s_utf8 (s_utf8 may be -infinity, i.e. invalid UTF-8)
             ("gbk", s_gbk, s_gbk - s_utf8 >= 0.1)
         };
 
@@ -1205,7 +1243,7 @@ impl FileIoServer {
         (best, confident)
     }
 
-    /// Score of how much the decoded text "像不像中文文本" (0.0~1.0):
+    /// Score of how much the decoded text "looks like Chinese text" (0.0~1.0):
     /// CJK and full-width characters add points; replacement/control/unrelated-script characters subtract.
     /// Used to tell GBK from UTF-8: text decoded with the wrong encoding is usually full of unexpected characters, so its score is clearly lower.
     fn text_likelihood(s: &str) -> f64 {
@@ -1353,7 +1391,7 @@ impl FileIoServer {
         if b < 0x80 {
             return Some(pos + 1);
         }
-        // GB18030 四字节序列：首 0x81-0xFE，次 0x30-0x39，三 0x81-0xFE，四 0x30-0x39
+        // GB18030 4-byte sequence: byte1 0x81-0xFE, byte2 0x30-0x39, byte3 0x81-0xFE, byte4 0x30-0x39
         if encoding.eq_ignore_ascii_case("gb18030")
             && pos + 3 < bytes.len()
             && (0x81..=0xFE).contains(&b)
@@ -1549,8 +1587,9 @@ impl FileIoServer {
 
     /// The 1-based line number for a byte offset (used to explain "where the hit is")
     fn line_of(hay: &str, offset: usize) -> usize {
-        // 调用方不能保证 offset 落在字符边界上（落在多字节字符中间很常见），
-        // 这里向下取整到最近的边界后再切片，避免直接 panic
+        // The caller cannot guarantee that offset lands on a character boundary (landing in the
+        // middle of a multi-byte character is common), so round down to the nearest boundary
+        // before slicing, to avoid a direct panic
         let off = offset.min(hay.len());
         let off = (0..=off).rev().find(|i| hay.is_char_boundary(*i)).unwrap_or(0);
         hay[..off].matches('\n').count() + 1
@@ -1862,8 +1901,8 @@ impl FileIoServer {
         // The original line up to which the previous snippet has been output (exclusive), used to avoid a neighboring snippet treating the same line as both "after-context" and "before-context".
         let mut last_ctx_end = 0usize;
         for p in planned {
-            let old_from = p.line_from.saturating_sub(1); // 0-based 起始（第 line_from 行）
-            let old_to = p.line_to.min(n); // 0-based 结束（不含），第 line_to 行（含）
+            let old_from = p.line_from.saturating_sub(1); // 0-based start (line_from is 1-based)
+            let old_to = p.line_to.min(n); // 0-based end (exclusive); line_to is 1-based inclusive
             if old_from >= old_to {
                 // Degenerate case (line range collapsed): still emit the label to avoid missing it
                 out.push_str(&format!(
@@ -2021,7 +2060,7 @@ impl FileIoServer {
         Some(BackupHandle { bak, meta })
     }
 
-    /// 写入完成后补齐"写入后 sha256"，供回滚时判断文件是否又被改过
+    /// Fill in the post-write sha256 after the write completes, so rollback can tell whether the file has changed again
     fn finish_backup(handle: &BackupHandle, after_bytes: &[u8]) {
         let Ok(text) = fs::read_to_string(&handle.meta) else {
             return;
@@ -2586,7 +2625,7 @@ impl FileIoServer {
 
 #[tool_router]
 impl FileIoServer {
-    /// 读取文本文件
+    /// Read a text file
     #[tool(
         name = "read_text_file",
         description = "Read a text fragment by byte offset/length. offset default 0; length must be >=1, default up to 10MB. Returns a header: path | encoding (BOM) | size | sha256 | range; the range is auto-snapped to character boundaries by default (flagged), use strict=true for exact byte ranges. For line-based editing use read_text_lines",
@@ -2864,7 +2903,7 @@ impl FileIoServer {
         ))
     }
 
-    /// 写入文本文件
+    /// Write a text file
     #[tool(
         name = "write_text_file",
         description = "Write text in one shot (auto-creates directories). mode=overwrite (default)/append/insert (needs offset, must land on a character boundary). Pass expected_old for a pre-write check and expected_sha256 from a prior read to avoid overwriting concurrent changes; dry_run=true returns only a diff",
@@ -3372,7 +3411,7 @@ impl FileIoServer {
         ))
     }
 
-    /// 写入十六进制数据到二进制文件
+    /// Write hexadecimal data to a binary file
     #[tool(
         name = "write_binary_file",
         description = "Write binary by hex. mode=overwrite (default)/append/insert (offset)/replace (offset+replace_length); offset out of range errors. \
@@ -4091,7 +4130,7 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
                             problems.push(format!(
                                 "edits[{}]: expected_old is not unique in the file (matched {} time(s): {}{}), cannot decide which one to change.\
                                  Make expected_old longer to locate uniquely, or use occurrence to pick the Nth hit, or use start_line to declare which line it starts on",
-                                idx, n, spots.join("、"), more
+                                idx, n, spots.join(", "), more
                             ));
                             continue;
                         }
@@ -4119,8 +4158,8 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
                         });
                     }
                     None => problems.push(format!(
-                        "edits[{}]: expected_old 与文件内容不匹配（未命中）。\
-                         它必须与原文逐字符一致（含缩进、空行、标点）；建议先用 read_text_lines 读出准确文本再复制过来",
+                        "edits[{}]: expected_old does not match the file content (no hit).\
+                         It must match the original character-by-character (including indentation, blank lines, punctuation); suggest reading the exact text with read_text_lines first and copying it over",
                         idx
                     )),
                 }
@@ -4128,7 +4167,7 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
 
             if !problems.is_empty() && (all_or_nothing || planned.is_empty()) {
                 // Explicit error code: when reasons are mixed, prioritize "not unique" so the caller can branch
-                let code = if problems.iter().all(|p| p.contains("不唯一")) {
+                let code = if problems.iter().all(|p| p.contains("not unique")) {
                     "E_NOT_UNIQUE"
                 } else {
                     "E_GUARD_MISMATCH"
@@ -4328,7 +4367,7 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
         // max_matches must be set explicitly: force the AI to think through "how many edits are expected", avoiding broad regex / empty-string matches that cause large unintended replacements
         let max_matches = params.max_matches.ok_or_else(|| {
             e_param(
-                "regex_replace requires max_matches to be set explicitly (the max replacements expected this time).\
+                "E_INVALID_PARAM regex_replace requires max_matches to be set explicitly (the max replacements expected this time).\
                  Estimate the expected match count first and pass it as the cap, e.g. max_matches=1 allows only 1 change;\
                  if the actual match count exceeds it, the call is rejected to prevent broad regex / empty-string matches from causing large unintended replacements.".to_string(),
                 None,
@@ -4354,7 +4393,7 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
         if count > max_matches {
             return Err(e_param(
                 format!(
-                    "match count {} exceeds your cap {}; execution refused! Check whether the regex is too broad or matched an empty string.\
+                    "E_TOO_MANY_MATCHES match count {} exceeds your cap {}; execution refused! Check whether the regex is too broad or matched an empty string.\
                      If correct, re-call with max_matches raised to the expected value",
                     count, max_matches
                 ),
@@ -4401,7 +4440,7 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
             ));
         }
 
-        // 按原编码编码回字节，并原样补回 BOM
+        // encode back to bytes with the original encoding, and restore the BOM verbatim
         let new_bytes = Self::encode_file(&FileText {
             encoding: encoding.clone(),
             bom,
@@ -4907,7 +4946,7 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
         // Target semantics: an existing path keeps its real type; if missing, multiple sources = a directory and a single source = a new file path (unless the path ends with a separator)
         let target_is_dir = Self::target_is_dir_for(target_path, &params.target, sources.len());
 
-        // 校验所有源文件存在
+        // verify all source files exist
         for s in &sources {
             if !std::path::Path::new(s).is_file() {
                 return Err(e_param(
@@ -5012,7 +5051,7 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
         // Target semantics: an existing path keeps its real type; if missing, multiple sources = a directory and a single source = a new file path (unless the path ends with a separator)
         let target_is_dir = Self::target_is_dir_for(target_path, &params.target, sources.len());
 
-        // 校验所有源文件存在
+        // verify all source files exist
         for s in &sources {
             if !std::path::Path::new(s).is_file() {
                 return Err(e_param(
@@ -5062,13 +5101,13 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
             }
 
             let size = fs::metadata(src)
-                .map_err(|e| e_internal(format!("无法读取源文件信息: {}", e), None))?
+                .map_err(|e| e_internal(format!("failed to read source file info: {}", e), None))?
                 .len();
 
             let dest_str = dest.to_string_lossy().to_string();
             // Source equals target (renaming onto itself): nothing to do
             if src.as_str() == dest_str {
-                results.push(format!("跳过 {} (源与目标相同)", dest.display()));
+                results.push(format!("skipped {} (source equals target)", dest.display()));
                 skipped += 1;
                 continue;
             }
@@ -5115,7 +5154,7 @@ Located against a single snapshot; overlaps error out; supports expected_sha256 
         ))
     }
 
-    /// 按行编辑文件：删除/插入/替换/追加行
+    /// Edit a file by line: delete / insert / replace / append lines
     #[tool(
         name = "edit_file_lines",
         description = "Edit by line (1-based; path required): delete_lines/insert_lines/replace_lines/append_lines. Locate with anchor_text (whole line, must be unique) or anchor_regex, or directly give start_line/end_line; delete/replace require expected_old for a second check; pass expected_sha256 from a prior read to avoid overwriting concurrent changes; dry_run=true returns only a diff. \
@@ -5148,7 +5187,7 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
                 || params.anchor_occurrence.is_some()
             {
                 return Err(e_param(
-                    "when using the context block (context_before/context_after), you must not also provide expected_old/anchor_text/anchor_regex/start_line/end_line/anchor_occurrence (mutually exclusive)",
+                    "E_INVALID_PARAM when using the context block (context_before/context_after), you must not also provide expected_old/anchor_text/anchor_regex/start_line/end_line/anchor_occurrence (mutually exclusive)",
                     None,
                 ));
             }
@@ -5253,14 +5292,14 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
                     None,
                 ));
             }
-            // 找出 before/after 各自的精确命中起点
+            // find the exact hit start of before/after respectively
             let before_hits: Vec<usize> = (0..=(total_lines - kb))
                 .filter(|&b| lines[b..b + kb] == before_lines[..])
                 .collect();
             let after_hits: Vec<usize> = (0..=(total_lines - ka))
                 .filter(|&a| lines[a..a + ka] == after_lines[..])
                 .collect();
-            // 候选落点：before 在前、after 在后（after 起点 >= before 块尾）
+            // Candidate landing points: before first, after second (after start >= end of the before block)
             let mut cands: Vec<(usize, usize)> = Vec::new();
             for &b in &before_hits {
                 for &a in &after_hits {
@@ -5282,8 +5321,8 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
                 }
                 1 => {
                     let (b, a) = cands[0];
-                    let gap_start = b + kb; // 0-based：被隐含替换/插入区间的起点
-                    let gap_end = a; // 0-based：区间终点（不含）
+                    let gap_start = b + kb; // 0-based: start of the implied replace/insert range
+                    let gap_end = a; // 0-based: end of that range (exclusive)
                     if gap_start == gap_end {
                         // Two frames adjacent -> insert content between them
                         (Some(gap_start + 1), Some(gap_start), "insert_lines".to_string(), None)
@@ -5332,7 +5371,7 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
                 .collect();
             // Compare line by line, tolerant of \r\n
             // Tolerate a single trailing newline on expected_old (the AI often copies the whole line including the newline):
-            // 否则 split 会多出一个空元素导致长度不等而误拒。
+            // otherwise split yields one extra empty element, making the lengths unequal and falsely rejecting
             let expected = expected
                 .strip_suffix("\r\n")
                 .or_else(|| expected.strip_suffix('\n'))
@@ -5367,7 +5406,7 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
                         range.end,
                         actual_lines.len(),
                         expected_lines.len(),
-                        if expected_lines.len() > actual_lines.len() { "多" } else { "少" },
+                        if expected_lines.len() > actual_lines.len() { "more" } else { "fewer" },
                         (expected_lines.len() as isize - actual_lines.len() as isize).abs()
                     )
                 };
@@ -5486,7 +5525,7 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
                     }
                 },
             }
-            // 锚点默认只作用于命中那一行；显式给了更大的 end_line 时按范围处理
+            // An anchor applies only to the matched line by default; an explicitly larger end_line makes it a range
             if end_line.unwrap_or(0) < start_line.unwrap_or(1) {
                 end_line = start_line;
             }
@@ -5688,7 +5727,9 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
     /// without writing or backing up. After confirming, call the per-file edit tool to actually apply.
     #[tool(
         name = "preview_edits",
-        description = "Read-only multi-file preview: aggregates several edit_file_lines-style changes (anchors/line numbers/context blocks) into one compact diff, without writing or backing up. After confirming, call the per-file edit tool to actually apply. edits=[{path, operation?, content?, expected_old?, anchor_*, start_line?, end_line?, context_before?, context_after?, expected_sha256?}]",
+        description = "Read-only multi-file preview: aggregates several edit_file_lines-style changes (anchors/line numbers/context blocks) into one compact diff, without writing or backing up. \
+Each previewed file gets a one-time planToken; commit with apply_plans(plan_tokens) — no need to resend the edit content. \
+edits=[{path, operation?, content?, expected_old?, anchor_*, start_line?, end_line?, context_before?, context_after?, expected_sha256?}]",
         annotations(title = "Multi-file edit preview", read_only_hint = true)
     )]
     fn preview_edits(
@@ -5701,6 +5742,7 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
         let mut out = String::new();
         let mut ok = 0usize;
         let mut failed = 0usize;
+        let mut any_token = false;
         for (i, spec) in params.edits.iter().enumerate() {
             let edit_params = EditFileLinesParams {
                 operation: spec
@@ -5725,7 +5767,14 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
             match self.edit_file_lines(Parameters(edit_params)) {
                 Ok(diff) => {
                     ok += 1;
+                    // Preview located successfully: freeze this edit into a plan and issue a one-time planToken.
+                    // At commit the AI only passes the token: no need to resend large content, and the target is re-located against the current content for consistency.
+                    let token = self.store_plan(spec, params.encoding.as_deref());
                     out.push_str(&diff);
+                    if let Some(t) = token {
+                        any_token = true;
+                        out.push_str(&format!("planToken: {}\n", t));
+                    }
                     out.push('\n');
                 }
                 Err(e) => {
@@ -5738,7 +5787,203 @@ Also supports a \"context block\" mode: give context_before + context_after (mut
             "\n=== summary: {} succeeded, {} failed (preview only, no file written) ===\n",
             ok, failed
         ));
+        if any_token {
+            out.push_str(&format!(
+                "Commit with apply_plans(plan_tokens); tokens are one-time and expire in {}s.\n",
+                PLAN_TTL_SECS
+            ));
+        }
         Ok(out)
+    }
+
+    
+
+    /// Commit edits frozen by preview_edits (round 1: read-only check that each target still locates; round 2: per file, locates then writes under the file lock).
+    #[tool(
+        name = "apply_plans",
+        description = "Commit edits frozen by preview_edits: pass the planToken(s) it returned, no need to resend edit content. \
+Each token is one-time (cleared on success or failure) and expires shortly; on any error re-run preview_edits. \
+Re-locates against current content at commit, so non-overlapping concurrent edits auto-merge; a changed target gives E_EXTERNAL_CHANGED. \
+strict=true also requires the file-level sha256 to match the preview snapshot. \
+One token commits one file; several tokens report per-file outcome",
+        annotations(title = "Apply preview plans", destructive_hint = true)
+    )]
+    fn apply_plans(
+        &self,
+        Parameters(params): Parameters<ApplyPlansParams>,
+    ) -> Result<String, McpError> {
+        if params.plan_tokens.is_empty() {
+            return Err(e_param(
+                "plan_tokens must not be empty: provide at least one planToken",
+                None,
+            ));
+        }
+        let strict = params.strict.unwrap_or(false);
+        // Take all tokens first (cleared regardless of outcome, one-time); a missing/expired one rejects the whole batch
+        let mut plans: Vec<(String, PlannedFileEdit)> = Vec::new();
+        for token in &params.plan_tokens {
+            let plan = Self::take_plan(token)?;
+            plans.push((token.clone(), plan.file));
+        }
+        // Round 1 (feasibility, read-only, no write): reject the whole batch up front if any target no longer locates.
+        // Skipped for a single token: one file is atomic on its own, so the extra dry-run adds nothing.
+        if plans.len() > 1 {
+            for (token, file) in &plans {
+                let p = Self::plan_to_edit_params(file, strict, true);
+                if let Err(e) = self.edit_file_lines(Parameters(p)) {
+                    return Err(e_param(
+                        format!(
+                            "E_EXTERNAL_CHANGED batch rejected (all tokens cleared; if a file was changed by someone else, re-run preview_edits); file {} (token {}) no longer locatable: {}",
+                            file.path, token, e
+                        ),
+                        None,
+                    ));
+                }
+            }
+        }
+        // Round 2 (write): per file locates then writes inside the lock; report per-file outcome on write
+        let mut out = String::new();
+        let mut ok = 0usize;
+        let mut failed = 0usize;
+        for (token, file) in &plans {
+            let p = Self::plan_to_edit_params(file, strict, false);
+            match self.edit_file_lines(Parameters(p)) {
+                Ok(res) => {
+                    ok += 1;
+                    out.push_str(&format!("applied | {} | token {}\n{}\n", file.path, token, res));
+                }
+                Err(e) => {
+                    failed += 1;
+                    // A single token: report the failure directly instead of a summary line (clearer for the caller)
+                    if plans.len() == 1 {
+                        return Err(e_param(
+                            format!(
+                                "E_EXTERNAL_CHANGED apply failed (token {} already cleared; re-run preview_edits if the file was changed by someone else): {}",
+                                token, e
+                            ),
+                            None,
+                        ));
+                    }
+                    out.push_str(&format!("failed | {} | token {}: {}\n", file.path, token, e));
+                }
+            }
+        }
+        out.push_str(&format!(
+            "\n=== batch summary: {} succeeded, {} failed ===\n",
+            ok, failed
+        ));
+        Ok(out)
+    }
+
+    /// Freeze one successfully previewed edit into a plan and issue a one-time planToken (written into the process-level store).
+    /// Returns None on failure (e.g. path resolution error); the caller then only shows the diff, without a token.
+    fn store_plan(&self, spec: &PreviewEdit, global_encoding: Option<&str>) -> Option<String> {
+        let path = self.resolve_path(&spec.path).ok()?;
+        // Concurrency guard: prefer an explicitly provided sha; otherwise compute the short fingerprint of the current content (same source as check_expected_sha)
+        let sha = spec
+            .expected_sha256
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| Self::path_fingerprint_short(&path));
+        let token = Self::new_plan_token();
+        let plan = EditPlan {
+            file: PlannedFileEdit {
+                path,
+                operation: spec
+                    .operation
+                    .clone()
+                    .unwrap_or_else(|| "replace_lines".to_string()),
+                start_line: spec.start_line,
+                end_line: spec.end_line,
+                content: spec.content.clone(),
+                expected_old: spec.expected_old.clone(),
+                anchor_text: spec.anchor_text.clone(),
+                anchor_regex: spec.anchor_regex.clone(),
+                anchor_occurrence: spec.anchor_occurrence,
+                context_before: spec.context_before.clone(),
+                context_after: spec.context_after.clone(),
+                encoding: spec
+                    .encoding
+                    .clone()
+                    .or_else(|| global_encoding.map(|s| s.to_string())),
+                expected_sha256: sha,
+            },
+            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(PLAN_TTL_SECS),
+        };
+        let store = PLAN_STORE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+        let mut m = store.lock().ok()?;
+        // Opportunistic cleanup: expired entries are dropped on access, bounding memory without a background thread
+        let now = std::time::Instant::now();
+        m.retain(|_, p| p.expires_at > now);
+        m.insert(token.clone(), plan);
+        Some(token)
+    }
+
+    /// Fetch a plan by token, removing it from the store first (naturally one-time: cleared whether it succeeds or fails); missing/expired → E_INVALID_PARAM.
+    fn take_plan(token: &str) -> Result<EditPlan, McpError> {
+        let store = PLAN_STORE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+        let mut m = store
+            .lock()
+            .map_err(|_| e_internal("plan store lock poisoned", None))?;
+        let now = std::time::Instant::now();
+        m.retain(|_, p| p.expires_at > now);
+        m.remove(token).ok_or_else(|| {
+            e_param(
+                format!(
+                    "E_INVALID_PARAM planToken invalid, already used or expired (token {}); re-run preview_edits to get a new token",
+                    token
+                ),
+                None,
+            )
+        })
+    }
+
+    /// Construct edit_file_lines parameters from a plan.
+    /// strict=true passes expected_sha256 (whole-file match required); false omits it and relies on re-location inside edit_file_lines (target region must still match uniquely), so non-overlapping concurrent edits merge.
+    /// The context-block mode always passes expected_sha256 (tool hard requirement).
+    fn plan_to_edit_params(
+        file: &PlannedFileEdit,
+        strict: bool,
+        dry_run: bool,
+    ) -> EditFileLinesParams {
+        let is_context = file.context_before.is_some() || file.context_after.is_some();
+        let pass_sha = strict || is_context;
+        EditFileLinesParams {
+            operation: file.operation.clone(),
+            path: Some(file.path.clone()),
+            start_line: file.start_line,
+            end_line: file.end_line,
+            content: file.content.clone(),
+            encoding: file.encoding.clone(),
+            expected_old: file.expected_old.clone(),
+            expected_sha256: if pass_sha {
+                Some(file.expected_sha256.clone())
+            } else {
+                None
+            },
+            anchor_text: file.anchor_text.clone(),
+            anchor_regex: file.anchor_regex.clone(),
+            anchor_occurrence: file.anchor_occurrence,
+            dry_run: Some(dry_run),
+            context_before: file.context_before.clone(),
+            context_after: file.context_after.clone(),
+        }
+    }
+
+    /// Generate an opaque random planToken (32 hex chars; encodes no content).
+    /// Built from sha256 (already a dependency) over a nanosecond timestamp + an in-process counter; only needs to be unique within this process (a token does not cross processes anyway).
+    fn new_plan_token() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let mut h = Sha256::new();
+        h.update(format!("file-io-mcp-plan-{}-{}", now, n).as_bytes());
+        let digest = h.finalize();
+        digest.iter().take(16).map(|b| format!("{:02x}", b)).collect()
     }
 }
 
@@ -5787,8 +6032,8 @@ impl<'a> PanicSafeRouter<'a> {
     ) -> Result<rmcp::model::CallToolResult, McpError> {
         let tool_name = tcc.name().to_string();
         let fut = self.inner.call(tcc);
-        // AssertUnwindSafe：future 里持有 &self/&params 的共享引用，编译器无法证明
-        // UnwindSafe. After a panic we immediately drop this future (no more polling), so no intermediate state is observed.
+        // AssertUnwindSafe: the future holds shared references to &self/&params, which the compiler
+        // cannot prove UnwindSafe. After a panic we immediately drop this future (no more polling), so no intermediate state is observed.
         match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(fut)).await {
             Ok(result) => result,
             Err(payload) => {
@@ -5867,7 +6112,8 @@ impl ServerHandler for FileIoServer {
                  ② Overwrite writes are atomic (temp file + rename) and auto-back up before writing, reversible with manage_backups; deletion requires confirm=true; \
                  ③ Always read_text_lines first to get sha256 before editing, and pass expected_sha256 back on write — if someone else changed it you get E_EXTERNAL_CHANGED, re-read then edit, never blindly overwrite; \
                  ④ For multiple changes or when line numbers are unknown use edit_file_sections; regex_replace requires max_matches; when unsure, dry_run=true first to see the diff; \
-                 ⑤ On an E_XXX error, fix the input per the message and retry; never ignore errors and force the write. \
+                 ⑤ preview_edits returns a one-time planToken per file; commit with apply_plans(plan_tokens) — no need to resend the edit content; on any error just re-run preview_edits; \
+⑥ On an E_XXX error, fix the input per the message and retry; never ignore errors and force the write. \
                  For full tool selection and the safe-edit loop, see the resource: file-io-mcp://skill/guide (read it via resources/read when needed).".into(),
             ),
         }

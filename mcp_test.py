@@ -2,7 +2,12 @@
 """file-io-mcp 新功能验证脚本：通过 MCP stdio 协议调用工具"""
 import subprocess, json, os, sys, hashlib, time
 
-EXE = r"F:\Projects\Web\file-io-mcp\target\release\file-io-mcp.exe"
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+EXE = sys.argv[1] if len(sys.argv) > 1 else r"F:\Projects\Web\file-io-mcp\target\release\file-io-mcp.exe"
 TEST_DIR = r"F:\Projects\Web\file-io-mcp\mcp_test_data"
 os.makedirs(TEST_DIR, exist_ok=True)
 

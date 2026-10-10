@@ -14,7 +14,8 @@
 | `read_text_lines` | 按行读文本（带行号），编辑前取内容与指纹 |
 | `write_text_file` | 整段写文本，支持覆盖/追加/插入，可 dry-run 预览 diff |
 | `edit_file_lines` | 按行编辑：删/插/替/追，支持锚点定位、`expected_old` 校验，以及"上下文块"小范围语义定位 |
-| `preview_edits` | **多文件只读预览**：把多个 edit_file_lines 式改动聚合成一份紧凑 diff，不写入、不备份 |
+| `preview_edits` | **多文件只读预览**：把多个 edit_file_lines 式改动聚合成一份紧凑 diff，不写入、不备份；每个预览成功的文件附一个一次性 `planToken` |
+| `apply_plans` | **按 token 提交预览**：传入 `preview_edits` 返回的 `planToken`（一个 token = 一个文件），无需重发编辑内容；多个 token 逐文件报告结果 |
 | `edit_file_sections` | **批量精确替换**：一次调用改多处，默认全成或全不成，全部基于同一次快照定位 |
 | `regex_replace` | 正则替换（`literal=true` 即免转义的纯文本替换），`max_matches` 必填防误伤，可 dry-run |
 | `read_binary_file` | 读二进制 HEX dump |
@@ -315,7 +316,7 @@ src/main.rs | utf-8 | 4096B | 120 lines total | sha256:8f3a1c02d94b7e15 | [10-15
 
 ### preview_edits
 
-**多文件只读预览**：把多个 `edit_file_lines` 式改动（支持锚点/行号/上下文块）聚合成一份紧凑 diff，**不写入、不备份**。确认无误后再逐文件调用对应编辑工具实写。
+**多文件只读预览**：把多个 `edit_file_lines` 式改动（支持锚点/行号/上下文块）聚合成一份紧凑 diff，**不写入、不备份**。每个预览成功的文件会附一个**一次性 `planToken`**；确认无误后用 `apply_plans(plan_tokens)` 按 token 提交，**无需再次传输编辑内容**，且提交时基于当前内容重新定位，保证落的就是预览那份改动。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
@@ -326,12 +327,31 @@ src/main.rs | utf-8 | 4096B | 120 lines total | sha256:8f3a1c02d94b7e15 | [10-15
 - 某条失败（如锚点未命中）仅在该条下标记 `❌`，不影响其余条目的预览。
 - 纯预览：绝不改动任何文件、不创建备份、不获取写锁之外的副作用。
 - 涉及"上下文块"的条目同样需遵循"必须传 `expected_sha256`"规则。
+- 每个预览成功的条目会输出 `planToken: <32 位十六进制>`，**一个文件一个 token**，可留到确认后再用 `apply_plans` 提交。
 
 ```json
 { "edits": [
   { "path": "src/a.pas", "operation": "replace_lines", "start_line": 3, "end_line": 3, "content": "C", "expected_old": "c" },
   { "path": "docs/a.md", "context_before": "## 标题", "context_after": "下一节", "content": "新增一段", "expected_sha256": "a1b2c3d4" }
 ] }
+```
+
+### apply_plans
+
+**按 `planToken` 提交预览**：直接把 `preview_edits` 冻结的那份编辑计划落盘，**无需再次传输编辑内容**。token 由服务端保存，提交时基于文件当前内容**重新定位**改写目标，保证"落的就是预览那份改动"。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `plan_tokens` | array | 是 | `preview_edits` 返回的 token 列表（一个 token = 一个文件） |
+| `strict` | bool | 否 | 默认 `false`：只重新定位改写目标，**非重叠的并发改动自动合并**；`true` 时额外要求整文件 sha256 与预览快照一致 |
+
+- **一次性**：token 无论提交成功还是失败都会清除，重复使用报 `E_INVALID_PARAM`；有效期约 10 分钟，过期需重新 `preview_edits`。
+- **并发**：提交时基于当前内容重新定位，若目标区域被他人改过则报 `E_EXTERNAL_CHANGED`（token 同时清除），重新 `preview_edits` 即可；多个 token 时先做一轮只读可行性检查，任一文件不可定位则整批拒绝。
+- 单个 token 在文件写锁临界区内"定位→写入"，天然原子；多个 token 逐文件报告结果。
+
+```json
+{ "plan_tokens": ["3f2a...c1"] }
+{ "plan_tokens": ["3f2a...c1", "9b7e...04"], "strict": false }
 ```
 
 ### edit_file_sections

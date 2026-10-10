@@ -62,7 +62,8 @@ BASE = "program demo;\r\n  a := 1;\r\n  b := 2;\r\n  c := 3;\r\n  d := 4;\r\n  e
 f = P("c1.pas")
 call("write_text_file", {"path": f, "content": BASE})
 sha = get_sha(f)
-r = call("edit_file_lines", {"path": f, "context_before": "  b := 2;",
+r = call("edit_file_lines", {"operation": "replace_lines", "path": f,
+                             "context_before": "  b := 2;",
                              "context_after": "  d := 4;", "content": "  c := 333;",
                              "expected_sha256": sha})
 print("C1 context replace:", ok("ERROR" not in r and "repl 4~4" in r),
@@ -73,7 +74,8 @@ print("   content changed:", ok("c := 333;" in read(f) and "c := 3;" not in read
 f = P("c2.pas")
 call("write_text_file", {"path": f, "content": BASE})
 sha = get_sha(f)
-r = call("edit_file_lines", {"path": f, "context_before": "  a := 1;",
+r = call("edit_file_lines", {"operation": "replace_lines", "path": f,
+                             "context_before": "  a := 1;",
                              "context_after": "  b := 2;", "content": "  INSERTED;",
                              "expected_sha256": sha})
 print("C2 context insert:", ok("ERROR" not in r and "ins @3" in r),
@@ -86,17 +88,19 @@ f = P("c3.pas")
 C3 = "  dup := 1;\r\n  mid := 1;\r\n  other := 9;\r\n  dup := 1;\r\n  mid := 2;\r\n"
 call("write_text_file", {"path": f, "content": C3})
 sha = get_sha(f)
-r = call("edit_file_lines", {"path": f, "context_before": "  dup := 1;",
+r = call("edit_file_lines", {"operation": "replace_lines", "path": f,
+                             "context_before": "  dup := 1;",
                              "context_after": "  mid := 2;", "content": "x",
                              "expected_sha256": sha})
-print("C3 context not unique:", ok("E_NOT_UNIQUE" in r and "命中 2 处" in r),
+print("C3 context not unique:", ok("E_NOT_UNIQUE" in r and "hit 2 place(s)" in r),
       "|", r.replace("\n", " ")[:130])
 
 # ---------- C4: 上下文块未命中 → 拒绝 ----------
 f = P("c4.pas")
 call("write_text_file", {"path": f, "content": BASE})
 sha = get_sha(f)
-r = call("edit_file_lines", {"path": f, "context_before": "  nope := 1;",
+r = call("edit_file_lines", {"operation": "replace_lines", "path": f,
+                             "context_before": "  nope := 1;",
                              "context_after": "  d := 4;", "content": "x",
                              "expected_sha256": sha})
 print("C4 context not found:", ok("E_NOT_FOUND" in r))
@@ -104,7 +108,8 @@ print("C4 context not found:", ok("E_NOT_FOUND" in r))
 # ---------- C5: 上下文块缺 expected_sha256 → 拒绝 ----------
 f = P("c5.pas")
 call("write_text_file", {"path": f, "content": BASE})
-r = call("edit_file_lines", {"path": f, "context_before": "  b := 2;",
+r = call("edit_file_lines", {"operation": "replace_lines", "path": f,
+                             "context_before": "  b := 2;",
                              "context_after": "  d := 4;", "content": "x"})
 print("C5 context requires sha256:", ok("E_INVALID_PARAM" in r and "expected_sha256" in r))
 
@@ -112,10 +117,11 @@ print("C5 context requires sha256:", ok("E_INVALID_PARAM" in r and "expected_sha
 f = P("c6.pas")
 call("write_text_file", {"path": f, "content": BASE})
 sha = get_sha(f)
-r = call("edit_file_lines", {"path": f, "context_before": "  b := 2;",
+r = call("edit_file_lines", {"operation": "replace_lines", "path": f,
+                             "context_before": "  b := 2;",
                              "context_after": "  d := 4;", "expected_old": "  c := 3;",
                              "content": "x", "expected_sha256": sha})
-print("C6 context vs expected_old conflict:", ok("E_INVALID_PARAM" in r))
+print("C6 context vs expected_old conflict:", ok("E_INVALID_PARAM" in r and "mutually exclusive" in r))
 
 # ---------- P1: 多文件预览聚合（只读，文件不变）----------
 fa = P("p1a.txt")
@@ -130,8 +136,8 @@ r = call("preview_edits", {"edits": [
     {"path": fb, "operation": "replace_lines", "start_line": 2, "end_line": 2,
      "content": "Y", "expected_old": "y"},
 ]})
-print("P1 preview aggregate:", ok("DRY-RUN" in r and "成功 2 个" in r
-                                 and "未写入文件" in r),
+print("P1 preview aggregate:", ok("DRY-RUN" in r and "2 succeeded" in r
+                                 and "0 failed" in r),
       "|", r.replace("\n", " ")[:120])
 print("   files unchanged:", ok(open(fa, "rb").read() == before_a and open(fb, "rb").read() == before_b))
 
@@ -147,7 +153,7 @@ r = call("preview_edits", {"edits": [
     {"path": fb2, "operation": "replace_lines", "anchor_text": "  not-exist;",
      "content": "Y", "expected_old": "nope"},
 ]})
-print("P2 preview with failure:", ok("❌" in r and "成功 1 个" in r and "失败 1 个" in r),
+print("P2 preview with failure:", ok("preview failed" in r and "1 succeeded" in r and "1 failed" in r),
       "|", r.replace("\n", " ")[:140])
 
 proc.kill()
